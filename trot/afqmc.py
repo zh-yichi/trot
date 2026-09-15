@@ -932,20 +932,31 @@ class AfqmcMixed(Afqmc):
         pyscf CC object. The guide is taken from ``cc._scf`` and the trial amplitudes
         from ``cc`` itself, so no second argument is needed.
     trial : str, optional
-        Which mixed recipe to run, by default "pt2ccsd". The name picks the energy
-        kernel the trial is measured with:
+        Which mixed recipe to run. The name picks the energy kernel the trial is
+        measured with. For a restricted ``CCSD`` object, with an RHF guide:
 
-        - ``"pt2ccsd"``       the plain estimator, one cholesky vector per scan step
-        - ``"pt2ccsd_chunk"`` chunked over the cholesky index
-        - ``"pt2ccsd_bar"``   chunked, with exp(T1) moved onto the hamiltonian and the
+        - ``"pt2ccsd"``          the plain estimator, one cholesky vector per scan step
+        - ``"pt2ccsd_chunk"``    chunked over the cholesky index
+        - ``"pt2ccsd_bar"``      chunked, with exp(T1) moved onto the hamiltonian and the
           walker rather than the trial
+        - ``"pt2ccsd_sto_chol"`` the bar estimator with a semistochastic cholesky sum
 
-        All three compute the same energy. ``trot.mixed.available_mixed_recipes()``
-        lists what is registered. ``max_memory`` and ``nchol_chunk`` apply to the two
-        chunking kernels only.
+        For a ``UCCSD`` object, with a UHF guide on the unrestricted hamiltonian of
+        ``AfqmcUh`` (alpha and beta each in their own orbital basis):
+
+        - ``"upt2ccsd"``          chunked over the cholesky index
+        - ``"upt2ccsd_bar"``      with exp(T1) moved onto the hamiltonian and the walker
+        - ``"upt2ccsd_sto_chol"`` the bar estimator with a semistochastic cholesky sum
+
+        By default ``"pt2ccsd"`` or ``"upt2ccsd"``, whichever matches the CC object; a
+        trial that does not match it is an error. Within a family all the kernels compute
+        the same energy. ``trot.mixed.available_mixed_recipes()`` lists what is
+        registered. ``max_memory`` and ``nchol_chunk`` apply to the chunking kernels,
+        which is every one but ``"pt2ccsd"``.
     guide : str, optional
         Which wavefunction propagates the walkers, by default the one the trial is
-        registered against ("rhf" for every pt2CCSD trial today). Recipes are keyed by
+        registered against ("rhf" for the pt2CCSD trials, "uhf" for the upt2CCSD ones).
+        Recipes are keyed by
         the (guide, trial) pair, so once a trial is registered against several guides
         this has to be given. It is also checked against the staged guide, so a mismatch
         is an error rather than a silently different calculation.
@@ -973,6 +984,12 @@ class AfqmcMixed(Afqmc):
 
             AfqmcMixed(mycc, trial="pt2ccsd_sto_chol",
                        trial_kwargs={"chol_cost_ratio": 0.25})
+    basis_a, basis_b : NDArray, optional
+        Unrestricted trials only: the alpha and beta orbital bases of the hamiltonian, as
+        in ``AfqmcUh``. They default to the CC object's own alpha and beta MOs, which is
+        where its amplitudes are expressed; bases given here must be the ones the
+        amplitudes were computed in (an unrestricted LNO fragment's active spaces, say).
+        The frozen core follows ``cc.frozen``.
     mixed_precision : bool, optional
         Single precision for the run, by default False. It reaches the guide propagator
         and the trial estimator's heavy two-body contractions; partial sums are always
@@ -1001,13 +1018,15 @@ class AfqmcMixed(Afqmc):
         self,
         cc: Any,
         *,
-        trial: str = "pt2ccsd",
+        trial: str | None = None,
         guide: str | None = None,
         memory_mode: str = "low",
         max_memory: float | None = None,
         nchol_chunk: int | None = None,
         trial_kwargs: dict[str, Any] | None = None,
         mixed_precision: bool = False,
+        basis_a: NDArray | None = None,
+        basis_b: NDArray | None = None,
         norb_frozen_core: int | None = None,
         norb_frozen: int | None = None,
         chol_cut: float = 1e-5,
@@ -1037,15 +1056,39 @@ class AfqmcMixed(Afqmc):
         defaults = self.params_cls()
         self.n_prop_steps = defaults.n_prop_steps if n_prop_steps is None else n_prop_steps
 
+        if self._cc is None:
+            raise ValueError(
+                "AfqmcMixed needs a pyscf CC object: the trial is built from its "
+                "amplitudes. Got a mean-field object, which supplies only the guide."
+            )
+
+        from pyscf.cc.uccsd import UCCSD
+
+        unrestricted = isinstance(self._cc, UCCSD)
+        suggested = "upt2ccsd" if unrestricted else "pt2ccsd"
+        if trial is None:
+            # the CC object's spin treatment picks between the two pt2CCSD families
+            trial = suggested
+
         self.recipe: MixedRecipe = get_mixed_recipe(trial, guide)
         self.trial: str = self.recipe.trial
         self.guide: str = self.recipe.guide
 
-        if self._cc is None:
+        if (self.recipe.ham_basis == "uchol") != unrestricted:
+            needs = "a UCCSD" if self.recipe.ham_basis == "uchol" else "a restricted CCSD"
             raise ValueError(
-                f"AfqmcMixed({trial!r}) needs a pyscf CC object: the trial is built from "
-                "its amplitudes. Got a mean-field object, which supplies only the guide."
+                f"trial={self.trial!r} needs {needs} object, got {type(self._cc).__name__}; "
+                f"use trial={suggested!r} or one of its _bar / _sto_chol variants."
             )
+        if (basis_a is not None or basis_b is not None) and self.recipe.ham_basis != "uchol":
+            raise ValueError(
+                "basis_a / basis_b set the alpha and beta orbital bases of the unrestricted "
+                f"hamiltonian, so they apply only to the unrestricted trials, not {self.trial!r}."
+            )
+        # orbital bases of the unrestricted hamiltonian, as in AfqmcUh; None means the
+        # CC object's own alpha and beta MOs, which is where its amplitudes live
+        self.basis_a = basis_a
+        self.basis_b = basis_b
 
         self.walker_kind = cast(WalkerKind, self.recipe.walker_kind)
         self.mixed_precision = mixed_precision
@@ -1097,7 +1140,6 @@ class AfqmcMixed(Afqmc):
         print(f" source_kind     = {meta['source_kind']}")
         print(f" chol_cut        = {meta['chol_cut']:g}")
         print(f" cache           = {str(self.cache) if self.cache else None}")
-        print(f" walker_kind     = {sys.walker_kind}")
         print(f" mixed_precision = {self.mixed_precision}\n")
 
         # the guide propagates the walkers, so it carries a force bias; the trial only
@@ -1159,16 +1201,42 @@ class AfqmcMixed(Afqmc):
         if self._staged is not None and self._cache_key == key and not force:
             return self._staged
 
-        staged = stage_inputs(
-            self._scf,
-            norb_frozen_core=(
-                int(self.norb_frozen_core) if self.norb_frozen_core is not None else None
-            ),
-            chol_cut=self.chol_cut,
-            cache=self.cache,
-            overwrite=self.overwrite_cache if self.cache is not None else False,
-            verbose=self.verbose,
-        )
+        if self.recipe.ham_basis == "uchol":
+            # as AfqmcUh.stage: build the unrestricted hamiltonian and hand it to stage(),
+            # which then stages only the guide. It is built from the CC object, whose alpha
+            # and beta MOs are the bases its amplitudes live in, and frozen with the core
+            # the CC object froze, so the hamiltonian and the amplitudes always agree
+            norb_frozen = int(staging.StagedMfOrCc(self._cc, self.norb_frozen_core).afqmc_frozen)
+            ham = staging.build_ham_uchol(
+                self._cc,
+                chol_cut=self.chol_cut,
+                basis_a=self.basis_a,
+                basis_b=self.basis_b,
+                norb_frozen_core=norb_frozen,
+                verbose=self.verbose,
+            )
+            staged = stage_inputs(
+                self._scf,
+                norb_frozen_core=norb_frozen,
+                chol_cut=self.chol_cut,
+                cache=self.cache,
+                overwrite=self.overwrite_cache if self.cache is not None else False,
+                verbose=self.verbose,
+                # StagedInputs.ham is typed as the restricted HamInput; the unrestricted
+                # path carries a HamInputU through the same slot
+                ham=cast(Any, ham),
+            )
+        else:
+            staged = stage_inputs(
+                self._scf,
+                norb_frozen_core=(
+                    int(self.norb_frozen_core) if self.norb_frozen_core is not None else None
+                ),
+                chol_cut=self.chol_cut,
+                cache=self.cache,
+                overwrite=self.overwrite_cache if self.cache is not None else False,
+                verbose=self.verbose,
+            )
         if staged.trial.kind != self.guide:
             raise ValueError(
                 f"guide={self.guide!r} was requested but the object underneath the CC one "
@@ -1176,6 +1244,18 @@ class AfqmcMixed(Afqmc):
                 f"needs a {self.guide} guide."
             )
         self._trial_input = self.recipe.stage_trial(self._cc, frozen=self.norb_frozen_core)
+
+        if self.recipe.ham_basis == "uchol":
+            norb_ham = tuple(int(n) for n in staged.ham.norb)
+            norb_trial = tuple(
+                int(self._trial_input.data[k].shape[0]) for k in ("mo_t_a", "mo_t_b")
+            )
+            if norb_ham != norb_trial:
+                raise ValueError(
+                    f"the unrestricted hamiltonian has norb={norb_ham} but the UCCSD "
+                    f"amplitudes span {norb_trial} orbitals; basis_a / basis_b must be the "
+                    "bases the amplitudes are expressed in."
+                )
 
         self._staged = staged
         self._cache_key = key

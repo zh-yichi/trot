@@ -1261,6 +1261,6 @@ def get_init_pt2trial_energy(
     )(walker_0, trial_data)
     guide_overlap = init_state.overlaps[0]
     trial_weights = init_state.weights * trial_overlap / guide_overlap
-    trial_energy = (ham_data.h0 + e0 + e1 - t2 * e1).mean()
+    trial_energy = (ham_data.h0 + e0 + e1 - t2 * e0).mean()
 
     return trial_energy + 0j, jnp.sum(trial_weights)

@@ -7,10 +7,12 @@ from typing import Any, Callable
 from .core.ops import MeasOps
 from .core.system import System, WalkerKind
 from .meas.pt2ccsd import make_pt2ccsd_meas_ops, plan_chunking_for_run
+from .meas.upt2ccsd import make_upt2ccsd_meas_ops, plan_chunking_for_run_u
 from .prop.blocks import MixedBlockFn, block_mixed
-from .staging import TrialInput, stage_pt2ccsd_trial
+from .staging import TrialInput, stage_pt2ccsd_trial, stage_upt2ccsd_trial
 from .stat_utils import pt2ccsd_blocking
 from .trial.pt2ccsd import make_pt2ccsd_trial_data
+from .trial.upt2ccsd import make_upt2ccsd_trial_data
 
 # Recipes for mixed guide/trial AFQMC, where the walkers propagate under one wavefunction
 # (the guide) and the energy is measured against another (the trial).
@@ -38,6 +40,9 @@ class MixedRecipe:
     make_trial_meas_ops:  (sys, ...) -> MeasOps for the trial estimator
     plan_chunking:        (sys, ham_data, trial_data, ...) -> ChunkPlan, or None if the
                           estimator has no memory model and so cannot honour max_memory
+    ham_basis:            the hamiltonian both halves use: "restricted" (HamChol, one
+                          orbital basis) or "uchol" (HamCholU, alpha and beta each in
+                          their own basis, as in AfqmcUh)
 
     mixed_block_fn:       per block propagate(guide) + measure(trial)
     blocking_fn:          combines the block components into (energy, stderr)
@@ -59,6 +64,7 @@ class MixedRecipe:
     blocking_fn: Callable[..., Any]
 
     plan_chunking: Callable[..., Any] | None = None
+    ham_basis: str = "restricted"
 
     @property
     def key(self) -> tuple[str, str]:
@@ -97,14 +103,49 @@ def _pt2ccsd_recipe(guide: str, trial: str, measure_type: str | None) -> MixedRe
     )
 
 
-MIXED_RECIPES: dict[tuple[str, str], MixedRecipe] = {
-    (guide, trial): _pt2ccsd_recipe(guide, trial, measure_type)
-    for guide, trial, measure_type in (
-        ("rhf", "pt2ccsd", None),
-        ("rhf", "pt2ccsd_chunk", "chunk"),
-        ("rhf", "pt2ccsd_bar", "bar"),
-        ("rhf", "pt2ccsd_sto_chol", "sto_chol"),
+def _upt2ccsd_recipe(guide: str, trial: str, measure_type: str) -> MixedRecipe:
+    """
+    The unrestricted pt2CCSD trials, run on the unrestricted (uchol) hamiltonian AfqmcUh
+    uses: each spin in its own MO basis, with unrestricted walkers under a UHF guide.
+
+    As for the restricted trials the name is the kernel choice: "upt2ccsd" the chunked
+    estimator, "upt2ccsd_bar" with exp(T1) on the hamiltonian, and "upt2ccsd_sto_chol"
+    that one with the T2-contracted two-body sum sampled. Every kernel returns the same
+    (t2, e0, e1) as the restricted ones, so the block function and the blocking analysis
+    are shared with them. All three are chunked, so all three can honour max_memory.
+    """
+    return MixedRecipe(
+        guide=guide,
+        trial=trial,
+        walker_kind="unrestricted",
+        stage_trial=stage_upt2ccsd_trial,
+        make_trial_data=make_upt2ccsd_trial_data,
+        make_trial_meas_ops=partial(make_upt2ccsd_meas_ops, measure_type=measure_type),
+        plan_chunking=partial(plan_chunking_for_run_u, measure_type=measure_type),
+        mixed_block_fn=block_mixed,
+        blocking_fn=pt2ccsd_blocking,
+        ham_basis="uchol",
     )
+
+
+MIXED_RECIPES: dict[tuple[str, str], MixedRecipe] = {
+    **{
+        (guide, trial): _pt2ccsd_recipe(guide, trial, measure_type)
+        for guide, trial, measure_type in (
+            ("rhf", "pt2ccsd", None),
+            ("rhf", "pt2ccsd_chunk", "chunk"),
+            ("rhf", "pt2ccsd_bar", "bar"),
+            ("rhf", "pt2ccsd_sto_chol", "sto_chol"),
+        )
+    },
+    **{
+        (guide, trial): _upt2ccsd_recipe(guide, trial, measure_type)
+        for guide, trial, measure_type in (
+            ("uhf", "upt2ccsd", "chunk"),
+            ("uhf", "upt2ccsd_bar", "bar"),
+            ("uhf", "upt2ccsd_sto_chol", "sto_chol"),
+        )
+    },
 }
 
 

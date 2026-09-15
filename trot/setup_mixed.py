@@ -11,7 +11,7 @@ from .core.ops import MeasOps
 from .core.system import System, WalkerKind
 from .driver import MixedQmcResult
 from .mixed import MixedRecipe, get_mixed_recipe
-from .prop.afqmc import make_prop_ops
+from .prop.afqmc import make_prop_ops, make_prop_ops_u
 from .prop.blocks import block as default_block
 from .prop.types import QmcParams, QmcParamsBase
 from .setup import Job, _assemble_job, _make_params, _resolve_default_walker_kind
@@ -42,6 +42,9 @@ def _make_prop_mixed(
     *,
     mixed_precision: bool,
 ) -> Any:
+    # the unrestricted (uchol) hamiltonian has its own propagator, as in setup._make_prop
+    if ham_data.basis == "uchol":
+        return make_prop_ops_u(ham_data.basis, walker_kind, mixed_precision=mixed_precision)
     return make_prop_ops(ham_data.basis, walker_kind, mixed_precision=mixed_precision)
 
 

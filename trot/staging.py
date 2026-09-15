@@ -1324,6 +1324,59 @@ def _stage_pt2ccsd_input(obj):
     )
 
 
+def stage_upt2ccsd_trial(cc: Any, *, frozen: int | ArrayLike | None = None) -> TrialInput:
+    """
+    Stage an unrestricted pt2CCSD trial from a pyscf UCCSD object, in the conventions of
+    afqmc's upt2ccsd trials (integral.save_cc_amplitude, slater_tools.uthouless).
+
+    Each spin is expressed in its own MO basis -- the basis build_ham_uchol builds that
+    spin's hamiltonian in -- so its reference occupies the leading nocc orbitals.
+
+    Returns a TrialInput with data {"mo_t_a", "mo_t_b", "t2aa", "t2ab", "t2bb"}: mo_t_s is
+    the Thouless-transformed reference exp(T1s)|HF_s>, and the doubles are (i, a, j, b)
+    with the same spin blocks antisymmetrized.
+    """
+    return _stage_upt2ccsd_input(StagedMfOrCc(cc, frozen))
+
+
+def _stage_upt2ccsd_input(obj: StagedMfOrCc) -> TrialInput:
+    if obj.kind != "uccsd":
+        raise ValueError(f"unrestricted pt2CCSD needs a UCCSD object, got kind {obj.kind!r}.")
+
+    t1a, t1b = (np.asarray(t) for t in obj.t1)
+    t2aa, t2ab, t2bb = (np.asarray(t) for t in obj.t2)
+
+    # antisymmetrize the same spin blocks (a no-op on pyscf's, which already are), then
+    # (i,j,a,b) -> (i,a,j,b)
+    t2aa = 0.5 * (t2aa - t2aa.transpose(0, 1, 3, 2))
+    t2bb = 0.5 * (t2bb - t2bb.transpose(0, 1, 3, 2))
+    t2aa = t2aa.transpose(0, 2, 1, 3)
+    t2ab = t2ab.transpose(0, 2, 1, 3)
+    t2bb = t2bb.transpose(0, 2, 1, 3)
+
+    def _thouless(t1):
+        # |psi'> = exp(t1_ia a+ i)|psi>, with |psi> the leading nocc orbitals of the MO
+        # basis; returns the mo_coeff of psi' in that basis
+        nocc, nvir = t1.shape
+        exp_t1 = np.eye(nocc + nvir, dtype=np.float64)
+        exp_t1[:nocc, nocc:] = t1
+        return exp_t1.T[:, :nocc]
+
+    data = {
+        "mo_t_a": _thouless(t1a),
+        "mo_t_b": _thouless(t1b),
+        "t2aa": t2aa,
+        "t2ab": t2ab,
+        "t2bb": t2bb,
+    }
+    return TrialInput(
+        kind="upt2ccsd",
+        data=data,
+        frozen=obj.trial_frozen,
+        source_kind=obj.source,
+    )
+
+
 # ---------------------------------------------------------------------------
 # ccpy interface helpers
 # ---------------------------------------------------------------------------
