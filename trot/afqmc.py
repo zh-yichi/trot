@@ -888,6 +888,22 @@ class AfqmcUh(Afqmc):
         return staged
 
 
+def _kernel_location(fn: Any) -> str:
+    """
+    Where a kernel is defined: the path inside the trot package, plus the function name.
+    Partials are unwrapped to the function they call; anything defined outside trot keeps
+    its full module path, since there is no relative path to give.
+    """
+    while isinstance(fn, partial):
+        fn = fn.func
+    name = getattr(fn, "__name__", type(fn).__name__)
+    module = getattr(fn, "__module__", "")
+    parts = module.split(".") if module else []
+    if parts and parts[0] == __name__.split(".")[0]:
+        parts = parts[1:]
+    return f"{'/'.join(parts)}.py:{name}" if parts else name
+
+
 class AfqmcMixed(Afqmc):
     """
     Mixed guide/trial AFQMC.
@@ -900,7 +916,8 @@ class AfqmcMixed(Afqmc):
         mf = scf.RHF(mol); mf.kernel()
         mycc = cc.CCSD(mf); mycc.kernel()
 
-        af = AfqmcMixed(mycc)          # RHF guide, pt2CCSD trial
+        af = AfqmcMixed(mycc)                                 # RHF guide, pt2CCSD trial
+        af = AfqmcMixed(mycc, trial="pt2ccsd_bar", guide="rhf")  # the bar energy kernel
         mean, err = af.kernel()        # returns the TRIAL (pt2CCSD) energy
 
     kernel() returns the trial energy; the guide result is kept alongside:
@@ -915,10 +932,63 @@ class AfqmcMixed(Afqmc):
         pyscf CC object. The guide is taken from ``cc._scf`` and the trial amplitudes
         from ``cc`` itself, so no second argument is needed.
     trial : str, optional
-        Which mixed recipe to run, by default "pt2ccsd". See
-        ``trot.mixed.available_mixed_recipes()``.
+        Which mixed recipe to run, by default "pt2ccsd". The name picks the energy
+        kernel the trial is measured with:
+
+        - ``"pt2ccsd"``       the plain estimator, one cholesky vector per scan step
+        - ``"pt2ccsd_chunk"`` chunked over the cholesky index
+        - ``"pt2ccsd_bar"``   chunked, with exp(T1) moved onto the hamiltonian and the
+          walker rather than the trial
+
+        All three compute the same energy. ``trot.mixed.available_mixed_recipes()``
+        lists what is registered. ``max_memory`` and ``nchol_chunk`` apply to the two
+        chunking kernels only.
+    guide : str, optional
+        Which wavefunction propagates the walkers, by default the one the trial is
+        registered against ("rhf" for every pt2CCSD trial today). Recipes are keyed by
+        the (guide, trial) pair, so once a trial is registered against several guides
+        this has to be given. It is also checked against the staged guide, so a mismatch
+        is an error rather than a silently different calculation.
     memory_mode : str, optional
-        Passed to the trial measurement ops, by default "low".
+        The trial estimator's memory layout, by default "low". None of the pt2CCSD
+        kernels branch on it today; the kernel choice lives in ``trial``.
+    max_memory : float, optional
+        Memory budget for the trial measurement, in MB as in pyscf, per device. The
+        estimator's memory model splits it between the two chunking knobs: the cholesky
+        chunk gives way first, and only when a single cholesky vector per step still does
+        not fit does ``n_chunks`` rise to take walkers out of flight -- at which point the
+        cholesky chunk is chosen again against the smaller walker count. This is the knob
+        to turn: it stays meaningful across system sizes and walker counts, where raw
+        chunk counts do not.
+    nchol_chunk : int, optional
+        Cholesky vectors per scan step, set directly. With ``max_memory`` it is taken as
+        fixed and only ``n_chunks`` is derived.
+    trial_kwargs : dict, optional
+        Extra options for the trial's measurement ops, for knobs that belong to one trial
+        rather than to every mixed run. ``"pt2ccsd_sto_chol"`` takes its sampling
+        controls this way -- ``n_chol_head``, ``n_chol_samples``, ``chol_cost_ratio`` and
+        the rest of the fields documented on ``Pt2ccsdMeasCfg``::
+
+            AfqmcMixed(mycc, trial="pt2ccsd_sto_chol",
+                       trial_kwargs={"chol_cost_ratio": 0.25})
+    mixed_precision : bool, optional
+        Single precision for the run, by default False. It reaches the guide propagator
+        and the trial estimator's heavy two-body contractions; partial sums are always
+        accumulated back in double. Only the chunked energy kernel honours it on the
+        trial side, and the guide's measurement ops do not honour it at all yet.
+
+    Examples
+    --------
+    Measure with the chunked kernel in single precision, keeping the measurement under
+    4 GB per device::
+
+        af = AfqmcMixed(
+            mycc, trial="pt2ccsd_chunk", max_memory=4000, n_walkers=50, mixed_precision=True
+        )
+
+    The chunking it settled on is on the job, and is printed with the flags::
+
+        print(af.build_job().chunk_plan.describe())
     """
 
     params_cls = QmcParams
@@ -930,7 +1000,12 @@ class AfqmcMixed(Afqmc):
         cc: Any,
         *,
         trial: str = "pt2ccsd",
+        guide: str | None = None,
         memory_mode: str = "low",
+        max_memory: float | None = None,
+        nchol_chunk: int | None = None,
+        trial_kwargs: dict[str, Any] | None = None,
+        mixed_precision: bool = False,
         norb_frozen_core: int | None = None,
         norb_frozen: int | None = None,
         chol_cut: float = 1e-5,
@@ -960,7 +1035,9 @@ class AfqmcMixed(Afqmc):
         defaults = self.params_cls()
         self.n_prop_steps = defaults.n_prop_steps if n_prop_steps is None else n_prop_steps
 
-        self.recipe: MixedRecipe = get_mixed_recipe(trial)
+        self.recipe: MixedRecipe = get_mixed_recipe(trial, guide)
+        self.trial: str = self.recipe.trial
+        self.guide: str = self.recipe.guide
 
         if self._cc is None:
             raise ValueError(
@@ -969,9 +1046,11 @@ class AfqmcMixed(Afqmc):
             )
 
         self.walker_kind = cast(WalkerKind, self.recipe.walker_kind)
-        # the pt2 correction is a small difference of larger numbers
-        self.mixed_precision = False
+        self.mixed_precision = mixed_precision
         self.memory_mode = memory_mode
+        self.max_memory = max_memory
+        self.nchol_chunk = nchol_chunk
+        self.extra_trial_kwargs: dict[str, Any] = dict(trial_kwargs or {})
 
         self._trial_input: TrialInput | None = None
         self.guide_e_tot: Any = None
@@ -980,6 +1059,77 @@ class AfqmcMixed(Afqmc):
     @property
     def trial_input(self) -> TrialInput | None:
         return self._trial_input
+
+    def _trial_kwargs(self) -> dict[str, Any]:
+        """
+        Options for the trial measurement ops. Only the ones that were actually set are
+        passed on, so a recipe is never handed a knob it does not have. Sizing against
+        max_memory happens in setup_mixed, which has the hamiltonian the model needs.
+        """
+        kwargs: dict[str, Any] = {"memory_mode": self.memory_mode}
+        if self.nchol_chunk is not None:
+            kwargs["nchol_chunk"] = self.nchol_chunk
+        # trial specific knobs last, so they can override the generic ones
+        kwargs.update(self.extra_trial_kwargs)
+        return kwargs
+
+    def dump_flags(self, job: JobMixed) -> None:
+        """
+        A mixed run prints its own flags rather than the inherited ones.
+
+        Afqmc's dump names a single "trial_kind", taken from job.staged.trial -- which in
+        a mixed run is the GUIDE, and would contradict the trial named below. Both
+        wavefunctions are listed here instead, each with the kernels it measures with.
+        """
+        from .core.ops import k_energy, k_force_bias
+        from .meas.pt2ccsd import get_pt2ccsd_meas_cfg
+
+        meta = job.staged.meta
+        sys = job.sys
+
+        print("\n******** AFQMC ********")
+        print(f" norb            = {sys.norb}")
+        print(f" nelec_up        = {sys.nelec[0]}")
+        print(f" nelec_dn        = {sys.nelec[1]}")
+        print(f" nchol           = {job.ham_data.nchol}")
+        print(f" walker_kind     = {sys.walker_kind}")
+        print(f" source_kind     = {meta['source_kind']}")
+        print(f" chol_cut        = {meta['chol_cut']:g}")
+        print(f" cache           = {str(self.cache) if self.cache else None}")
+        print(f" walker_kind     = {sys.walker_kind}")
+        print(f" mixed_precision = {self.mixed_precision}\n")
+
+        # the guide propagates the walkers, so it carries a force bias; the trial only
+        # measures, so it has none
+        for label, name, meas_ops in (
+            ("guide", self.guide, job.meas_ops),
+            ("trial", self.trial, job.mix_trial_meas_ops),
+        ):
+            print(f" {label:<15} = {name}")
+            print(f"   overlap_kernel    = {_kernel_location(meas_ops.overlap)}")
+            for key, shown in ((k_force_bias, "force_bias_kernel"), (k_energy, "energy_kernel")):
+                if meas_ops.has_kernel(key):
+                    print(f"   {shown:<17} = {_kernel_location(meas_ops.kernels[key])}")
+        print("")
+
+        guide_cfg = self._resolve_meas_cfg(job)
+        if guide_cfg is not None:
+            self._dump_cfg("meas_cfg", guide_cfg)
+            print("")
+
+        trial_cfg = get_pt2ccsd_meas_cfg(job.mix_trial_meas_ops)
+        if trial_cfg is not None:
+            self._dump_cfg("trial_meas_cfg", trial_cfg)
+            if trial_cfg.measure_type is not None:
+                # the chunk size the config actually resolves to against this hamiltonian
+                width = len(max(dataclasses.fields(trial_cfg), key=lambda f: len(f.name)).name)
+                print(f"  {'nchol_chunk_used':<{width}} = {job.mix_meas_ctx().nchol_chunk}")
+            print("")
+
+        if job.chunk_plan is not None:
+            print(f" chunk_plan      = {job.chunk_plan.describe()}\n")
+
+        self._dump_params(job.params)
 
     def stage(self, *, force: bool = False) -> StagedInputs:
         """
@@ -1003,6 +1153,12 @@ class AfqmcMixed(Afqmc):
             overwrite=self.overwrite_cache if self.cache is not None else False,
             verbose=self.verbose,
         )
+        if staged.trial.kind != self.guide:
+            raise ValueError(
+                f"guide={self.guide!r} was requested but the object underneath the CC one "
+                f"stages as {staged.trial.kind!r}; the {self.guide}+{self.trial} recipe "
+                f"needs a {self.guide} guide."
+            )
         self._trial_input = self.recipe.stage_trial(self._cc, frozen=self.norb_frozen_core)
 
         self._staged = staged
@@ -1026,14 +1182,19 @@ class AfqmcMixed(Afqmc):
                 staged,
                 recipe=self.recipe,
                 trial_input=self._trial_input,
-                trial_kwargs={"memory_mode": self.memory_mode},
+                trial_kwargs=self._trial_kwargs(),
                 walker_kind=self.walker_kind,
                 mesh=mesh,
                 mixed_precision=self.mixed_precision,
+                max_memory=self.max_memory,
                 params=cast(Any, qmc_params),
                 **kwargs,
             ),
         )
+        # the memory plan may have raised n_chunks, so adopt what setup_mixed settled on
+        self.params = job.params
+        self.n_chunks = int(job.params.n_chunks)
+
         self._job = job
         return job
 
@@ -1046,8 +1207,6 @@ class AfqmcMixed(Afqmc):
         mesh = driver_kwargs.get("mesh")
         job = self.build_job(mesh=mesh)
         self.dump_flags(job)
-        print(f" mixed recipe    = {self.recipe.name}")
-        print(f" guide           = {self.recipe.guide_kind}\n")
 
         qmc_result = job.kernel(**driver_kwargs)
 

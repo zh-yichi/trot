@@ -394,9 +394,20 @@ def block_mixed(
 
     # measuing with respect to trial
     trial_e_kernel = trial_meas_ops.require_kernel(k_energy)
-    pt2results = wk.vmap_chunked(
-        trial_e_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
-    )(state.walkers, ham_data, trial_meas_ctx, trial_data)
+    if trial_meas_ops.needs_rng(k_energy):
+        # a stochastic estimator gets a fresh key per walker every block: sharing one
+        # would make every walker sample the same terms, and reusing the block key would
+        # freeze the draws for the whole run
+        rng_key, sub = jax.random.split(state.rng_key)
+        state = state._replace(rng_key=rng_key)
+        walker_keys = jax.random.split(sub, wk.n_walkers(state.walkers))
+        pt2results = wk.vmap_chunked(
+            trial_e_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None, 0)
+        )(state.walkers, ham_data, trial_meas_ctx, trial_data, walker_keys)
+    else:
+        pt2results = wk.vmap_chunked(
+            trial_e_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
+        )(state.walkers, ham_data, trial_meas_ctx, trial_data)
     trial_t2s, trial_e0s, trial_e1s = pt2results[:, 0], pt2results[:, 1], pt2results[:, 2]
     trial_overlaps = wk.vmap_chunked(
         trial_meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None)

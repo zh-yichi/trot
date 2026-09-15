@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Union, cast
 
@@ -23,6 +23,16 @@ from .staging import StagedInputs, TrialInput
 # under the guide wavefunction with the guide's own hamiltonian, ops and propagator. So
 # _assemble_job builds it unchanged, and JobMixed only adds the trial that the energy is
 # measured against.
+
+
+def _walker_devices(mesh: Mesh | None) -> int:
+    """
+    How many devices the walker axis is spread over. Walkers are sharded on the "data"
+    axis, so that is what divides the population; a mesh without one is treated as whole.
+    """
+    if mesh is None:
+        return 1
+    return int(mesh.shape.get("data", mesh.size))
 
 
 def _make_prop_mixed(
@@ -48,6 +58,8 @@ class JobMixed(Job):
     recipe: MixedRecipe = None  # type: ignore[assignment]
     mix_trial_data: Any = None
     mix_trial_meas_ops: MeasOps = None  # type: ignore[assignment]
+    # how max_memory was split between the two chunking knobs, None if it was not given
+    chunk_plan: Any = None
     _runtime_mix_meas_ctx: object | None = field(default=None, init=False, repr=False)
 
     params_cls: ClassVar[type[QmcParamsBase]] = QmcParams
@@ -112,6 +124,7 @@ def setup_mixed(
     walker_kind: WalkerKind | None = None,
     mesh: Mesh | None = None,
     mixed_precision: bool = False,
+    max_memory: float | None = None,
     # params options
     params: QmcParams | None = None,
     # overrides for customized runs
@@ -131,6 +144,14 @@ def setup_mixed(
     path). trial_input supplies the measurement trial; if omitted it must have been
     staged already and passed in, since the trial generally comes from a different pyscf
     object than the guide.
+
+    mixed_precision is single precision for the whole run: the guide propagator and the
+    trial estimator both take it. The guide's measurement ops do not honour it yet, so
+    today it reaches the guide only through the propagator.
+
+    max_memory (MB) hands the recipe's memory model a budget for the measurement, which
+    it splits between the cholesky chunk and the walker chunk. It can raise params
+    .n_chunks, never lower it.
 
     Basic usage is through AfqmcMixed rather than this function directly.
     """
@@ -172,7 +193,35 @@ def setup_mixed(
     # attach the measurement trial
     job.recipe = rec
     job.mix_trial_data = rec.make_trial_data(trial_input.data, job.sys)
+
+    meas_kwargs = dict(trial_kwargs or {})
+
+    if max_memory is not None:
+        if rec.plan_chunking is None:
+            raise ValueError(
+                f"trial {rec.trial!r} measures with the unchunked energy kernel, which "
+                "has nothing for max_memory to size. Use trial='pt2ccsd_chunk' or "
+                "'pt2ccsd_bar', or drop max_memory."
+            )
+        assert job.params is not None
+        plan = rec.plan_chunking(
+            job.sys,
+            job.ham_data,
+            job.mix_trial_data,
+            n_walkers=job.params.n_walkers,
+            max_memory_mb=max_memory,
+            n_chunks=job.params.n_chunks,
+            nchol_chunk=meas_kwargs.get("nchol_chunk"),
+            mixed_precision=mixed_precision,
+            n_devices=_walker_devices(mesh),
+        )
+        meas_kwargs["nchol_chunk"] = plan.nchol_chunk
+        job.chunk_plan = plan
+        # the plan only ever raises n_chunks, so this cannot undercut a caller's setting
+        if plan.n_chunks != job.params.n_chunks:
+            job.params = replace(job.params, n_chunks=plan.n_chunks)
+
     job.mix_trial_meas_ops = rec.make_trial_meas_ops(
-        job.sys, **(trial_kwargs or {}), mixed_precision=mixed_precision
+        job.sys, **meas_kwargs, mixed_precision=mixed_precision
     )
     return job

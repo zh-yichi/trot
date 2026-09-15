@@ -250,14 +250,15 @@ def test_pt2ccsd_recipe_selects_its_own_blocking():
     the wrong estimator.
     """
     rec = get_mixed_recipe("pt2ccsd")
-    assert rec.guide_kind == "rhf"
+    assert rec.guide == "rhf"
+    assert rec.trial == "pt2ccsd"
     assert rec.walker_kind == "restricted"
     assert rec.mixed_block_fn is block_mixed
     assert rec.blocking_fn is pt2ccsd_blocking
 
     with pytest.raises(ValueError, match="unknown mixed recipe"):
         get_mixed_recipe("cisd")
-    assert "pt2ccsd" in available_mixed_recipes()
+    assert ("rhf", "pt2ccsd") in available_mixed_recipes()
 
 
 def test_public_staging_matches_private(h8_system):
