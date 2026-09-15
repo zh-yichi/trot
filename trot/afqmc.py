@@ -967,7 +967,9 @@ class AfqmcMixed(Afqmc):
         Extra options for the trial's measurement ops, for knobs that belong to one trial
         rather than to every mixed run. ``"pt2ccsd_sto_chol"`` takes its sampling
         controls this way -- ``n_chol_head``, ``n_chol_samples``, ``chol_cost_ratio`` and
-        the rest of the fields documented on ``Pt2ccsdMeasCfg``::
+        the rest of the fields documented on ``Pt2ccsdMeasCfg``. By default each walker
+        uses 20% of the cholesky vectors (``chol_cost_ratio=0.2``), split head : samples
+        = 3 : 1; the resolved sizes are printed with the flags::
 
             AfqmcMixed(mycc, trial="pt2ccsd_sto_chol",
                        trial_kwargs={"chol_cost_ratio": 0.25})
@@ -1082,15 +1084,14 @@ class AfqmcMixed(Afqmc):
         wavefunctions are listed here instead, each with the kernels it measures with.
         """
         from .core.ops import k_energy, k_force_bias
-        from .meas.pt2ccsd import get_pt2ccsd_meas_cfg
+        from .meas.pt2ccsd import get_pt2ccsd_meas_cfg, resolve_chol_budget
 
         meta = job.staged.meta
         sys = job.sys
 
         print("\n******** AFQMC ********")
+        print(f" nelec           = {sys.nelec}")
         print(f" norb            = {sys.norb}")
-        print(f" nelec_up        = {sys.nelec[0]}")
-        print(f" nelec_dn        = {sys.nelec[1]}")
         print(f" nchol           = {job.ham_data.nchol}")
         print(f" walker_kind     = {sys.walker_kind}")
         print(f" source_kind     = {meta['source_kind']}")
@@ -1124,6 +1125,21 @@ class AfqmcMixed(Afqmc):
                 # the chunk size the config actually resolves to against this hamiltonian
                 width = len(max(dataclasses.fields(trial_cfg), key=lambda f: len(f.name)).name)
                 print(f"  {'nchol_chunk_used':<{width}} = {job.mix_meas_ctx().nchol_chunk}")
+            if trial_cfg.measure_type == "sto_chol":
+                # the head and tail sizes the sampling knobs resolve to, defaults included
+                nchol = int(job.ham_data.nchol)
+                n_head, n_samples = resolve_chol_budget(
+                    nchol,
+                    trial_cfg.n_chol_head,
+                    trial_cfg.head_chol_ratio,
+                    trial_cfg.n_chol_samples,
+                    trial_cfg.chol_cost_ratio,
+                    trial_cfg.head_sample_ratio,
+                )
+                if n_head >= nchol:
+                    n_samples = 0  # a full head leaves no tail to sample
+                print(f"  {'n_chol_head_used':<{width}} = {n_head}")
+                print(f"  {'n_chol_samples_used':<{width}} = {n_samples}")
             print("")
 
         if job.chunk_plan is not None:

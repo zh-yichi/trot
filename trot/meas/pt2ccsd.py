@@ -65,6 +65,11 @@ def max_equal_chunk_pad(n: int) -> int:
 
 
 
+# per-walker cholesky budget for "sto_chol", as a fraction of nchol, split head : samples
+# by head_sample_ratio (3:1 by default)
+DEFAULT_CHOL_COST_RATIO = 0.2
+
+
 @dataclass(frozen=True)
 class Pt2ccsdMeasCfg:
     """
@@ -104,7 +109,7 @@ class Pt2ccsdMeasCfg:
     n_chol_head: int | str = 0  # head size; a positive int, or "full" to disable sampling
     head_chol_ratio: float | None = None  # head as a fraction of nchol, if n_chol_head == 0
     n_chol_samples: int | None = None  # tail draws per walker per block
-    chol_cost_ratio: float | None = None  # per-walker budget as a fraction of nchol
+    chol_cost_ratio: float = DEFAULT_CHOL_COST_RATIO  # per-walker budget as a fraction of nchol
     head_sample_ratio: float = 3.0  # how that budget splits head : samples
     chol_score_floor: float = 1.0e-6  # drop proposal weight negligible against the max
     chol_uniform_mix: float = 0.01  # uniform floor on the proposal, bounds 1/pi
@@ -841,30 +846,29 @@ def resolve_chol_budget(
     (n_samples * pi ~ 1), and the minimum is shallow between roughly 50% and 87% of the
     budget in the head.
 
+    chol_cost_ratio=None falls back to DEFAULT_CHOL_COST_RATIO (0.2), so by default every
+    walker touches 20% of the cholesky vectors, 3/4 of them in the head.
+
     Precedence, each half independently:
       n_chol_head      int > 0 or "full"  -- sets the head outright
       head_chol_ratio  not None           -- head = round(ratio * nchol)
-      chol_cost_ratio  not None           -- head = 0.75 * C
-      otherwise                           -- head = 0.125 * nchol
+      otherwise                           -- head = C * head_sample_ratio / (head_sample_ratio + 1)
     and for the tail:
       n_chol_samples   not None           -- used as given
-      chol_cost_ratio  not None           -- n_samples = 0.25 * C
-      otherwise                           -- n_samples = 128
+      otherwise                           -- n_samples = C / (head_sample_ratio + 1)
 
     So head_chol_ratio and/or n_chol_samples override the chol_cost_ratio split for that
     half only.
     """
-    if chol_cost_ratio is not None:
-        if not 0.0 < chol_cost_ratio <= 1.0:
-            raise ValueError(f"chol_cost_ratio must lie in (0, 1], got {chol_cost_ratio}")
-        if head_sample_ratio < 0.0:
-            raise ValueError("head_sample_ratio must be nonnegative")
-        budget = chol_cost_ratio * nchol
-        default_head = budget * head_sample_ratio / (head_sample_ratio + 1.0)
-        default_samples = budget / (head_sample_ratio + 1.0)
-    else:
-        default_head = 0.125 * nchol
-        default_samples = 128
+    if chol_cost_ratio is None:
+        chol_cost_ratio = DEFAULT_CHOL_COST_RATIO
+    if not 0.0 < chol_cost_ratio <= 1.0:
+        raise ValueError(f"chol_cost_ratio must lie in (0, 1], got {chol_cost_ratio}")
+    if head_sample_ratio < 0.0:
+        raise ValueError("head_sample_ratio must be nonnegative")
+    budget = chol_cost_ratio * nchol
+    default_head = budget * head_sample_ratio / (head_sample_ratio + 1.0)
+    default_samples = budget / (head_sample_ratio + 1.0)
 
     if isinstance(n_chol_head, str):
         if n_chol_head.lower() != "full":
