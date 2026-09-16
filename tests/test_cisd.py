@@ -33,8 +33,8 @@ from trot.runtime_layout import (
     _build_restricted_prop_ctx_from_host,
     _make_ham_data,
 )
+from trot.cholesky import freeze_core_from_mo_cholesky
 from trot.setup import setup as setup_job
-from trot.staging import _freeze_core_from_mo_cholesky
 from trot.trial.cisd import (
     CisdTrial,
     make_cisd_trial_data,
@@ -511,7 +511,7 @@ def test_freeze_core_from_mo_cholesky_matches_pyscf_get_h1eff():
     eri = ao2mo.restore(1, ao2mo.kernel(mol, mo_coeff), nmo)
     chol = _exact_cholesky_from_mo_eri(eri)
 
-    ecore, h1_eff, chol_act, nelec = _freeze_core_from_mo_cholesky(
+    ecore, h1_eff, chol_act, nelec = freeze_core_from_mo_cholesky(
         h0=float(mf.energy_nuc()),
         h1=np.asarray(h1),
         chol=chol,

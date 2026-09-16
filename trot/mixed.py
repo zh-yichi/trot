@@ -172,9 +172,7 @@ def get_mixed_recipe(trial: str, guide: str | None = None) -> MixedRecipe:
 
     matches = [rec for (_, t), rec in MIXED_RECIPES.items() if t == trial]
     if not matches:
-        raise ValueError(
-            f"unknown mixed recipe trial={trial!r}; available: {_format_pairs()}"
-        )
+        raise ValueError(f"unknown mixed recipe trial={trial!r}; available: {_format_pairs()}")
     if len(matches) > 1:
         guides = ", ".join(sorted(rec.guide for rec in matches))
         raise ValueError(

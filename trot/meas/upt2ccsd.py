@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax, tree_util
 
+from ..cholesky import equal_chunks, max_equal_chunk_pad
 from ..core.ops import MeasOps, k_energy
 from ..ham.chol_u import HamCholU
 from ..trial.upt2ccsd import Upt2ccsdTrial, overlap_u
@@ -17,9 +18,7 @@ from .pt2ccsd import (
     ChunkPlan,
     Pt2ccsdMeasCfg,
     Pt2ccsdMemoryModel,
-    _equal_chunks,
     chol_sampling_proposal,
-    max_equal_chunk_pad,
     plan_pt2ccsd_chunking,
     resolve_chol_budget,
     t1_from_mo_t,
@@ -268,7 +267,7 @@ def build_meas_ctx(
 
     # cfg.nchol_chunk is a cap; resolve the even division the kernels will really scan
     cap = min(requested, nchol) if nchol > 0 else requested
-    _, nchol_chunk, _ = _equal_chunks(nchol, cap)
+    _, nchol_chunk, _ = equal_chunks(nchol, cap)
 
     needs_bar = cfg.measure_type in ("bar", "sto_chol")
     bar = build_bar_intermediates_u(ham_data, trial_data) if needs_bar else {}
@@ -461,8 +460,12 @@ def _bar_chunk_terms(
     """
     nocc_a, nocc_b = trial_data.nocc
 
-    gl_a = jnp.einsum("ir,gqr->giq", bw.green_a, chol_a_c, optimize="optimal")  # (k, nocc_a, norb_a)
-    gl_b = jnp.einsum("ir,gqr->giq", bw.green_b, chol_b_c, optimize="optimal")  # (k, nocc_b, norb_b)
+    gl_a = jnp.einsum(
+        "ir,gqr->giq", bw.green_a, chol_a_c, optimize="optimal"
+    )  # (k, nocc_a, norb_a)
+    gl_b = jnp.einsum(
+        "ir,gqr->giq", bw.green_b, chol_b_c, optimize="optimal"
+    )  # (k, nocc_b, norb_b)
     e2_0_g, tr_gl = _e2_0_g(gl_a[:, :, :nocc_a], gl_b[:, :, :nocc_b])
 
     # e2_2_2_1: only the trace of chol . t2_green is needed
@@ -564,11 +567,15 @@ def energy_kernel_uw_uh_chunk(
 
     # <exp(T1)HF|T2 h2|walker>/<exp(T1)HF|walker>, chunked over the shared cholesky index.
     # both spins are padded the same way, so the leftover contributes to neither
-    nchunks, nchol_chunk, pad = _equal_chunks(chol_a.shape[0], meas_ctx.nchol_chunk)
+    nchunks, nchol_chunk, pad = equal_chunks(chol_a.shape[0], meas_ctx.nchol_chunk)
     chol_a = _pad_reshape(chol_a, nchunks, nchol_chunk, pad)
     chol_b = _pad_reshape(chol_b, nchunks, nchol_chunk, pad)
 
-    t2_r = (trial_data.t2aa.astype(rtype), trial_data.t2ab.astype(rtype), trial_data.t2bb.astype(rtype))
+    t2_r = (
+        trial_data.t2aa.astype(rtype),
+        trial_data.t2ab.astype(rtype),
+        trial_data.t2bb.astype(rtype),
+    )
 
     def scanned_fun(carry, x):
         chol_a_c, chol_b_c = x  # (k, norb_a, norb_a), (k, norb_b, norb_b)
@@ -642,11 +649,15 @@ def energy_kernel_uw_uh_bar(
     chol_a, chol_b = meas_ctx.chol_bar_a, meas_ctx.chol_bar_b
     assert chol_a is not None and chol_b is not None
 
-    nchunks, nchol_chunk, pad = _equal_chunks(chol_a.shape[0], meas_ctx.nchol_chunk)
+    nchunks, nchol_chunk, pad = equal_chunks(chol_a.shape[0], meas_ctx.nchol_chunk)
     chol_a = _pad_reshape(chol_a, nchunks, nchol_chunk, pad)
     chol_b = _pad_reshape(chol_b, nchunks, nchol_chunk, pad)
 
-    t2_r = (trial_data.t2aa.astype(rtype), trial_data.t2ab.astype(rtype), trial_data.t2bb.astype(rtype))
+    t2_r = (
+        trial_data.t2aa.astype(rtype),
+        trial_data.t2ab.astype(rtype),
+        trial_data.t2bb.astype(rtype),
+    )
 
     def scanned_fun(carry, x):
         e2_0_g, e2_2_2_1_g, e2_2_2_2_g, e2_2_3_g = _bar_chunk_terms(
@@ -705,7 +716,11 @@ def energy_kernel_uw_uh_sto(
     assert chol_a is not None and chol_b is not None
     nchol = chol_a.shape[0]
     nchol_chunk = meas_ctx.nchol_chunk
-    t2_r = (trial_data.t2aa.astype(rtype), trial_data.t2ab.astype(rtype), trial_data.t2bb.astype(rtype))
+    t2_r = (
+        trial_data.t2aa.astype(rtype),
+        trial_data.t2ab.astype(rtype),
+        trial_data.t2bb.astype(rtype),
+    )
 
     # ---- pass 1: e2_0 per cholesky vector, exact, no T2 anywhere ----
     # fed the half rotated chol_s[:, :nocc_s, :]: e2_0 only touches the occupied blocks
@@ -717,7 +732,7 @@ def energy_kernel_uw_uh_sto(
         e2_0_g = e2_0_g.astype(c128)
         return carry + jnp.sum(e2_0_g), e2_0_g
 
-    n_chunk1, chunk1, npad1 = _equal_chunks(nchol, nchol_chunk)
+    n_chunk1, chunk1, npad1 = equal_chunks(nchol, nchol_chunk)
     e2_0, e2_0_chunks = lax.scan(
         scan_e2_0,
         jnp.zeros((), dtype=c128),
@@ -779,7 +794,7 @@ def energy_kernel_uw_uh_sto(
         n = weights.shape[0]
         if n == 0:
             return zero, zero, zero
-        n_ch, chunk, npad = _equal_chunks(n, nchol_chunk)
+        n_ch, chunk, npad = equal_chunks(n, nchol_chunk)
         if npad:
             weights = jnp.pad(weights, (0, npad))
         out, _ = lax.scan(
@@ -798,7 +813,7 @@ def energy_kernel_uw_uh_sto(
         n = weights.shape[0]
         if n == 0:
             return zero, zero, zero
-        n_ch, chunk, npad = _equal_chunks(n, nchol_chunk)
+        n_ch, chunk, npad = equal_chunks(n, nchol_chunk)
         if npad:
             # pad with index 0 at zero weight, which contributes nothing
             idx = jnp.pad(idx, (0, npad))

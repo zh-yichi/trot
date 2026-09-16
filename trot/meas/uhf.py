@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax, tree_util
 
+from ..cholesky import chunk_rot_chol
 from ..core.ops import MeasOps, k_energy, k_force_bias, o_density_corr, o_rdm1
 from ..core.system import System
 from ..ham.chol import HamChol
@@ -358,18 +359,6 @@ def u_rot_energy(
     return h0 + e1 + e2
 
 
-def _chunk_rot_chol(rot_chol: jax.Array, nchol_chunk: int | None) -> jax.Array:
-    """(n_chol, nocc, norb) -> (n_chunks, nchol_chunk, nocc, norb), zero padded."""
-    n_chol = int(rot_chol.shape[0])
-    chunk = n_chol if nchol_chunk is None else int(nchol_chunk)
-    chunk = max(1, min(chunk, n_chol))
-    n_chunks = -(-n_chol // chunk)
-    pad = n_chunks * chunk - n_chol
-    if pad:
-        rot_chol = jnp.pad(rot_chol, ((0, pad), (0, 0), (0, 0)))
-    return rot_chol.reshape(n_chunks, chunk, *rot_chol.shape[1:])
-
-
 def force_bias_kernel_uw_uh(
     walker: tuple[jax.Array, jax.Array],
     ham_data: HamCholU,
@@ -390,8 +379,8 @@ def energy_kernel_uw_uh(
 ) -> jax.Array:
     bra = (trial_data.mo_coeff_a, trial_data.mo_coeff_b)
     rot_chol = (
-        _chunk_rot_chol(meas_ctx.rot_chol_a, nchol_chunk),
-        _chunk_rot_chol(meas_ctx.rot_chol_b, nchol_chunk),
+        chunk_rot_chol(meas_ctx.rot_chol_a, nchol_chunk),
+        chunk_rot_chol(meas_ctx.rot_chol_b, nchol_chunk),
     )
     return u_rot_energy(
         bra,

@@ -14,6 +14,15 @@ from numpy.typing import ArrayLike, NDArray
 
 print = partial(print, flush=True)
 
+from .cholesky import (
+    ao_cholesky,
+    chunked_cholesky,
+    freeze_core_from_mo_cholesky,
+    freeze_core_from_mo_cholesky_uh,
+    modified_cholesky,
+    rotate_chol_to_ghf_mo,
+    rotate_chol_to_mo,
+)
 from .ham.chol import HamBasis
 
 # This file contains staging utilities to convert pyscf mf/cc objects
@@ -95,59 +104,6 @@ def _copy_scf_with_cc_mo_coeff(cc: Any, mf: Any) -> Any:
     return mf_copy
 
 
-def _freeze_core_from_mo_cholesky(
-    *,
-    h0: float,
-    h1: NDArray,
-    chol: NDArray,
-    norb_frozen: int,
-    nelec: Tuple[int, int],
-) -> tuple[float, NDArray, NDArray, Tuple[int, int]]:
-    nmo = int(h1.shape[0])
-    if h1.shape != (nmo, nmo):
-        raise ValueError(f"h1 must be square, got shape {h1.shape}.")
-    if chol.ndim != 3 or chol.shape[1:] != (nmo, nmo):
-        raise ValueError(f"chol must have shape (nchol, {nmo}, {nmo}), got {chol.shape}.")
-    if norb_frozen < 0:
-        raise ValueError(f"norb_frozen must be non-negative, got {norb_frozen}.")
-    if norb_frozen > min(nelec):
-        raise ValueError(f"norb_frozen={norb_frozen} exceeds min(nelec)={min(nelec)}")
-    if norb_frozen >= nmo:
-        raise ValueError(f"norb_frozen={norb_frozen} leaves no active orbitals (nmo={nmo}).")
-    if norb_frozen == 0:
-        return float(h0), np.asarray(h1), np.asarray(chol), nelec
-
-    nelec_active = (int(nelec[0] - norb_frozen), int(nelec[1] - norb_frozen))
-    if nelec_active[0] < 0 or nelec_active[1] < 0:
-        raise ValueError(
-            f"norb_frozen={norb_frozen} leaves negative active electron count "
-            f"{nelec_active} from nelec={nelec}."
-        )
-    if sum(nelec_active) <= 0:
-        raise ValueError("Frozen core left no active electrons.")
-
-    core = slice(0, norb_frozen)
-    act = slice(norb_frozen, nmo)
-
-    chol_core = np.asarray(chol[:, core, core])
-    chol_act = np.asarray(chol[:, act, act])
-    chol_act_core = np.asarray(chol[:, act, core])
-    chol_core_act = np.asarray(chol[:, core, act])
-
-    core_trace = np.trace(chol_core, axis1=1, axis2=2)
-    vj = 2.0 * np.einsum("x,xpq->pq", core_trace, chol_act, optimize=True)
-    vk = np.einsum("xpi,xiq->pq", chol_act_core, chol_core_act, optimize=True)
-
-    h1_eff = np.asarray(h1[act, act]) + vj - vk
-
-    e1_core = 2.0 * np.trace(np.asarray(h1[core, core]))
-    ej_core = 2.0 * np.dot(core_trace, core_trace)
-    ek_core = np.einsum("xij,xji->", chol_core, chol_core, optimize=True)
-    ecore = float(np.real(h0 + e1_core + ej_core - ek_core))
-
-    return ecore, np.asarray(h1_eff), np.array(chol_act, copy=True), nelec_active
-
-
 def _infer_restricted_trial_freeze_from_cc(
     *,
     cc_frozen: Any,
@@ -187,210 +143,6 @@ def _infer_restricted_trial_freeze_from_cc(
     nocc_t_core = nocc_cc_frozen - norb_frozen
     nvir_t_outer = nvir_cc_frozen
     return nocc_t_core, nvir_t_outer
-
-
-def modified_cholesky(
-    mat: Array,
-    max_error: float = 1e-6,
-) -> Array:
-    """Modified cholesky decomposition for a given matrix.
-
-    Args:
-        mat (Array): Matrix to decompose.
-        max_error (float, optional): Maximum error allowed. Defaults to 1e-6.
-
-    Returns:
-        Array: Cholesky vectors.
-    """
-    diag = mat.diagonal()
-    norb = int(((-1 + (1 + 8 * mat.shape[0]) ** 0.5) / 2))
-    size = mat.shape[0]
-    nchol_max = size
-    chol_vecs = np.zeros((nchol_max, nchol_max))
-    # ndiag = 0
-    nu = np.argmax(diag)
-    delta_max = diag[nu]
-    Mapprox = np.zeros(size)
-    chol_vecs[0] = np.copy(mat[nu]) / delta_max**0.5
-
-    nchol = 0
-    while abs(delta_max) > max_error and (nchol + 1) < nchol_max:
-        Mapprox += chol_vecs[nchol] * chol_vecs[nchol]
-        delta = diag - Mapprox
-        nu = np.argmax(np.abs(delta))
-        delta_max = np.abs(delta[nu])
-        R = np.dot(chol_vecs[: nchol + 1, nu], chol_vecs[: nchol + 1, :])
-        chol_vecs[nchol + 1] = (mat[nu] - R) / (delta_max + 1e-10) ** 0.5
-        nchol += 1
-
-    chol0 = chol_vecs[:nchol]
-    nchol = chol0.shape[0]
-    chol = np.zeros((nchol, norb, norb))
-    for i in range(nchol):
-        for m in range(norb):
-            for n in range(m + 1):
-                triind = m * (m + 1) // 2 + n
-                chol[i, m, n] = chol0[i, triind]
-                chol[i, n, m] = chol0[i, triind]
-    return chol
-
-
-def chunked_cholesky(mol, max_error=1e-6, verbose=False, cmax=10) -> NDArray:
-    """Modified cholesky decomposition from pyscf eris.
-
-    See, e.g. [Motta17]_
-
-    Only works for molecular systems. (copied from pauxy)
-
-    Parameters
-    ----------
-    mol : :class:`pyscf.mol`
-        pyscf mol object.
-    orthoAO: :class:`numpy.ndarray`
-        Orthogonalising matrix for AOs. (e.g., mo_coeff).
-    delta : float
-        Accuracy desired.
-    verbose : bool
-        If true print out convergence progress.
-    cmax : int
-        nchol = cmax * M, where M is the number of basis functions.
-        Controls buffer size for cholesky vectors.
-
-    Returns
-    -------
-    chol_vecs : :class:`numpy.ndarray`
-        Matrix of cholesky vectors in AO basis.
-    """
-    nao = mol.nao_nr()
-    diag = np.zeros(nao * nao)
-    nchol_max = cmax * nao
-    chol_vecs = np.zeros((nchol_max, nao * nao))
-    ndiag = 0
-    dims = [0]
-    nao_per_i = 0
-    for i in range(0, mol.nbas):
-        l = mol.bas_angular(i)
-        nc = mol.bas_nctr(i)
-        nao_per_i += (2 * l + 1) * nc
-        dims.append(nao_per_i)
-    # print (dims)
-    for i in range(0, mol.nbas):
-        shls = (i, i + 1, 0, mol.nbas, i, i + 1, 0, mol.nbas)
-        buf = mol.intor("int2e_sph", shls_slice=shls)
-        di, dk, dj, dl = buf.shape
-        diag[ndiag : ndiag + di * nao] = buf.reshape(di * nao, di * nao).diagonal()
-        ndiag += di * nao
-    nu = np.argmax(diag)
-    delta_max = diag[nu]
-    if verbose:
-        print("# Generating Cholesky decomposition of ERIs.")
-        print("# max number of cholesky vectors = %d" % nchol_max)
-        print("# iteration %5d: delta_max = %f" % (0, delta_max))
-    j = nu // nao
-    l = nu % nao
-    sj = np.searchsorted(dims, j)
-    sl = np.searchsorted(dims, l)
-    if dims[sj] != j and j != 0:
-        sj -= 1
-    if dims[sl] != l and l != 0:
-        sl -= 1
-    Mapprox = np.zeros(nao * nao)
-    # ERI[:,jl]
-    eri_col = mol.intor("int2e_sph", shls_slice=(0, mol.nbas, 0, mol.nbas, sj, sj + 1, sl, sl + 1))
-    cj, cl = max(j - dims[sj], 0), max(l - dims[sl], 0)
-    chol_vecs[0] = np.copy(eri_col[:, :, cj, cl].reshape(nao * nao)) / delta_max**0.5
-
-    nchol = 0
-    while abs(delta_max) > max_error:
-        # Update cholesky vector
-        start = time.time()
-        # M'_ii = L_i^x L_i^x
-        Mapprox += chol_vecs[nchol] * chol_vecs[nchol]
-        # D_ii = M_ii - M'_ii
-        delta = diag - Mapprox
-        nu = np.argmax(np.abs(delta))
-        delta_max = np.abs(delta[nu])
-        # Compute ERI chunk.
-        # shls_slice computes shells of integrals as determined by the angular
-        # momentum of the basis function and the number of contraction
-        # coefficients. Need to search for AO index within this shell indexing
-        # scheme.
-        # AO index.
-        j = nu // nao
-        l = nu % nao
-        # Associated shell index.
-        sj = np.searchsorted(dims, j)
-        sl = np.searchsorted(dims, l)
-        if dims[sj] != j and j != 0:
-            sj -= 1
-        if dims[sl] != l and l != 0:
-            sl -= 1
-        # Compute ERI chunk.
-        eri_col = mol.intor(
-            "int2e_sph", shls_slice=(0, mol.nbas, 0, mol.nbas, sj, sj + 1, sl, sl + 1)
-        )
-        # Select correct ERI chunk from shell.
-        cj, cl = max(j - dims[sj], 0), max(l - dims[sl], 0)
-        Munu0 = eri_col[:, :, cj, cl].reshape(nao * nao)
-        # Updated residual = \sum_x L_i^x L_nu^x
-        R = np.dot(chol_vecs[: nchol + 1, nu], chol_vecs[: nchol + 1, :])
-        chol_vecs[nchol + 1] = (Munu0 - R) / (delta_max) ** 0.5
-        nchol += 1
-        if verbose:
-            step_time = time.time() - start
-            info = (nchol, delta_max, step_time)
-            print("# iteration %5d: delta_max = %13.8e: time = %13.8e" % info)
-
-    return chol_vecs[:nchol]
-
-
-def _rotate_chol_to_mo(chol_vec: Array, basis_coeff: Array) -> Array:
-    """Rotate AO-space Cholesky into an MO basis."""
-    C = np.asarray(basis_coeff)
-    nao, norb = C.shape
-    nchol = int(chol_vec.shape[0])
-    out_dtype = np.result_type(chol_vec.dtype, C.dtype)
-
-    reuse_storage = nao == norb and out_dtype == chol_vec.dtype
-    if reuse_storage:
-        chol = chol_vec.reshape(nchol, nao, nao)
-    else:
-        chol = np.empty((nchol, norb, norb), dtype=out_dtype)
-
-    Cdag = np.asarray(C.conj().T)
-    tmp = np.empty((nao, norb), dtype=out_dtype)
-    for i in range(nchol):
-        chol_i_ao = chol_vec[i].reshape(nao, nao)
-        np.dot(chol_i_ao, C, out=tmp)
-        np.dot(Cdag, tmp, out=chol[i])
-
-    return chol
-
-
-def _rotate_chol_to_ghf_mo(chol_vec: Array, basis_coeff: Array) -> Array:
-    """Rotate spatial AO Cholesky factors into a generalized-spin MO basis."""
-    C = np.asarray(basis_coeff)
-    nao2, nmo = C.shape
-    if nao2 % 2 != 0:
-        raise ValueError(f"Expected even GHF AO dimension, got {nao2}")
-
-    nao = nao2 // 2
-    nchol = int(chol_vec.shape[0])
-    out_dtype = np.result_type(chol_vec.dtype, C.dtype)
-    chol = np.empty((nchol, nmo, nmo), dtype=out_dtype)
-
-    Cdag = np.asarray(C.conj().T)
-    chol_i_full = np.zeros((nao2, nao2), dtype=out_dtype)
-    tmp = np.empty((nao2, nmo), dtype=out_dtype)
-    for i in range(nchol):
-        chol_i = chol_vec[i].reshape(nao, nao)
-        chol_i_full.fill(0)
-        chol_i_full[:nao, :nao] = chol_i
-        chol_i_full[nao:, nao:] = chol_i
-        np.dot(chol_i_full, C, out=tmp)
-        np.dot(Cdag, tmp, out=chol[i])
-
-    return chol
 
 
 def _stage_frozen(frozen: int | ArrayLike | None) -> int | NDArray | None:
@@ -927,10 +679,10 @@ def _stage_ham_input(obj: StagedMfOrCc, *, chol_cut: float, verbose: bool) -> Ha
     C = np.asarray(basis_coeff)
     if scf_obj.kind != "ghf":
         norb = int(basis_coeff.shape[1])
-        chol = _rotate_chol_to_mo(chol_vec, C)
+        chol = rotate_chol_to_mo(chol_vec, C)
     else:
         norb = basis_coeff.shape[1] // 2
-        chol = _rotate_chol_to_ghf_mo(chol_vec, C)
+        chol = rotate_chol_to_ghf_mo(chol_vec, C)
 
     # freeze core
     if norb_frozen > 0 and scf_obj.kind != "ghf":
@@ -943,7 +695,7 @@ def _stage_ham_input(obj: StagedMfOrCc, *, chol_cut: float, verbose: bool) -> Ha
         if min(nelec_active) < 0 or sum(nelec_active) <= 0 or ncas <= 0:
             raise ValueError("Frozen core left no active electrons/orbitals.")
 
-        h0, h1, chol, nelec = _freeze_core_from_mo_cholesky(
+        h0, h1, chol, nelec = freeze_core_from_mo_cholesky(
             h0=h0,
             h1=h1,
             chol=chol,
@@ -1563,182 +1315,6 @@ class HamInputU:
     basis: str = "uchol"
 
 
-def df2chol(dferi: NDArray, max_error: float = 1e-6) -> NDArray:
-    """
-    Modified cholesky decomposition of a density fitting tensor.
-
-    Args:
-        dferi: packed 3-index DF integrals, shape (n_aux, n_pair) with n_pair the lower
-            triangle of the AO pair index (pyscf lib.pack_tril ordering).
-        max_error: stop when the residual diagonal falls below this.
-
-    Returns:
-        (n_chol, norb, norb) cholesky vectors.
-    """
-    dferi = np.asarray(dferi)
-    n_aux, n_pair = dferi.shape
-    norb = int(round((-1 + (1 + 8 * n_pair) ** 0.5) / 2))
-    if norb * (norb + 1) // 2 != n_pair:
-        raise ValueError(f"n_pair={n_pair} is not a valid packed lower triangle size")
-
-    diag = (dferi**2).sum(axis=0)
-    chol_vecs = np.zeros((n_aux, n_pair))
-    m_approx = np.zeros(n_pair)
-    diag_residual = diag.copy()
-
-    nchol = 0
-    while nchol < n_aux:
-        nu = int(np.argmax(diag_residual))
-        delta_max = diag_residual[nu]
-        if delta_max < max_error:
-            break
-
-        row_nu = dferi.T @ dferi[:, nu]
-        if nchol == 0:
-            chol_vecs[nchol] = row_nu / delta_max**0.5
-        else:
-            r = chol_vecs[:nchol, nu] @ chol_vecs[:nchol, :]
-            chol_vecs[nchol] = (row_nu - r) / delta_max**0.5
-
-        m_approx += chol_vecs[nchol] ** 2
-        diag_residual = np.abs(diag - m_approx)
-        nchol += 1
-
-    chol = np.zeros((nchol, norb, norb))
-    row_idx, col_idx = np.tril_indices(norb)
-    chol[:, row_idx, col_idx] = chol_vecs[:nchol]
-    chol[:, col_idx, row_idx] = chol_vecs[:nchol]
-    return chol
-
-
-def _df_cderi(mf: Any) -> NDArray | None:
-    """Packed (n_aux, n_pair) DF tensor if this mean field is density fitted, else None."""
-    with_df = getattr(mf, "with_df", None)
-    if with_df is None:
-        return None
-    blocks = [np.asarray(b) for b in with_df.loop()]
-    if not blocks:
-        return None
-    return np.vstack(blocks)
-
-
-def ao_cholesky(mf: Any, mol: Any, *, chol_cut: float, verbose: bool = False) -> NDArray:
-    """
-    AO cholesky vectors, flattened to (n_chol, nao*nao).
-
-    Uses the density fitting tensor when the mean field carries one, otherwise falls back
-    to the modified cholesky decomposition of the AO ERIs.
-    """
-    t0 = time.time()
-    cderi = _df_cderi(mf)
-
-    if cderi is not None:
-        print(
-            f"[stage] cholesky from density fitting (n_aux={cderi.shape[0]}), "
-            f"max_error={chol_cut:g} ..."
-        )
-        chol = df2chol(cderi, max_error=chol_cut)
-        nao = int(chol.shape[1])
-        chol = chol.reshape(chol.shape[0], nao * nao)
-        source = "density fitting"
-    else:
-        print(f"[stage] AO modified cholesky, max_error={chol_cut:g} ...")
-        chol = np.asarray(chunked_cholesky(mol, max_error=chol_cut, verbose=verbose))
-        source = "AO modified cholesky"
-
-    print(f"[stage] {source}: nchol={chol.shape[0]} in {time.time() - t0:.2f}s")
-    return chol
-
-
-def _freeze_core_from_mo_cholesky_uh(
-    *,
-    h0: float,
-    h1_a: NDArray,
-    h1_b: NDArray,
-    chol_a: NDArray,
-    chol_b: NDArray,
-    norb_frozen: int,
-    nelec: Tuple[int, int],
-) -> tuple[float, NDArray, NDArray, NDArray, NDArray, Tuple[int, int]]:
-    """
-    Unrestricted frozen core.
-
-    _freeze_core_from_mo_cholesky is closed shell: it carries factors of 2 that assume
-    both spins occupy the same spatial core orbitals. Here the two spins have their own
-    basis and their own core, so:
-
-        E_core   = sum_sigma tr h^sigma_cc
-                   + 1/2 sum_g [ T_g^2 - sum_sigma tr(L^sigma_cc L^sigma_cc) ]
-        h1_eff^s = h^s_aa + sum_g T_g L^s_aa - sum_g L^s_ac L^s_ca
-
-    with T_g = tr L^a_g,cc + tr L^b_g,cc the core trace summed over spin. The coulomb
-    term sees both spins (T_g), the exchange term only its own.
-
-    Setting alpha == beta reduces to the restricted expressions.
-    """
-    if norb_frozen < 0:
-        raise ValueError(f"norb_frozen must be non-negative, got {norb_frozen}.")
-    if norb_frozen == 0:
-        return float(h0), h1_a, h1_b, chol_a, chol_b, nelec
-    if norb_frozen > min(nelec):
-        raise ValueError(f"norb_frozen={norb_frozen} exceeds min(nelec)={min(nelec)}")
-
-    nmo_a, nmo_b = int(h1_a.shape[0]), int(h1_b.shape[0])
-    if norb_frozen >= min(nmo_a, nmo_b):
-        raise ValueError(
-            f"norb_frozen={norb_frozen} leaves no active orbitals "
-            f"(norb_a={nmo_a}, norb_b={nmo_b})."
-        )
-
-    nelec_active = (int(nelec[0] - norb_frozen), int(nelec[1] - norb_frozen))
-    if min(nelec_active) < 0 or sum(nelec_active) <= 0:
-        raise ValueError("Frozen core left no active electrons.")
-
-    core = slice(0, norb_frozen)
-
-    def blocks(h1, chol, nmo):
-        act = slice(norb_frozen, nmo)
-        return (
-            np.asarray(h1[core, core]),
-            np.asarray(h1[act, act]),
-            np.asarray(chol[:, core, core]),
-            np.asarray(chol[:, act, act]),
-            np.asarray(chol[:, act, core]),
-            np.asarray(chol[:, core, act]),
-        )
-
-    h1_cc_a, h1_aa_a, l_cc_a, l_aa_a, l_ac_a, l_ca_a = blocks(h1_a, chol_a, nmo_a)
-    h1_cc_b, h1_aa_b, l_cc_b, l_aa_b, l_ac_b, l_ca_b = blocks(h1_b, chol_b, nmo_b)
-
-    # core trace summed over spin: the coulomb field the active space sees
-    t_g = np.trace(l_cc_a, axis1=1, axis2=2) + np.trace(l_cc_b, axis1=1, axis2=2)
-
-    vj_a = np.einsum("x,xpq->pq", t_g, l_aa_a, optimize=True)
-    vj_b = np.einsum("x,xpq->pq", t_g, l_aa_b, optimize=True)
-    vk_a = np.einsum("xpi,xiq->pq", l_ac_a, l_ca_a, optimize=True)
-    vk_b = np.einsum("xpi,xiq->pq", l_ac_b, l_ca_b, optimize=True)
-
-    h1_eff_a = h1_aa_a + vj_a - vk_a
-    h1_eff_b = h1_aa_b + vj_b - vk_b
-
-    e1_core = np.trace(h1_cc_a) + np.trace(h1_cc_b)
-    ej_core = 0.5 * float(np.dot(t_g, t_g))
-    ek_core = 0.5 * (
-        np.einsum("xij,xji->", l_cc_a, l_cc_a, optimize=True)
-        + np.einsum("xij,xji->", l_cc_b, l_cc_b, optimize=True)
-    )
-    ecore = float(np.real(h0 + e1_core + ej_core - ek_core))
-
-    return (
-        ecore,
-        np.asarray(h1_eff_a),
-        np.asarray(h1_eff_b),
-        np.array(l_aa_a, copy=True),
-        np.array(l_aa_b, copy=True),
-        nelec_active,
-    )
-
-
 def build_ham_uchol(
     obj: Any,
     *,
@@ -1787,11 +1363,11 @@ def build_ham_uchol(
     t_proj = time.time()
     h1_a = basis_a.conj().T @ hcore @ basis_a
     h1_b = basis_b.conj().T @ hcore @ basis_b
-    # _rotate_chol_to_mo rotates in place when nao == norb, so the alpha call would
+    # rotate_chol_to_mo rotates in place when nao == norb, so the alpha call would
     # otherwise clobber chol_ao and the beta call would rotate it a second time. Hand
     # alpha a copy and let beta consume the original (its last use).
-    chol_a = _rotate_chol_to_mo(np.array(chol_ao, copy=True), basis_a)
-    chol_b = _rotate_chol_to_mo(chol_ao, basis_b)
+    chol_a = rotate_chol_to_mo(np.array(chol_ao, copy=True), basis_a)
+    chol_b = rotate_chol_to_mo(chol_ao, basis_b)
     print(
         f"[stage] projected chol into the alpha/beta bases "
         f"({basis_a.shape[1]}, {basis_b.shape[1]} orbitals) in {time.time() - t_proj:.2f}s"
@@ -1801,7 +1377,7 @@ def build_ham_uchol(
 
     norb_frozen = int(norb_frozen_core)
     if norb_frozen > 0:
-        h0, h1_a, h1_b, chol_a, chol_b, nelec = _freeze_core_from_mo_cholesky_uh(
+        h0, h1_a, h1_b, chol_a, chol_b, nelec = freeze_core_from_mo_cholesky_uh(
             h0=h0,
             h1_a=h1_a,
             h1_b=h1_b,

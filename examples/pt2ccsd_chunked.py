@@ -32,7 +32,6 @@ See examples/pt2ccsd_api.py for the plain run this builds on.
 from pyscf import cc, gto, scf
 
 from trot.afqmc import AfqmcMixed
-from trot.meas.pt2ccsd import plan_pt2ccsd_chunking
 
 MB = 1024**2
 
@@ -92,7 +91,7 @@ print(f"\nplan: {plan.describe()}")
 # resident         the cholesky tensor and its padded copy, the t2 amplitudes, the
 #                  whole walker population -- no chunking touches any of it. Nothing
 #                  shared scales with k: the scan slice is a view into the padded copy,
-#                  and _equal_chunks keeps that copy's padding bounded whatever k is
+#                  and equal_chunks keeps that copy's padding bounded whatever k is
 # per_walker       walker, green, greenp, t2_green and its halves -- the per-walker
 #                  work that only n_chunks can reduce
 # per_walker_chol  gl_c, lt2g_c, glgp_c, lt2_1, lt2_2 and their mixed-precision casts

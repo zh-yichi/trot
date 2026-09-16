@@ -70,7 +70,9 @@ def o2_system():
 @pytest.fixture(scope="module")
 def closed_shell_system():
     """A closed-shell H6 chain solved with RHF/CCSD, and the same solution as UHF/UCCSD."""
-    mol = gto.M(atom="; ".join(f"H 0 0 {1.6 * i}" for i in range(6)), basis="631g", unit="b", verbose=0)
+    mol = gto.M(
+        atom="; ".join(f"H 0 0 {1.6 * i}" for i in range(6)), basis="631g", unit="b", verbose=0
+    )
     mf = scf.RHF(mol)
     mf.kernel()
     rcc = cc.CCSD(mf)
@@ -117,7 +119,9 @@ def test_initial_energy_matches_uccsd(o2_system, measure_type, kernel, extra):
         s["ham_data"], s["trial_data"], Pt2ccsdMeasCfg(measure_type=measure_type, **extra)
     )
     out = kernel(_walkers(s)["tau=0"], s["ham_data"], ctx, s["trial_data"])
-    assert float(_energy(s["ham_data"], out).real) == pytest.approx(float(s["mycc"].e_tot), abs=1e-6)
+    assert float(_energy(s["ham_data"], out).real) == pytest.approx(
+        float(s["mycc"].e_tot), abs=1e-6
+    )
 
 
 @pytest.mark.parametrize("nchol_chunk", [1, 8, 1000])
@@ -155,7 +159,9 @@ def test_closed_shell_reduces_to_restricted(closed_shell_system):
     ham_u = from_ham_chol(ham_r)
 
     staged_r = stage_pt2ccsd_trial(s["rcc"])
-    trial_r = Pt2ccsdTrial(mo_t=jnp.asarray(staged_r.data["mo_t"]), t2=jnp.asarray(staged_r.data["t2"]))
+    trial_r = Pt2ccsdTrial(
+        mo_t=jnp.asarray(staged_r.data["mo_t"]), t2=jnp.asarray(staged_r.data["t2"])
+    )
     nocc = trial_r.nocc
     sys_u = System_uh(norb=trial_r.norb, nelec=(nocc, nocc))
     trial_u = make_upt2ccsd_trial_data(stage_upt2ccsd_trial(s["ucc"]).data, sys_u)
@@ -182,7 +188,9 @@ def test_sto_chol_is_unbiased(o2_system):
     w = _walkers(s)["perturbed"]
 
     exact = np.asarray(
-        energy_kernel_uw_uh_bar(w, ham, build_meas_ctx(ham, trial, Pt2ccsdMeasCfg(measure_type="bar")), trial)
+        energy_kernel_uw_uh_bar(
+            w, ham, build_meas_ctx(ham, trial, Pt2ccsdMeasCfg(measure_type="bar")), trial
+        )
     )
     cfg = Pt2ccsdMeasCfg(measure_type="sto_chol", nchol_chunk=8, n_chol_head=4, n_chol_samples=16)
     ctx = build_meas_ctx(ham, trial, cfg)
@@ -191,7 +199,9 @@ def test_sto_chol_is_unbiased(o2_system):
     f = jax.jit(jax.vmap(lambda key: energy_kernel_uw_uh_sto(w, ham, ctx, trial, key)))
     out = np.asarray(f(jax.random.split(jax.random.PRNGKey(5), n_keys)))
 
-    np.testing.assert_allclose(out[:, :2], np.broadcast_to(exact[:2], (n_keys, 2)), rtol=0, atol=1e-12)
+    np.testing.assert_allclose(
+        out[:, :2], np.broadcast_to(exact[:2], (n_keys, 2)), rtol=0, atol=1e-12
+    )
     mean, sem = out[:, 2].mean(), out[:, 2].std() / np.sqrt(n_keys)
     assert sem > 0.0
     assert abs(mean - exact[2]) < 4 * sem

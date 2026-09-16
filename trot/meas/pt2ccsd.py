@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax, tree_util
 
+from ..cholesky import equal_chunks, max_equal_chunk_pad
 from ..core.ops import MeasOps, k_energy
 from ..core.system import System
 from ..ham.chol import HamChol
@@ -14,7 +15,6 @@ from ..trial.pt2ccsd import Pt2ccsdTrial
 from ..trial.pt2ccsd import overlap_r
 from .. import walkers as wk
 from ..prop.types import PropState, QmcParams
-
 
 _PT2CCSD_MEAS_CFG_ATTR = "_pt2ccsd_meas_cfg"
 
@@ -24,45 +24,6 @@ DEFAULT_NCHOL_CHUNK = 100
 
 _MEMORY_MODES = ("low", "high")
 _MEASURE_TYPES = (None, "chunk", "bar", "sto_chol")
-
-
-def _equal_chunks(n: int, max_chunk: int) -> tuple[int, int, int]:
-    """
-    Split n cholesky vectors into equal chunks of at most max_chunk, returning
-    (n_chunks, chunk, n_pad).
-
-    Take the fewest chunks the cap allows, then divide evenly. That gives the same number
-    of scan steps as slicing at exactly max_chunk and padding the remainder, but spreads
-    the vectors out, so the zero padding is the minimum a fixed scan shape admits: with
-    nchol=1600 and a cap of 300 it pads 2 vectors rather than 200.
-
-    Padding is always < n_chunks, and is bounded over all caps by about sqrt(n) -- worst
-    when the chunk count and the chunk size meet, e.g. 19 vectors at n=381, cap=20.
-
-    Every chunking kernel here uses this, on the whole cholesky set and on the subsets the
-    semistochastic kernel forms (its head and its sampled tail). Subsets are why an
-    exactly-max_chunk rule will not do: with a cap sized for the full set, a short head
-    would pad out to one whole chunk and run the T2 contractions on mostly zeros.
-    """
-    if max_chunk < 1:
-        raise ValueError(f"max_chunk must be >= 1, got {max_chunk}")
-    n_chunks = max(1, -(-n // max_chunk))
-    chunk = max(1, -(-n // n_chunks))  # max(1, ...) keeps n == 0 from giving a zero axis
-    return n_chunks, chunk, n_chunks * chunk - n
-
-
-def max_equal_chunk_pad(n: int) -> int:
-    """
-    Worst-case padding from _equal_chunks over every cap, i.e. how many zero cholesky
-    vectors the padded copy can carry whatever chunk size is chosen. Small (about sqrt(n)),
-    and k independent, which is what lets the memory model charge it once up front instead
-    of scaling it with the chunk.
-    """
-    if n <= 0:
-        return 1
-    return max(_equal_chunks(n, cap)[2] for cap in range(1, n + 1))
-
-
 
 
 # per-walker cholesky budget for "sto_chol", as a fraction of nchol, split head : samples
@@ -160,7 +121,7 @@ class Pt2ccsdMemoryModel:
     that dominates for any system worth chunking.
 
     Nothing shared scales with k. The scan slice is a view into the padded copy, not a new
-    buffer, and _equal_chunks keeps that copy's zero padding bounded by about sqrt(nchol)
+    buffer, and equal_chunks keeps that copy's zero padding bounded by about sqrt(nchol)
     whatever k is -- so resident carries it once, at its worst case over k.
     """
 
@@ -193,7 +154,7 @@ def pt2ccsd_memory_model(
     resident
       chol            nchol*norb^2 * 8    the hamiltonian tensor
       chol (padded)  (nchol + p)*norb^2 * 8   the kernel's own zero padded copy, where p
-                                          is the worst-case padding _equal_chunks can
+                                          is the worst-case padding equal_chunks can
                                           leave over any chunk size (about sqrt(nchol))
       t2              no^2*nv^2    * 8    the trial amplitudes
       t2 (cast)       no^2*nv^2    * r    hoisted out of the scan, only if r != 8
@@ -358,9 +319,7 @@ def plan_pt2ccsd_chunking(
         k = max(1, min(int(nchol_chunk), nchol))
         w_max = walkers_for(k)
         if w_max < 1:
-            raise _budget_error(
-                model, budget_bytes, f"one walker at nchol_chunk={k} does not fit"
-            )
+            raise _budget_error(model, budget_bytes, f"one walker at nchol_chunk={k} does not fit")
         nc = max(n_chunks_floor, _ceil_div(n_walkers, w_max * n_devices))
         note = "nchol_chunk fixed by the caller"
     else:
@@ -374,9 +333,7 @@ def plan_pt2ccsd_chunking(
             # the cholesky chunk is then chosen again against the smaller walker count
             w_max = walkers_for(1)
             if w_max < 1:
-                raise _budget_error(
-                    model, budget_bytes, "one walker at nchol_chunk=1 does not fit"
-                )
+                raise _budget_error(model, budget_bytes, "one walker at nchol_chunk=1 does not fit")
             nc = max(nc, _ceil_div(n_walkers, w_max * n_devices))
             k = chunk_for(in_flight(nc))
             note = "walkers chunked; cholesky chunk re-derived"
@@ -386,7 +343,7 @@ def plan_pt2ccsd_chunking(
         k = max(1, min(int(k), nchol))
 
     # the kernels divide the cap evenly, so report the size that will really be scanned
-    _, k, _ = _equal_chunks(nchol, k) if nchol > 0 else (1, k, 0)
+    _, k, _ = equal_chunks(nchol, k) if nchol > 0 else (1, k, 0)
 
     w = in_flight(nc)
     return ChunkPlan(
@@ -459,7 +416,7 @@ def build_meas_ctx(
     # so resolve that here and let everything downstream -- kernels, the flags dump, the
     # memory accounting -- see the size that really runs
     cap = min(requested, nchol) if nchol > 0 else requested
-    _, nchol_chunk, _ = _equal_chunks(nchol, cap)
+    _, nchol_chunk, _ = equal_chunks(nchol, cap)
 
     # sto_chol is the bar estimator with a sampled two-body sum, so it needs the same
     # transformed tensors
@@ -518,9 +475,7 @@ def build_bar_intermediates(ham_data: HamChol, trial_data: Pt2ccsdTrial) -> dict
     exp_mt1 = eye - x
 
     h1_bar = exp_t1 @ ham_data.h1 @ exp_mt1
-    chol_bar = jnp.einsum(
-        "pr,grs,sq->gpq", exp_t1, ham_data.chol, exp_mt1, optimize="optimal"
-    )
+    chol_bar = jnp.einsum("pr,grs,sq->gpq", exp_t1, ham_data.chol, exp_mt1, optimize="optimal")
 
     return {"exp_t1": exp_t1, "exp_mt1": exp_mt1, "h1_bar": h1_bar, "chol_bar": chol_bar}
 
@@ -639,9 +594,9 @@ def energy_kernel_rw_rh_chunk(
     e1_2_2 = -2 * jnp.einsum("pq,pq->", h1, t2_green, optimize="optimal")
     e1_2 = e1_2_1 + e1_2_2  # <exp(T1)HF|T2 h1|walker>/<exp(T1)HF|walker>
 
-    # two body energy, chunked over the cholesky index. _equal_chunks divides the set
+    # two body energy, chunked over the cholesky index. equal_chunks divides the set
     # evenly under the requested cap; the leftover is zero padded and contributes nothing.
-    nchunks, nchol_chunk, pad = _equal_chunks(chol.shape[0], meas_ctx.nchol_chunk)
+    nchunks, nchol_chunk, pad = equal_chunks(chol.shape[0], meas_ctx.nchol_chunk)
     chol = jnp.pad(chol, ((0, pad), (0, 0), (0, 0)))
     chol = chol.reshape(nchunks, nchol_chunk, norb, norb)
 
@@ -671,19 +626,17 @@ def energy_kernel_rw_rh_chunk(
         glgp_c = glgp_c.astype(ctype)
         lt2_1 = jnp.einsum("gia,iajb->gjb", glgp_c, t2_r, optimize="optimal")
         lt2_2 = jnp.einsum("gib,iajb->gja", glgp_c, t2_r, optimize="optimal")
-        l2t2_1 = jnp.einsum(
-            "gjb,gjb->", lt2_1.astype(ctype), glgp_c, optimize="optimal"
-        ).astype(jnp.complex128)
-        l2t2_2 = jnp.einsum(
-            "gja,gja->", lt2_2.astype(ctype), glgp_c, optimize="optimal"
-        ).astype(jnp.complex128)
+        l2t2_1 = jnp.einsum("gjb,gjb->", lt2_1.astype(ctype), glgp_c, optimize="optimal").astype(
+            jnp.complex128
+        )
+        l2t2_2 = jnp.einsum("gja,gja->", lt2_2.astype(ctype), glgp_c, optimize="optimal").astype(
+            jnp.complex128
+        )
         carry[3] += (2 * l2t2_1 - l2t2_2).astype(jnp.complex128)
 
         return carry, 0.0
 
-    [e2_0, e2_2_2_1, e2_2_2_2, e2_2_3], _ = lax.scan(
-        scanned_fun, [0.0, 0.0, 0.0, 0.0], chol
-    )
+    [e2_0, e2_2_2_1, e2_2_2_2, e2_2_3], _ = lax.scan(scanned_fun, [0.0, 0.0, 0.0, 0.0], chol)
 
     e2_2_1 = e2_0 * gt2g
     e2_2_2 = 4 * (e2_2_2_1 + e2_2_2_2)
@@ -758,7 +711,7 @@ def energy_kernel_rw_rh_bar(
 
     # two body energy, chunked over the cholesky index. both the full and the half
     # rotated tensors are padded the same way, so the leftover contributes to neither.
-    nchunks, nchol_chunk, pad = _equal_chunks(chol.shape[0], meas_ctx.nchol_chunk)
+    nchunks, nchol_chunk, pad = equal_chunks(chol.shape[0], meas_ctx.nchol_chunk)
     chol = jnp.pad(chol, ((0, pad), (0, 0), (0, 0)))
     rot_chol = jnp.pad(rot_chol, ((0, pad), (0, 0), (0, 0)))
     chol = chol.reshape(nchunks, nchol_chunk, norb, norb)
@@ -773,9 +726,7 @@ def energy_kernel_rw_rh_bar(
         gl = jnp.einsum("ir,gqr->giq", green, chol_c, optimize="optimal")  # (k, nocc, norb)
         tr_gl = jnp.einsum("gii->g", gl[:, :, :nocc], optimize="optimal")
         e2_0_c = 2 * jnp.einsum("g,g->", tr_gl, tr_gl, optimize="optimal")
-        e2_0_e = -jnp.einsum(
-            "gij,gji->", gl[:, :, :nocc], gl[:, :, :nocc], optimize="optimal"
-        )
+        e2_0_e = -jnp.einsum("gij,gji->", gl[:, :, :nocc], gl[:, :, :nocc], optimize="optimal")
         carry[0] += e2_0_c + e2_0_e
 
         # e2_2_2_1
@@ -798,17 +749,15 @@ def energy_kernel_rw_rh_bar(
         ).astype(jnp.complex128)
 
         # e2_2_3
-        glgp = jnp.einsum(
-            "gir,rb->gib", gl.astype(ctype), greenp.astype(ctype), optimize="optimal"
-        )
+        glgp = jnp.einsum("gir,rb->gib", gl.astype(ctype), greenp.astype(ctype), optimize="optimal")
         lt2_c = jnp.einsum("gia,iajb->gjb", glgp, t2_r, optimize="optimal")
         lt2_e = jnp.einsum("gib,iajb->gja", glgp, t2_r, optimize="optimal")
-        l2t2_c = jnp.einsum(
-            "gjb,gjb->", lt2_c.astype(ctype), glgp, optimize="optimal"
-        ).astype(jnp.complex128)
-        l2t2_e = jnp.einsum(
-            "gja,gja->", lt2_e.astype(ctype), glgp, optimize="optimal"
-        ).astype(jnp.complex128)
+        l2t2_c = jnp.einsum("gjb,gjb->", lt2_c.astype(ctype), glgp, optimize="optimal").astype(
+            jnp.complex128
+        )
+        l2t2_e = jnp.einsum("gja,gja->", lt2_e.astype(ctype), glgp, optimize="optimal").astype(
+            jnp.complex128
+        )
         carry[3] += (2 * l2t2_c - l2t2_e).astype(jnp.complex128)
 
         return carry, 0.0
@@ -888,9 +837,7 @@ def resolve_chol_budget(
     return n_head, max(1, n_samples)
 
 
-def chol_sampling_proposal(
-    e2_g: jax.Array, *, score_floor: float, uniform_mix: float
-) -> jax.Array:
+def chol_sampling_proposal(e2_g: jax.Array, *, score_floor: float, uniform_mix: float) -> jax.Array:
     """
     Sampling probability for each cholesky vector from its two-body energy:
 
@@ -984,13 +931,11 @@ def energy_kernel_rw_rh_sto(
     def scan_e2_0(carry, rot_c):
         gl_occ = jnp.einsum("ir,gqr->giq", green, rot_c, optimize="optimal")
         tr_gl = jnp.einsum("gii->g", gl_occ, optimize="optimal")
-        e2_0_g = 2 * tr_gl * tr_gl - jnp.einsum(
-            "gij,gji->g", gl_occ, gl_occ, optimize="optimal"
-        )
+        e2_0_g = 2 * tr_gl * tr_gl - jnp.einsum("gij,gji->g", gl_occ, gl_occ, optimize="optimal")
         e2_0_g = e2_0_g.astype(c128)
         return carry + jnp.sum(e2_0_g), e2_0_g
 
-    n_chunk1, chunk1, npad1 = _equal_chunks(nchol, nchol_chunk)
+    n_chunk1, chunk1, npad1 = equal_chunks(nchol, nchol_chunk)
     rot_all = chol[:, :nocc, :]
     if npad1:
         rot_all = jnp.pad(rot_all, ((0, npad1), (0, 0), (0, 0)))
@@ -1066,9 +1011,7 @@ def energy_kernel_rw_rh_sto(
         ).astype(c128)
 
         # e2_2_3
-        glgp = jnp.einsum(
-            "gir,rb->gib", gl.astype(ctype), greenp.astype(ctype), optimize="optimal"
-        )
+        glgp = jnp.einsum("gir,rb->gib", gl.astype(ctype), greenp.astype(ctype), optimize="optimal")
         t2_r = t2.astype(rtype)
         lt2_c = jnp.einsum("gia,iajb->gjb", glgp, t2_r, optimize="optimal")
         lt2_e = jnp.einsum("gib,iajb->gja", glgp, t2_r, optimize="optimal")
@@ -1085,7 +1028,7 @@ def energy_kernel_rw_rh_sto(
         n = weights.shape[0]
         if n == 0:
             return zero, zero, zero
-        n_ch, chunk, npad = _equal_chunks(n, nchol_chunk)
+        n_ch, chunk, npad = equal_chunks(n, nchol_chunk)
         if npad:
             chol_s = jnp.pad(chol_s, ((0, npad), (0, 0), (0, 0)))
             weights = jnp.pad(weights, (0, npad))
@@ -1102,7 +1045,7 @@ def energy_kernel_rw_rh_sto(
         n = weights.shape[0]
         if n == 0:
             return zero, zero, zero
-        n_ch, chunk, npad = _equal_chunks(n, nchol_chunk)
+        n_ch, chunk, npad = equal_chunks(n, nchol_chunk)
         if npad:
             # pad with index 0 at zero weight, which contributes nothing
             idx = jnp.pad(idx, (0, npad))
@@ -1130,9 +1073,7 @@ def energy_kernel_rw_rh_sto(
                 "energy_kernel_rw_rh_sto draws a sampled tail and so needs a PRNG key; "
                 "only n_chol_head='full' can run without one."
             )
-        sel = jax.random.choice(
-            key, tail.shape[0], shape=(n_samples,), replace=True, p=tail_prob
-        )
+        sel = jax.random.choice(key, tail.shape[0], shape=(n_samples,), replace=True, p=tail_prob)
         samp_w = (1.0 / (n_samples * tail_prob[sel])).astype(c128)
         b_t, c_t, d_t = run_indices(tail[sel], samp_w)
 
@@ -1168,9 +1109,7 @@ def make_pt2ccsd_meas_ops(
             f"pt2CCSD MeasOps currently supports only restricted walkers, got: {sys.walker_kind}"
         )
     if measure_type not in _MEASURE_TYPES:
-        raise ValueError(
-            f"unknown measure_type {measure_type!r}; expected one of {_MEASURE_TYPES}"
-        )
+        raise ValueError(f"unknown measure_type {measure_type!r}; expected one of {_MEASURE_TYPES}")
     if memory_mode not in _MEMORY_MODES:
         raise ValueError(f"unknown memory_mode {memory_mode!r}; expected one of {_MEMORY_MODES}")
     if nchol_chunk is not None and measure_type is None:
@@ -1248,9 +1187,9 @@ def get_init_pt2trial_energy(
         # the tau = 0 row is one sample of a stochastic estimator like any other, so it
         # gets a key too, split off the initial state's
         keys = jax.random.split(init_state.rng_key, wk.n_walkers(walker_0))
-        pt2results = wk.vmap_chunked(
-            trial_e_kernel, n_chunks=1, in_axes=(0, None, None, None, 0)
-        )(walker_0, ham_data, trial_meas_ctx, trial_data, keys)
+        pt2results = wk.vmap_chunked(trial_e_kernel, n_chunks=1, in_axes=(0, None, None, None, 0))(
+            walker_0, ham_data, trial_meas_ctx, trial_data, keys
+        )
     else:
         pt2results = wk.vmap_chunked(trial_e_kernel, n_chunks=1, in_axes=(0, None, None, None))(
             walker_0, ham_data, trial_meas_ctx, trial_data
