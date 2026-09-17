@@ -46,11 +46,11 @@ __all__ = [
 # from afqmc's lno_afqmc/wavefunctions_unrestricted.py (class upt2ccsd: _calc_e0bar_frag,
 # _t2eorb_tc, _build_measurement_intermediates).
 #
-# As the restricted one (lnotrot/meas/pt2ccsd.py) it is the bar estimator and only that:
+# As the restricted one (lnoafqmc/meas/pt2ccsd.py) it is the bar estimator and only that:
 # each spin's exp(T1) sits on that spin's hamiltonian and walker, the reference is the
 # bare determinant, and the kernel returns TRIAL_COMPONENTS = [t2frg, e0frg, e1frg, e0]
 # per walker, with E_F = <e0frg> + <e1frg> - <t2frg><e0> formed over the blocks
-# (lnotrot.stat_utils). It measures on the uchol hamiltonian, alpha and beta each in
+# (lnoafqmc.stat_utils). It measures on the uchol hamiltonian, alpha and beta each in
 # their own LNO basis over one shared cholesky index.
 #
 # Differences from trot's energy_kernel_uw_uh_bar, which this otherwise follows line by

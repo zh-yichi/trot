@@ -1,7 +1,7 @@
 """
 Run one LNO fragment's AFQMC from its self-contained file, in its own process:
 
-    python -m trot.lnotrot.run_frag frag3.h5 --options opts.json --out res.json
+    python -m trot.lnoafqmc.run_frag frag3.h5 --options opts.json --out res.json
 
 opts.json holds the LnoFragMixed keyword arguments (trial, guide, max_error, seed, ...);
 res.json gets the fragment energy and error. LnoAfqmcMixed(isolate=True) drives this so

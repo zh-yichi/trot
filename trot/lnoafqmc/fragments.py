@@ -14,7 +14,7 @@ from pyscf.scf import atom_hf
 try:
     from pyscf.lno import tools as lno_tools  # pyright: ignore[reportMissingImports]
 except ModuleNotFoundError as e:  # pragma: no cover
-    raise ModuleNotFoundError("trot.lnotrot needs pyscf-forge for the LNO machinery.") from e
+    raise ModuleNotFoundError("trot.lnoafqmc needs pyscf-forge for the LNO machinery.") from e
 
 print = partial(print, flush=True)
 

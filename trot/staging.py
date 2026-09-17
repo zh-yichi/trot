@@ -16,7 +16,6 @@ print = partial(print, flush=True)
 
 from .cholesky import (
     ao_cholesky,
-    chunked_cholesky,
     freeze_core_from_mo_cholesky,
     freeze_core_from_mo_cholesky_uh,
     modified_cholesky,
@@ -663,11 +662,10 @@ def _stage_ham_input(obj: StagedMfOrCc, *, chol_cut: float, verbose: bool) -> Ha
     h1 = basis_coeff.T.conj() @ hcore @ basis_coeff
     h1 = np.asarray(h1)
 
-    # ao cholesky
-    t0 = time.time()
-    chol_vec = chunked_cholesky(mol, max_error=chol_cut, verbose=verbose)
-    if verbose:
-        print(f"[stage] AO cholesky: nchol={chol_vec.shape[0]} in {time.time() - t0:.2f}s")
+    # ao cholesky: from the density fitting tensor when the mean field has one, so the
+    # hamiltonian is on the same footing as the mean field and any DF correlated method on
+    # it; otherwise the modified cholesky decomposition of the exact AO ERIs
+    chol_vec = ao_cholesky(scf_obj.mf, chol_cut=chol_cut, verbose=verbose)
 
     # full space electron count
     nelec: Tuple[int, int] = (int(mol.nelec[0]), int(mol.nelec[1]))
@@ -1358,7 +1356,7 @@ def build_ham_uchol(
 
     h0 = float(mf.energy_nuc())
     hcore = np.asarray(mf.get_hcore())
-    chol_ao = ao_cholesky(mf, mol, chol_cut=chol_cut, verbose=verbose)
+    chol_ao = ao_cholesky(mf, chol_cut=chol_cut, verbose=verbose)
 
     t_proj = time.time()
     h1_a = basis_a.conj().T @ hcore @ basis_a

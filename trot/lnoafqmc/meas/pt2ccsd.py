@@ -52,7 +52,7 @@ __all__ = [
 #     e0    = <HF| H_bar |walker_bar> / <HF|walker_bar>, electronic, unprojected
 #
 # and the fragment energy is E_F = <e0frg> + <e1frg> - <t2frg><e0> over the blocks
-# (lnotrot.stat_utils). There is no h0.
+# (lnoafqmc.stat_utils). There is no h0.
 #
 # Differences from trot's energy_kernel_rw_rh_bar, which this otherwise follows line by
 # line: the projected t2 is not symmetric under (ia)<->(jb), so both halves of every

@@ -256,13 +256,14 @@ def df_cderi(mf: Any) -> NDArray | None:
     return np.vstack(blocks)
 
 
-def ao_cholesky(mf: Any, mol: Any, *, chol_cut: float, verbose: bool = False) -> NDArray:
+def ao_cholesky(mf: Any, *, chol_cut: float, verbose: bool = False) -> NDArray:
     """
-    AO cholesky vectors, flattened to (n_chol, nao*nao).
+    AO cholesky vectors of a mean field, flattened to (n_chol, nao*nao).
 
     Uses the density fitting tensor when the mean field carries one, otherwise falls back
-    to the modified cholesky decomposition of the AO ERIs.
+    to the modified cholesky decomposition of the AO ERIs of mf.mol.
     """
+    mol = mf.mol
     t0 = time.time()
     cderi = df_cderi(mf)
 

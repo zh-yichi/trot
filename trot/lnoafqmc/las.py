@@ -9,7 +9,7 @@ from pyscf.lib import logger
 try:
     from pyscf.lno import lno, ulno  # pyright: ignore[reportMissingImports]
 except ModuleNotFoundError as e:  # pragma: no cover
-    raise ModuleNotFoundError("trot.lnotrot needs pyscf-forge for the LNO machinery.") from e
+    raise ModuleNotFoundError("trot.lnoafqmc needs pyscf-forge for the LNO machinery.") from e
 
 print = partial(print, flush=True)
 

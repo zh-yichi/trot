@@ -1,10 +1,10 @@
 """
-Tests of trot.lnotrot on O2 (sto-3g, density fitted), two atomic fragments.
+Tests of trot.lnoafqmc on O2 (sto-3g, density fitted), two atomic fragments.
 
 Run from the repository root:
 
-    pytest trot/lnotrot/tests -q                 # fast checks
-    pytest trot/lnotrot/tests -q --run-slow      # + the end-to-end LNO-AFQMC run
+    pytest trot/lnoafqmc/tests -q                 # fast checks
+    pytest trot/lnoafqmc/tests -q --run-slow      # + the end-to-end LNO-AFQMC run
 
 With a tight LNO threshold each fragment's local active space is the whole active space,
 so the two fragments' projectors add up to the identity and their energies must add up
@@ -19,7 +19,7 @@ import os
 
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 
-import trot.lnotrot  # noqa: F401  (allocator, before jax)
+import trot.lnoafqmc  # noqa: F401  (allocator, before jax)
 from trot import config
 
 config.configure_once()
@@ -35,14 +35,14 @@ from pyscf.data import elements
 
 from trot.core.system import System
 from trot.ham.chol import HamChol
-from trot.lnotrot import LnoAfqmcMixed, LnoFragMixed, iao_fragment
-from trot.lnotrot import integral as li
-from trot.lnotrot import las, pipeline, solvers
-from trot.lnotrot import staging as lst
-from trot.lnotrot import stat_utils as su
-from trot.lnotrot.meas import pt2ccsd as lm
-from trot.lnotrot.mixed import available_mixed_recipes, get_mixed_recipe
-from trot.lnotrot.trial.pt2ccsd import make_pt2ccsd_trial_data, overlap_r
+from trot.lnoafqmc import LnoAfqmcMixed, LnoFragMixed, iao_fragment
+from trot.lnoafqmc import integral as li
+from trot.lnoafqmc import las, pipeline, solvers
+from trot.lnoafqmc import staging as lst
+from trot.lnoafqmc import stat_utils as su
+from trot.lnoafqmc.meas import pt2ccsd as lm
+from trot.lnoafqmc.mixed import available_mixed_recipes, get_mixed_recipe
+from trot.lnoafqmc.trial.pt2ccsd import make_pt2ccsd_trial_data, overlap_r
 from trot.meas.pt2ccsd import Pt2ccsdMeasCfg
 from trot.meas.pt2ccsd import build_meas_ctx as trot_build_ctx
 from trot.meas.pt2ccsd import energy_kernel_rw_rh_bar as trot_bar_kernel

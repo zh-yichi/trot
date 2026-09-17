@@ -1,14 +1,14 @@
 """
-Tests of the unrestricted half of trot.lnotrot (trial="upt2ccsd"), on triplet O2 (UHF,
+Tests of the unrestricted half of trot.lnoafqmc (trial="upt2ccsd"), on triplet O2 (UHF,
 sto-3g, density fitted, two atomic fragments, full-space LAS). The restricted half and
-the statistics are in test_lnotrot.py.
+the statistics are in test_lnoafqmc.py.
 
-    pytest trot/lnotrot/tests -q [--run-slow]
+    pytest trot/lnoafqmc/tests -q [--run-slow]
 """
 
 from __future__ import annotations
 
-import trot.lnotrot  # noqa: F401  (allocator, before jax)
+import trot.lnoafqmc  # noqa: F401  (allocator, before jax)
 from trot import config
 
 config.configure_once()
@@ -24,13 +24,13 @@ from pyscf.data import elements
 
 from trot.core.system import System
 from trot.ham.chol_u import HamCholU
-from trot.lnotrot import LnoAfqmcMixed, LnoFragMixed, iao_fragment
-from trot.lnotrot import integral as li
-from trot.lnotrot import pipeline, solvers
-from trot.lnotrot import staging as lst
-from trot.lnotrot.meas import upt2ccsd as lmu
-from trot.lnotrot.mixed import available_mixed_recipes, get_mixed_recipe
-from trot.lnotrot.trial.upt2ccsd import make_upt2ccsd_trial_data, overlap_u
+from trot.lnoafqmc import LnoAfqmcMixed, LnoFragMixed, iao_fragment
+from trot.lnoafqmc import integral as li
+from trot.lnoafqmc import pipeline, solvers
+from trot.lnoafqmc import staging as lst
+from trot.lnoafqmc.meas import upt2ccsd as lmu
+from trot.lnoafqmc.mixed import available_mixed_recipes, get_mixed_recipe
+from trot.lnoafqmc.trial.upt2ccsd import make_upt2ccsd_trial_data, overlap_u
 from trot.meas.pt2ccsd import Pt2ccsdMeasCfg
 from trot.meas.upt2ccsd import build_meas_ctx as trot_build_ctx
 from trot.meas.upt2ccsd import energy_kernel_uw_uh_bar as trot_bar_kernel

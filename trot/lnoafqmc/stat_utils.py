@@ -5,7 +5,7 @@ import jax.numpy as jnp
 # Statistics for the LNO fragment estimator, mirroring the pt2CCSD functions of
 # trot/stat_utils.py one for one:
 #
-#     trot/stat_utils.py                lnotrot/stat_utils.py
+#     trot/stat_utils.py                lnoafqmc/stat_utils.py
 #     _pt2ccsd_energy                   _frag_pt2ccsd_energy
 #     _pt2ccsd_delta_method_error       _frag_pt2ccsd_delta_method_error
 #     pt2ccsd_blocking                  frag_pt2ccsd_blocking

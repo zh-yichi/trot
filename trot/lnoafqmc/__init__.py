@@ -1,7 +1,7 @@
 """
 LNO-AFQMC on trot's mixed guide/trial pipeline.
 
-    from trot.lnotrot import LnoAfqmcMixed, iao_fragment
+    from trot.lnoafqmc import LnoAfqmcMixed, iao_fragment
 
     lo_coeff, frag_list, frag_name = iao_fragment(mf, nfrozen)
     lno = LnoAfqmcMixed(mf, lo_coeff, frag_list, frag_name=frag_name, lno_thresh=1e-5,

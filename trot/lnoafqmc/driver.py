@@ -31,7 +31,7 @@ print = partial(print, flush=True)
 #   post         outlier blocks dropped (recipe.clean_fn), guide and fragment blocking
 #                (recipe.blocking_fn), the final numbers as host floats
 #
-# The scan itself is trot's make_run_mixed_blocks over lnotrot.blocks.block_frag.
+# The scan itself is trot's make_run_mixed_blocks over lnoafqmc.blocks.block_frag.
 # Everything returned is on the host, so nothing of the fragment stays on the device.
 
 
@@ -57,8 +57,11 @@ def _init_frag_energy(
     trial_meas_ops: MeasOps,
     trial_meas_ctx: Any,
     components: tuple[str, ...],
-) -> float:
-    """The fragment estimator on the first initial walker, the tau = 0 line."""
+) -> tuple[float, float]:
+    """
+    The tau = 0 line: the fragment estimator on the first initial walker, and the total
+    absorbed weight of the initial population, sum_i w_i <T|phi_i>/<G|phi_i>.
+    """
     walker_0 = wk.take_walkers(init_state.walkers, jnp.array([0]))
     kernel = trial_meas_ops.require_kernel(k_energy)
     if trial_meas_ops.needs_rng(k_energy):
@@ -71,7 +74,13 @@ def _init_frag_energy(
             walker_0, ham_data, trial_meas_ctx, trial_data
         )
     c = {name: out[0, i] for i, name in enumerate(components)}
-    return float(jnp.real(c["e0frg"] + c["e1frg"] - c["t2frg"] * c["e0"]))
+    e_init = float(jnp.real(c["e0frg"] + c["e1frg"] - c["t2frg"] * c["e0"]))
+
+    trial_overlaps = wk.vmap_chunked(trial_meas_ops.overlap, n_chunks=1, in_axes=(0, None))(
+        init_state.walkers, trial_data
+    )
+    w_init = float(jnp.real(jnp.sum(init_state.weights * trial_overlaps / init_state.overlaps)))
+    return e_init, w_init
 
 
 def run_frag_qmc(
@@ -121,7 +130,9 @@ def run_frag_qmc(
             mesh=mesh,
         )
 
-    e_init = _init_frag_energy(state, ham_data, trial_data, trial_meas_ops, trial_meas_ctx, components)
+    e_init, w_init = _init_frag_energy(
+        state, ham_data, trial_data, trial_meas_ops, trial_meas_ctx, components
+    )
 
     if mesh is None or mesh.size == 1:
         block_fn_sr = mix_block_fn
@@ -150,13 +161,20 @@ def run_frag_qmc(
     guide_block_e_eq = [float(np.real(state.e_estimate))]
     guide_block_w_eq = [float(np.real(jnp.sum(state.weights)))]
 
-    print(f"\n{tag}Equilibration (the fragment energy is not measured until sampling)")
-    print(f"{tag}Initial fragment energy (tau = 0): {e_init:.8f}")
-    if print_every:
-        print(
-            f"{'':4s}{'block':>9s}  {'tau':>6s}  {'Guide_E_blk':>14s}  {'Guide_W_blk':>12s}   "
-            f"{'nodes':>10s}  {'t[s]':>8s}"
-        )
+    # the same layout as run_mixed_qmc: the tau = 0 row carries the initial walkers
+    # measured against both the guide and the trial (here the fragment correlation
+    # energy); afterwards the fragment is not measured until sampling
+    print(f"\n{tag}Equilibration:")
+    print("The fragment energy is not measured until the sampling phase\n")
+    print(
+        f"{'':4s}{'block':>9s}  {'tau':>6s}  {'Guide_E_blk':>14s}  {'Guide_W_blk':>12s}  "
+        f"{'Frag_E_blk':>14s}  {'Frag_W_blk':>12s}  {'nodes':>10s}  {'t[s]':>8s}"
+    )
+    print(
+        f"[eql {0:4d}/{params.n_eql_blocks}]  {0.0:6.2f}  "
+        f"{guide_block_e_eq[0]:14.10f}  {guide_block_w_eq[0]:12.6e}  "
+        f"{e_init:14.10f}  {w_init:12.6e}  {int(state.node_encounters):10d}  {0.0:8.1f}"
+    )
     chunk = print_every if print_every > 0 else 1
     for start in range(0, params.n_eql_blocks, chunk):
         n = min(chunk, params.n_eql_blocks - start)
@@ -178,18 +196,19 @@ def run_frag_qmc(
         w_avg = float(np.mean(w_chunk))
         e_avg = float(np.mean(e_chunk * w_chunk) / w_avg)
         print(
-            f"{tag}[eql {start + n:4d}/{params.n_eql_blocks}]  {(start + n) * block_time:6.2f}  "
-            f"{e_avg:14.10f}  {w_avg:12.6e}  {int(state.node_encounters):10d}  "
-            f"{time.perf_counter() - t0:8.1f}"
+            f"[eql {start + n:4d}/{params.n_eql_blocks}]  {(start + n) * block_time:6.2f}  "
+            f"{e_avg:14.10f}  {w_avg:12.6e}  {'-':>14s}  {'-':>12s}  "
+            f"{int(state.node_encounters):10d}  {time.perf_counter() - t0:8.1f}"
         )
 
     # ------------------------------------------------------------------ sampling
-    print(f"\n{tag}Sampling")
+    print(f"\n{tag}Sampling:")
     if max_error is not None and max_error > 0:
         print(
-            f"{tag}Early stop once the fragment error < {stop_ratio:.2f} x {max_error:.3e} "
+            f"Early stop once the fragment error < {stop_ratio:.2f} x {max_error:.3e} "
             f"= {stop_ratio * max_error:.3e}, after at least {min_blocks} blocks"
         )
+    print("")
     print_every = params.n_blocks // 10 if params.n_blocks >= 10 else 0
     chunk = print_every if print_every > 0 else 1
 
@@ -198,11 +217,10 @@ def run_frag_qmc(
     wp_sp: list[complex] = []
     comp_sp: dict[str, list[complex]] = {name: [] for name in components}
 
-    if print_every:
-        print(
-            f"{'':4s}{'block':>9s}  {'Guide_E_avg':>14s}  {'Guide_E_err':>10s}  {'Guide_W':>12s}  "
-            f"{'E_frag':>14s}  {'E_frag_err':>10s}  {'nodes':>10s}  {'dt[s/bl]':>10s}  {'t[s]':>7s}"
-        )
+    print(
+        f"{'':4s}{'block':>9s}  {'Guide_E_avg':>14s}  {'Guide_E_err':>10s}  {'Guide_W':>12s}  "
+        f"{'Frag_E_avg':>14s}  {'Frag_E_err':>10s}  {'nodes':>10s}  {'dt[s/bl]':>10s}  {'t[s]':>8s}"
+    )
 
     n_done = 0
     for start in range(0, params.n_blocks, chunk):
@@ -237,12 +255,13 @@ def run_frag_qmc(
             jnp.asarray(wp_sp), *(jnp.asarray(comp_sp[name]) for name in components), printQ=False, final=False
         )
         frag_e, frag_err = (None, None) if frag_stats is None else frag_stats
+        guide_se_s = f"{guide_se:10.3e}" if guide_se is not None else f"{'-':>10s}"
+        frag_e_s = f"{float(np.real(frag_e)):14.10f}" if frag_e is not None else f"{'-':>14s}"
+        frag_err_s = f"{float(np.real(frag_err)):10.3e}" if frag_err is not None else f"{'-':>10s}"
         print(
-            f"{tag}[blk {n_done:4d}/{params.n_blocks}]  {guide_mu:14.10f}  "
-            f"{(f'{guide_se:10.3e}' if guide_se is not None else ' ' * 10)}  {guide_w_avg:12.6e}  "
-            f"{(f'{float(np.real(frag_e)):14.10f}' if frag_e is not None else ' ' * 14)}  "
-            f"{(f'{float(np.real(frag_err)):10.3e}' if frag_err is not None else ' ' * 10)}  "
-            f"{int(state.node_encounters):10d}  {dt_per_block:9.3f}  {elapsed:8.1f}"
+            f"[blk {n_done:4d}/{params.n_blocks}]  {guide_mu:14.10f}  {guide_se_s}  {guide_w_avg:12.6e}  "
+            f"{frag_e_s}  {frag_err_s}  {int(state.node_encounters):10d}  {dt_per_block:10.3f}  "
+            f"{elapsed:8.1f}"
         )
         if (
             max_error is not None

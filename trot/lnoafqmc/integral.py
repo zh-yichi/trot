@@ -211,21 +211,21 @@ def build_ham_lno_df(mf: Any, lno_coeff: Any, lno_frozen: Any, *, chol_cut: floa
     _require_df_x64(mf)
     lno_coeff = np.asarray(lno_coeff)
     ncore, nocc, ncas, actfrag = get_las_idx(mf, lno_frozen)
-    print(f"[lnotrot] fragment space: nocc={nocc} ncas={ncas} ncore={ncore}")
+    print(f"[lnoafqmc] fragment space: nocc={nocc} ncas={ncas} ncore={ncore}")
 
     t0 = time.time()
     h0, h1 = lno_effective_core(mf, lno_coeff[:, :ncore], lno_coeff[:, actfrag])
-    print(f"[lnotrot] effective core and h1 in {time.time() - t0:.2f}s (E_core={h0:.10f})")
+    print(f"[lnoafqmc] effective core and h1 in {time.time() - t0:.2f}s (E_core={h0:.10f})")
 
     t0 = time.time()
     (cderi_las,) = active_df(mf, [lno_coeff[:, actfrag]])
-    print(f"[lnotrot] DF tensor in the active space {cderi_las.shape} in {time.time() - t0:.2f}s")
+    print(f"[lnoafqmc] DF tensor in the active space {cderi_las.shape} in {time.time() - t0:.2f}s")
 
     t0 = time.time()
     chol_full, nchol = df2chol_gpu(jnp.asarray(cderi_las), max_error=chol_cut)
     nchol = int(nchol)
     chol = np.asarray(chol_full[:nchol])
-    print(f"[lnotrot] cholesky: nchol={nchol} (cut {chol_cut:g}) in {time.time() - t0:.2f}s")
+    print(f"[lnoafqmc] cholesky: nchol={nchol} (cut {chol_cut:g}) in {time.time() - t0:.2f}s")
 
     return HamInput(
         h0=float(h0),
@@ -250,22 +250,22 @@ def build_ham_ulno_df(mf: Any, lno_coeff: Any, lno_frozen: Any, *, chol_cut: flo
     _require_df_x64(mf)
     coeffs = [np.asarray(c) for c in lno_coeff]
     ncore, nocc, ncas, _ = get_las_idx(mf, lno_frozen)
-    print(f"[lnotrot] fragment space: nocc={nocc} ncas={ncas} ncore={ncore}")
+    print(f"[lnoafqmc] fragment space: nocc={nocc} ncas={ncas} ncore={ncore}")
 
     t0 = time.time()
     core = [coeffs[s][:, : ncore[s]] for s in range(2)]
     act = [coeffs[s][:, ncore[s] : ncore[s] + ncas[s]] for s in range(2)]
     h0, (h1a, h1b) = lno_effective_core(mf, core, act)
-    print(f"[lnotrot] effective core and h1 in {time.time() - t0:.2f}s (E_core={h0:.10f})")
+    print(f"[lnoafqmc] effective core and h1 in {time.time() - t0:.2f}s (E_core={h0:.10f})")
 
     t0 = time.time()
     df_a, df_b = active_df(mf, act)
-    print(f"[lnotrot] DF tensors in the active spaces {df_a.shape}, {df_b.shape} in {time.time() - t0:.2f}s")
+    print(f"[lnoafqmc] DF tensors in the active spaces {df_a.shape}, {df_b.shape} in {time.time() - t0:.2f}s")
 
     t0 = time.time()
     uc = joint_df2chol(df_a, df_b, chol_cut=chol_cut)
     print(
-        f"[lnotrot] joint cholesky: nchol={uc.nchol} residual_max={uc.residual_max:.2e} "
+        f"[lnoafqmc] joint cholesky: nchol={uc.nchol} residual_max={uc.residual_max:.2e} "
         f"(cut {chol_cut:g}) in {time.time() - t0:.2f}s"
     )
 

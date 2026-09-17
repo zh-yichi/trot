@@ -84,6 +84,28 @@ class LnoFragData:
             )
         return int(self.nactocc) + int(self.nactvir)
 
+    @staticmethod
+    def _split_frozen(frozen: Any) -> tuple[int, int]:
+        # the LAS ordering [frz_occ | act_occ | act_vir | frz_vir] puts the frozen occupied
+        # at the leading indices 0, 1, ..., so they are the initial run of the sorted list
+        idx = np.sort(_as_frozen_array(frozen))
+        nfrzocc = int(np.sum(idx == np.arange(idx.size)))
+        return nfrzocc, int(idx.size - nfrzocc)
+
+    @property
+    def nfrzocc(self):
+        """Frozen occupied count, an int or an (alpha, beta) pair."""
+        if self.unrestricted:
+            return tuple(self._split_frozen(f)[0] for f in self.lno_frozen)
+        return self._split_frozen(self.lno_frozen)[0]
+
+    @property
+    def nfrzvir(self):
+        """Frozen virtual count, an int or an (alpha, beta) pair."""
+        if self.unrestricted:
+            return tuple(self._split_frozen(f)[1] for f in self.lno_frozen)
+        return self._split_frozen(self.lno_frozen)[1]
+
 
 def frag_mf(mf: Any, frag: LnoFragData) -> Any:
     """

@@ -95,7 +95,7 @@ class LnoFragMixed(AfqmcMixed):
     ----------
     mf : pyscf RHF/UHF, density fitted. None when built from a fragment file.
     frag : LnoFragData, the CPU stage of the fragment (LNOs, amplitudes).
-    trial, guide : the recipe (lnotrot.mixed); defaults "pt2ccsd" (RHF) / "upt2ccsd" (UHF)
+    trial, guide : the recipe (lnoafqmc.mixed); defaults "pt2ccsd" (RHF) / "upt2ccsd" (UHF)
         with the HF guide.
     max_error : early-stop target of the fragment error; None runs all n_blocks.
     stop_ratio, min_blocks : stop once err < stop_ratio * max_error and at least
@@ -213,7 +213,7 @@ class LnoFragMixed(AfqmcMixed):
 
     def stage(self, *, force: bool = False) -> StagedInputs:
         """
-        The fragment hamiltonian (lnotrot.integral) and the guide, staged by trot from the
+        The fragment hamiltonian (lnoafqmc.integral) and the guide, staged by trot from the
         mean field in the fragment basis, as AfqmcMixed.stage does from cc._scf.
         """
         key = self._key()
@@ -256,11 +256,13 @@ class LnoFragMixed(AfqmcMixed):
         print(f"\n******** LNO fragment {frag.frag_idx + 1} [{frag.frag_name}] ********")
         print(f" nactocc         = {frag.nactocc}")
         print(f" nactvir         = {frag.nactvir}")
-        print(f" nfrozen (LNO)   = {np.size(frag.lno_frozen[0]) if frag.unrestricted else np.size(frag.lno_frozen)}")
-        print(f" lno_thresh      = {frag.lno_thresh}")
+        print(f" nfrzocc         = {frag.nfrzocc}")
+        print(f" nfrzvir         = {frag.nfrzvir}")
+        thresh = ", ".join("None" if x is None else f"{x:.2e}" for x in frag.lno_thresh)
+        print(f" lno_thresh      = [{thresh}]")
         print(f" E(LNO-MP2)      = {frag.efrag_mp:.8f}")
         print(f" E(LNO-CCSD)     = {frag.efrag_cc:.8f}")
-        print(f" max_error       = {self.max_error}")
+        print(f" max_error       = {'None' if self.max_error is None else f'{self.max_error:.2e}'}")
         print(f" stop_ratio      = {self.stop_ratio}  min_blocks = {self.min_blocks}")
         super().dump_flags(job)
 
@@ -333,15 +335,15 @@ class LnoAfqmcMixed:
     Parameters (LNO, as run_afqmc)
     ----------
     mf : density fitted pyscf RHF/UHF
-    lo_coeff, frag_list, frag_name : from lnotrot.fragments.iao_fragment
+    lo_coeff, frag_list, frag_name : from lnoafqmc.fragments.iao_fragment
     lno_thresh : float (-> [10 x, x]) or [occ, vir]
     nfrozen : frozen core count, default chemcore
     run_frag : fragment indices to run (0-based), default all
     run_mp, run_cc, run_qmc : which steps to run; run_cc=None follows the recipe
     pipeline, prefetch : run the CPU stage ahead on a thread, and how far ahead
-    frag_output, lno_output : optional per-fragment logs / results table (lnotrot.io)
+    frag_output, lno_output : optional per-fragment logs / results table (lnoafqmc.io)
     save_frag_data : directory for the self-contained frag{i}.h5 files
-    isolate : run each fragment's AFQMC in a child process (python -m trot.lnotrot.run_frag)
+    isolate : run each fragment's AFQMC in a child process (python -m trot.lnoafqmc.run_frag)
     keep_qmc_results : keep every fragment's FragQmcResult in frag_qmc_results
     debug_memory : raise if device memory does not return to baseline after a fragment
 
@@ -486,7 +488,7 @@ class LnoAfqmcMixed:
             warnings.warn(
                 f"{_ALLOCATOR} is {os.environ.get(_ALLOCATOR)!r}, not 'platform': jax keeps a memory "
                 "pool, so device memory may not return to the driver between fragments. Import "
-                "trot.lnotrot before jax, or set the variable, for long fragment loops.",
+                "trot.lnoafqmc before jax, or set the variable, for long fragment loops.",
                 stacklevel=2,
             )
 
@@ -618,7 +620,7 @@ class LnoAfqmcMixed:
         opts_path = base / f"frag{frag.frag_idx + 1}.opts.json"
         out_path = base / f"frag{frag.frag_idx + 1}.result.json"
         opts_path.write_text(json.dumps(opts))
-        cmd = [sys.executable, "-m", "trot.lnotrot.run_frag", str(path), "--options", str(opts_path), "--out", str(out_path)]
+        cmd = [sys.executable, "-m", "trot.lnoafqmc.run_frag", str(path), "--options", str(opts_path), "--out", str(out_path)]
         print(f"running fragment {frag.frag_idx + 1} in a child process: {' '.join(cmd)}")
         env = dict(os.environ)
         env.setdefault(_ALLOCATOR, "platform")
@@ -639,7 +641,7 @@ class LnoAfqmcMixed:
         mf = self._scf
         print(banner_afqmc())
         print_runtime_provenance()
-        print("\n ******* LNO-AFQMC (lnotrot) ******* \n")
+        print("\n ******* LNO-AFQMC (lnoafqmc) ******* \n")
         print(f"LNO THRESHOLD = {self.lno_thresh_in}")
         print(f"trial = {self.trial}  guide = {self.guide}")
 
@@ -653,7 +655,7 @@ class LnoAfqmcMixed:
         self._reset_results()
         self._seeds = np.random.default_rng(self.seed).integers(1, 2**31 - 1, size=self.nfrag_tot)
         if self.max_error is not None:
-            print(f"target_error = {self.target_error:g}  ->  per fragment max_error = {self.max_error:.3e}")
+            print(f"target_error = {self.target_error:.2e}  ->  per fragment max_error = {self.max_error:.2e}")
 
         lno_pct_occ = [None, None]
         lno_norb = [[None, None]] * self.nfrag_tot
@@ -680,7 +682,7 @@ class LnoAfqmcMixed:
                 print(f"Fragment Num.  {ifrag + 1}")
                 print(f"Fragment Idx.  {frag_idx + 1}")
                 print(f"Fragment Name  {self.frag_name_all[frag_idx]}")
-                print(f"LNO THRESHOLD  {lno_thresh}")
+                print(f"LNO THRESHOLD  [{', '.join(f'{x:.2e}' for x in lno_thresh)}]")
                 print(f"PySCF Threads  {lib.num_threads()}")
 
                 # ---------------- CPU stage (possibly already finished)
