@@ -396,11 +396,51 @@ def freeze_core_from_mo_cholesky(
     return ecore, np.asarray(h1_eff), np.array(chol_act, copy=True), nelec_active
 
 
+@jax.jit
+def _ujk_from_cderi(cderi: jax.Array, dm_a: jax.Array, dm_b: jax.Array):
+    """J[D^a + D^b], K[D^a], K[D^b] from one (naux, nao, nao) block of DF vectors."""
+    dm_tot = dm_a + dm_b
+    vj = jnp.einsum("g,gij->ij", jnp.einsum("gkl,lk->g", cderi, dm_tot), cderi)
+    vk_a = jnp.einsum("gik,kl,glj->ij", cderi, dm_a, cderi, optimize=True)
+    vk_b = jnp.einsum("gik,kl,glj->ij", cderi, dm_b, cderi, optimize=True)
+    return vj, vk_a, vk_b
+
+
+def _core_uveff(mf: Any, dm_a: NDArray, dm_b: NDArray) -> tuple[NDArray, NDArray]:
+    """
+    V^s = J[D^a + D^b] - K[D^s] for the core densities, in the AO basis.
+
+    A density fitted mf is contracted block by block on the device, which is much faster
+    than pyscf's DF get_jk; otherwise this is mf.get_jk with the exact ERIs. Without
+    jax_enable_x64 the device path would be single precision, so it falls back to
+    mf.get_jk (still density fitted) there too.
+    """
+    with_df = getattr(mf, "with_df", None)
+    if with_df is None or not jax.config.read("jax_enable_x64"):
+        vj, vk = mf.get_jk(mf.mol, np.asarray([dm_a, dm_b]), hermi=1)
+        return vj[0] + vj[1] - vk[0], vj[0] + vj[1] - vk[1]
+
+    from pyscf import lib
+
+    dm_a = jnp.asarray(dm_a)
+    dm_b = jnp.asarray(dm_b)
+    vj = jnp.zeros_like(dm_a)
+    vk_a = jnp.zeros_like(dm_a)
+    vk_b = jnp.zeros_like(dm_b)
+    for cderi in with_df.loop():
+        cderi = jnp.asarray(lib.unpack_tril(cderi, axis=-1))
+        dvj, dvk_a, dvk_b = _ujk_from_cderi(cderi, dm_a, dm_b)
+        vj += dvj
+        vk_a += dvk_a
+        vk_b += dvk_b
+    return np.asarray(vj - vk_a), np.asarray(vj - vk_b)
+
+
 def freeze_core_from_mo_cholesky_uh(
     *,
-    h0: float,
-    h1_a: NDArray,
-    h1_b: NDArray,
+    mf: Any,
+    basis_a: NDArray,
+    basis_b: NDArray,
     chol_a: NDArray,
     chol_b: NDArray,
     norb_frozen: int,
@@ -409,27 +449,31 @@ def freeze_core_from_mo_cholesky_uh(
     """
     Unrestricted frozen core.
 
-    freeze_core_from_mo_cholesky is closed shell: it carries factors of 2 that assume
-    both spins occupy the same spatial core orbitals. Here the two spins have their own
-    basis and their own core, so:
+    The core energy and the core potential are built from the AO integrals of mf
+    (the DF tensor on the GPU if mf is density fitted, else mf.get_jk), not from the
+    cholesky vectors, so h0 and h1 do not depend on how, or how tightly, the ERIs were
+    decomposed. With the core
+    densities D^s = C^s_c C^s_c^dag and V^s = J[D^a + D^b] - K[D^s],
 
-        E_core   = sum_sigma tr h^sigma_cc
-                   + 1/2 sum_g [ T_g^2 - sum_sigma tr(L^sigma_cc L^sigma_cc) ]
-        h1_eff^s = h^s_aa + sum_g T_g L^s_aa - sum_g L^s_ac L^s_ca
+        E_core   = E_nuc + sum_s tr[D^s (h + V^s / 2)]
+        h1_eff^s = C^s_a^dag (h + V^s) C^s_a
 
-    with T_g = tr L^a_g,cc + tr L^b_g,cc the core trace summed over spin. The coulomb
-    term sees both spins (T_g), the exchange term only its own.
-
-    Setting alpha == beta reduces to the restricted expressions.
+    basis_a / basis_b are the full (nao, nmo_s) bases chol_a / chol_b were rotated into;
+    their first norb_frozen columns are the core. The cholesky vectors are only cut down
+    to the active block. Setting alpha == beta reduces to the restricted expressions.
     """
+    basis_a = np.asarray(basis_a)
+    basis_b = np.asarray(basis_b)
+    nmo_a, nmo_b = int(basis_a.shape[1]), int(basis_b.shape[1])
+    for spin, chol, nmo in (("a", chol_a, nmo_a), ("b", chol_b, nmo_b)):
+        if chol.ndim != 3 or chol.shape[1:] != (nmo, nmo):
+            raise ValueError(
+                f"chol_{spin} must have shape (nchol, {nmo}, {nmo}), got {chol.shape}."
+            )
     if norb_frozen < 0:
         raise ValueError(f"norb_frozen must be non-negative, got {norb_frozen}.")
-    if norb_frozen == 0:
-        return float(h0), h1_a, h1_b, chol_a, chol_b, nelec
     if norb_frozen > min(nelec):
         raise ValueError(f"norb_frozen={norb_frozen} exceeds min(nelec)={min(nelec)}")
-
-    nmo_a, nmo_b = int(h1_a.shape[0]), int(h1_b.shape[0])
     if norb_frozen >= min(nmo_a, nmo_b):
         raise ValueError(
             f"norb_frozen={norb_frozen} leaves no active orbitals "
@@ -440,47 +484,35 @@ def freeze_core_from_mo_cholesky_uh(
     if min(nelec_active) < 0 or sum(nelec_active) <= 0:
         raise ValueError("Frozen core left no active electrons.")
 
-    core = slice(0, norb_frozen)
+    hcore = np.asarray(mf.get_hcore())
+    ecore = float(mf.energy_nuc())
 
-    def blocks(h1, chol, nmo):
-        act = slice(norb_frozen, nmo)
-        return (
-            np.asarray(h1[core, core]),
-            np.asarray(h1[act, act]),
-            np.asarray(chol[:, core, core]),
-            np.asarray(chol[:, act, act]),
-            np.asarray(chol[:, act, core]),
-            np.asarray(chol[:, core, act]),
-        )
+    core_a, act_a = basis_a[:, :norb_frozen], basis_a[:, norb_frozen:]
+    core_b, act_b = basis_b[:, :norb_frozen], basis_b[:, norb_frozen:]
 
-    h1_cc_a, h1_aa_a, l_cc_a, l_aa_a, l_ac_a, l_ca_a = blocks(h1_a, chol_a, nmo_a)
-    h1_cc_b, h1_aa_b, l_cc_b, l_aa_b, l_ac_b, l_ca_b = blocks(h1_b, chol_b, nmo_b)
+    if norb_frozen == 0:
+        veff_a = veff_b = 0.0
+    else:
+        dm_a = core_a @ core_a.conj().T
+        dm_b = core_b @ core_b.conj().T
+        veff_a, veff_b = _core_uveff(mf, dm_a, dm_b)
 
-    # core trace summed over spin: the coulomb field the active space sees
-    t_g = np.trace(l_cc_a, axis1=1, axis2=2) + np.trace(l_cc_b, axis1=1, axis2=2)
+        e_core = (
+            np.einsum("ij,ji->", dm_a, hcore + 0.5 * veff_a)
+            + np.einsum("ij,ji->", dm_b, hcore + 0.5 * veff_b)
+        ) 
+        ecore += float(np.real(e_core))
 
-    vj_a = np.einsum("x,xpq->pq", t_g, l_aa_a, optimize=True)
-    vj_b = np.einsum("x,xpq->pq", t_g, l_aa_b, optimize=True)
-    vk_a = np.einsum("xpi,xiq->pq", l_ac_a, l_ca_a, optimize=True)
-    vk_b = np.einsum("xpi,xiq->pq", l_ac_b, l_ca_b, optimize=True)
+    h1_eff_a = act_a.conj().T @ (hcore + veff_a) @ act_a
+    h1_eff_b = act_b.conj().T @ (hcore + veff_b) @ act_b
 
-    h1_eff_a = h1_aa_a + vj_a - vk_a
-    h1_eff_b = h1_aa_b + vj_b - vk_b
-
-    e1_core = np.trace(h1_cc_a) + np.trace(h1_cc_b)
-    ej_core = 0.5 * float(np.dot(t_g, t_g))
-    ek_core = 0.5 * (
-        np.einsum("xij,xji->", l_cc_a, l_cc_a, optimize=True)
-        + np.einsum("xij,xji->", l_cc_b, l_cc_b, optimize=True)
-    )
-    ecore = float(np.real(h0 + e1_core + ej_core - ek_core))
-
+    act = slice(norb_frozen, None)
     return (
         ecore,
         np.asarray(h1_eff_a),
         np.asarray(h1_eff_b),
-        np.array(l_aa_a, copy=True),
-        np.array(l_aa_b, copy=True),
+        np.array(chol_a[:, act, act], copy=True),
+        np.array(chol_b[:, act, act], copy=True),
         nelec_active,
     )
 
@@ -601,7 +633,7 @@ def _unpack_symmetric(packed: NDArray, norb: int) -> NDArray:
     return output
 
 
-def joint_df_pair_cholesky(
+def joint_df2chol(
     df_a: ArrayLike,
     df_b: ArrayLike,
     *,
@@ -706,7 +738,7 @@ def _df_block_to_pairs(block: NDArray, coeff: NDArray) -> NDArray:
     return np.asarray(transformed[:, rows, cols])
 
 
-def build_joint_df_cholesky(
+def build_joint_df2chol(
     mf: Any,
     coeff: tuple[NDArray, NDArray],
     *,
@@ -736,7 +768,7 @@ def build_joint_df_cholesky(
         offset = stop
     if offset != naux:
         raise RuntimeError(f"DF iterator yielded {offset} auxiliaries; expected {naux}.")
-    return joint_df_pair_cholesky(df_a, df_b, chol_cut=chol_cut, max_chol=max_chol)
+    return joint_df2chol(df_a, df_b, chol_cut=chol_cut, max_chol=max_chol)
 
 
 # ======================================================================================
@@ -857,7 +889,7 @@ def common_active_space(
     )
 
 
-def build_common_space_df_cholesky(
+def build_union_df2chol(
     mf: Any,
     act_a: NDArray,
     act_b: NDArray,

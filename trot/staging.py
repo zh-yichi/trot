@@ -1378,9 +1378,9 @@ def build_ham_uchol(
     norb_frozen = int(norb_frozen_core)
     if norb_frozen > 0:
         h0, h1_a, h1_b, chol_a, chol_b, nelec = freeze_core_from_mo_cholesky_uh(
-            h0=h0,
-            h1_a=h1_a,
-            h1_b=h1_b,
+            mf=mf,
+            basis_a=basis_a,
+            basis_b=basis_b,
             chol_a=chol_a,
             chol_b=chol_b,
             norb_frozen=norb_frozen,
