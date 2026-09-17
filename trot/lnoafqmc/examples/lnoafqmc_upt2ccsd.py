@@ -30,7 +30,7 @@ from trot.afqmc import AfqmcMixed
 from trot.lnoafqmc import LnoAfqmcMixed, LnoFragMixed, iao_fragment
 
 a = 1.20577  # intra-dimer bond length (Bohr)
-d = 5  # centre-to-centre distance between dimers (Bohr)
+d = 100  # centre-to-centre distance between dimers (Bohr)
 na, nc = 2, 2  # atoms per monomer, number of monomers
 
 atoms = ""
@@ -67,16 +67,18 @@ lno = LnoAfqmcMixed(
     nfrozen=nfrozen,
     trial="upt2ccsd",  # the default for a UHF mf; guide=None -> the UHF guide.
     #                    "upt2ccsd_sto_chol" samples the T2-contracted cholesky sum; its knobs go in
-    #                    trial_kwargs, e.g. {"chol_cost_ratio": 0.2}, as in AfqmcMixed
+    #                    trial_kwargs, e.g. {"chol_cost_ratio": 0.2}, as in AfqmcMixed\
+    run_frag = [0, 1],
     target_error=1e-4,
-    n_walkers=600,
+    n_walkers=300,
     n_eql_blocks=80,
-    n_blocks=300,
+    n_blocks=600,
     dt=0.005,
     seed=27,
-    frag_output="./fragment.out",
-    lno_output="./lno_result.out",
-    save_frag_data="./frag_data",
+    mixed_precision = True,
+    # frag_output="./fragment.out",
+    # lno_output="./lno_result.out",
+    # save_frag_data="./frag_data",
 )
 e_qmc, e_qmc_err = lno.kernel()
 
@@ -99,8 +101,8 @@ print(f"LNO-MP2   E_corr = {lno.e_mp:.8f}")
 print(f"    MP2   E_corr = {mymp.e_corr:.8f}")
 print(f"LNO-CCSD  E_corr = {lno.e_cc:.8f}")
 print(f"    CCSD  E_corr = {mycc.e_corr:.8f}")
-print(f"LNO-AFQMC E_corr + dMP2 = {e_qmc + mymp.e_corr - lno.e_mp:.6f} +/- {e_qmc_err:.6f}")
-print(f"AFQMC E_corr  = {e_ref - mf.e_tot:.6f} +/- {err_ref:.6f}")
+# print(f"LNO-AFQMC E_corr + dMP2 = {e_qmc + mymp.e_corr - lno.e_mp:.6f} +/- {e_qmc_err:.6f}")
+print(f"AFQMC E_corr  = {(e_ref - mf.e_tot)/2:.6f} +/- {err_ref/2:.6f}")
 
 # one fragment again, from its file: no LNO, UCCSD or integral work, straight to the QMC
 # frag = LnoFragMixed.from_frag_data("./frag_data/frag1.h5", n_blocks=300, seed=27, n_walkers=300, n_eql_blocks=80)
