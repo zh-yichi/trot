@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import jax
 import jax.numpy as jnp
@@ -162,7 +162,9 @@ def _frag_two_body(
     lg_s a (k, nocc_s, nocc_s) contraction of the ov cholesky block with an ov matrix.
     The projected two-body form shared by e0t1orb (with t1) and e0frg (with the green).
     """
-    tr = jnp.einsum("gjj->g", lg_a, optimize="optimal") + jnp.einsum("gjj->g", lg_b, optimize="optimal")
+    tr = jnp.einsum("gjj->g", lg_a, optimize="optimal") + jnp.einsum(
+        "gjj->g", lg_b, optimize="optimal"
+    )
     coul = jnp.einsum("gik,ik,g->", lg_a, prjlo_a, tr, optimize="optimal") + jnp.einsum(
         "gik,ik,g->", lg_b, prjlo_b, tr, optimize="optimal"
     )
@@ -202,7 +204,9 @@ def build_meas_ctx(
             f"unknown measure_type {cfg.measure_type!r}; the LNO estimator has only {_MEASURE_TYPES_U}"
         )
     if cfg.memory_mode not in _MEMORY_MODES:
-        raise ValueError(f"unknown memory_mode {cfg.memory_mode!r}; expected one of {_MEMORY_MODES}")
+        raise ValueError(
+            f"unknown memory_mode {cfg.memory_mode!r}; expected one of {_MEMORY_MODES}"
+        )
 
     nchol = _nchol(ham_data)
     requested = DEFAULT_NCHOL_CHUNK if cfg.nchol_chunk is None else int(cfg.nchol_chunk)
@@ -211,7 +215,8 @@ def build_meas_ctx(
     cap = min(requested, nchol) if nchol > 0 else requested
     _, nchol_chunk, _ = equal_chunks(nchol, cap)
 
-    bar = build_bar_intermediates_u(ham_data, trial_data)
+    # trot's builder reads mo_t_a/b and the sizes only, which the fragment trial has as well
+    bar = build_bar_intermediates_u(ham_data, cast(Any, trial_data))
     fock_bar_a, fock_bar_b = ufock_from_chol(
         trial_data.nocc, (bar["h1_bar_a"], bar["h1_bar_b"]), (bar["chol_bar_a"], bar["chol_bar_b"])
     )
@@ -385,8 +390,12 @@ def _bar_chunk_terms(
     """
     nocc_a, nocc_b = trial_data.nocc
 
-    gl_a = jnp.einsum("ir,gqr->giq", bw.green_a, chol_a_c, optimize="optimal")  # (k, nocc_a, norb_a)
-    gl_b = jnp.einsum("ir,gqr->giq", bw.green_b, chol_b_c, optimize="optimal")  # (k, nocc_b, norb_b)
+    gl_a = jnp.einsum(
+        "ir,gqr->giq", bw.green_a, chol_a_c, optimize="optimal"
+    )  # (k, nocc_a, norb_a)
+    gl_b = jnp.einsum(
+        "ir,gqr->giq", bw.green_b, chol_b_c, optimize="optimal"
+    )  # (k, nocc_b, norb_b)
     e2_0_g, tr_gl = _e2_0_g(gl_a[:, :, :nocc_a], gl_b[:, :, :nocc_b])
 
     # e2_2_2_1: only the trace of chol . t2_green is needed
@@ -415,8 +424,12 @@ def _bar_chunk_terms(
     ) + jnp.einsum("giq,giq->g", gl_b.astype(ctype), lt2_green_b.astype(ctype), optimize="optimal")
 
     # e2_2_3
-    glgp_a = jnp.einsum("giq,qa->gia", gl_a.astype(ctype), bw.greenp_a.astype(ctype), optimize="optimal")
-    glgp_b = jnp.einsum("giq,qa->gia", gl_b.astype(ctype), bw.greenp_b.astype(ctype), optimize="optimal")
+    glgp_a = jnp.einsum(
+        "giq,qa->gia", gl_a.astype(ctype), bw.greenp_a.astype(ctype), optimize="optimal"
+    )
+    glgp_b = jnp.einsum(
+        "giq,qa->gia", gl_b.astype(ctype), bw.greenp_b.astype(ctype), optimize="optimal"
+    )
     e2_2_3_g = _l2t2_g(glgp_a, glgp_b, t2_r)
 
     return e2_0_g.astype(jnp.complex128), e2_2_2_1_g, e2_2_2_2_g, e2_2_3_g
@@ -426,7 +439,9 @@ def _frag_two_body_g(
     lg_a: jax.Array, lg_b: jax.Array, prjlo_a: jax.Array, prjlo_b: jax.Array
 ) -> jax.Array:
     """_frag_two_body per cholesky vector, (k,): the summand, not the sum."""
-    tr = jnp.einsum("gjj->g", lg_a, optimize="optimal") + jnp.einsum("gjj->g", lg_b, optimize="optimal")
+    tr = jnp.einsum("gjj->g", lg_a, optimize="optimal") + jnp.einsum(
+        "gjj->g", lg_b, optimize="optimal"
+    )
     p_g = jnp.einsum("gik,ik->g", lg_a, prjlo_a, optimize="optimal") + jnp.einsum(
         "gik,ik->g", lg_b, prjlo_b, optimize="optimal"
     )
@@ -755,7 +770,9 @@ def plan_chunking_for_run_u(
     ctx adds the fock matrices and a constant, and the trial the t2ba block (the size of
     t2ab); both are small against the cholesky copies the model already counts.
     """
-    return _trot_plan_chunking_for_run_u(sys, ham_data, trial_data, measure_type="bar", **kwargs)
+    return _trot_plan_chunking_for_run_u(
+        sys, ham_data, cast(Any, trial_data), measure_type="bar", **kwargs
+    )
 
 
 def make_upt2ccsd_meas_ops(
@@ -810,7 +827,9 @@ def make_upt2ccsd_meas_ops(
     samples_tail = measure_type == "sto_chol" and not (
         isinstance(cfg.n_chol_head, str) and cfg.n_chol_head.lower() == "full"
     )
-    energy_kernel = {"bar": energy_kernel_uw_uh_bar, "sto_chol": energy_kernel_uw_uh_sto}[measure_type]
+    energy_kernel = {"bar": energy_kernel_uw_uh_bar, "sto_chol": energy_kernel_uw_uh_sto}[
+        measure_type
+    ]
 
     meas_ops = MeasOps(
         overlap=overlap_u,

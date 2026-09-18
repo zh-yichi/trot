@@ -18,16 +18,16 @@ lno_nocc are then (alpha, beta) pairs per fragment.
 Run from the repository root:  python trot/lnoafqmc/examples/lnoafqmc_upt2ccsd.py
 """
 
-import os
-
 # os.environ["OMP_NUM_THREADS"] = "1"  # LNO orbitals are thread sensitive; keeps runs reproducible
+
+from typing import Any
 
 import trot.lnoafqmc  # noqa: F401  before jax: chooses the allocator that frees memory between fragments
 from pyscf import cc, gto, scf, mp
 from pyscf.data.elements import chemcore
 
 from trot.afqmc import AfqmcMixed
-from trot.lnoafqmc import LnoAfqmcMixed, LnoFragMixed, iao_fragment
+from trot.lnoafqmc import LnoAfqmcMixed, iao_fragment
 
 a = 1.20577  # intra-dimer bond length (Bohr)
 d = 100  # centre-to-centre distance between dimers (Bohr)
@@ -38,22 +38,22 @@ for n in range(nc * na):
     shift = ((n - n % na) // na) * (d - a)
     atoms += f"O {n*a+shift:.5f} 0.00000 0.00000 \n"
 
-mol = gto.M(atom=atoms, basis="sto-6g", spin=2*nc, verbose=4)
-mf = scf.UHF(mol).density_fit()  # the fragment integrals come from the DF tensor
+mol = gto.M(atom=atoms, basis="sto-6g", spin=2 * nc, verbose=4)
+mf: Any = scf.UHF(mol).density_fit()  # the fragment integrals come from the DF tensor
 mf.kernel()
 
 stable = False
 while not stable:
-    print(f'mean-field stability test')
+    print("mean-field stability test")
     if not stable:
-        mo_i, _, stable,_ = mf.stability(return_status=True)
-        dm = mf.make_rdm1(mo_i,mf.mo_occ)
+        mo_i, _, stable, _ = mf.stability(return_status=True)
+        dm = mf.make_rdm1(mo_i, mf.mo_occ)
         mf.kernel(dm0=dm)
     elif stable:
-        print(f'HF Energy: {mf.e_tot}, stability {stable}')
+        print(f"HF Energy: {mf.e_tot}, stability {stable}")
         break
 
-nfrozen = chemcore(mol)
+nfrozen = int(chemcore(mol))
 
 # for a UHF mean field lo_coeff is an (alpha, beta) pair and each fragment a pair of LO lists
 lo_coeff, frag_list, frag_name = iao_fragment(mf, nfrozen, frag_type="atom")
@@ -68,14 +68,14 @@ lno = LnoAfqmcMixed(
     trial="upt2ccsd",  # the default for a UHF mf; guide=None -> the UHF guide.
     #                    "upt2ccsd_sto_chol" samples the T2-contracted cholesky sum; its knobs go in
     #                    trial_kwargs, e.g. {"chol_cost_ratio": 0.2}, as in AfqmcMixed\
-    run_frag = [0, 1],
+    run_frag=None,
     target_error=1e-4,
     n_walkers=300,
     n_eql_blocks=80,
     n_blocks=600,
     dt=0.005,
     seed=27,
-    mixed_precision = True,
+    mixed_precision=True,
     # frag_output="./fragment.out",
     # lno_output="./lno_result.out",
     # save_frag_data="./frag_data",
@@ -93,7 +93,16 @@ mymp.kernel()
 
 mycc = cc.UCCSD(mf, frozen=nfrozen)
 mycc.kernel()
-af = AfqmcMixed(mycc, trial="upt2ccsd_bar", norb_frozen_core=nfrozen, n_walkers=300, n_eql_blocks=80, n_blocks=600, seed=27)
+af = AfqmcMixed(
+    mycc,
+    trial="upt2ccsd_bar",
+    norb_frozen_core=nfrozen,
+    n_walkers=300,
+    n_eql_blocks=80,
+    n_blocks=600,
+    seed=27,
+    mixed_precision=True,
+)
 e_ref, err_ref = af.kernel()
 
 print(f"\nLNO-AFQMC E_corr = {e_qmc:.6f} +/- {e_qmc_err:.6f}")

@@ -143,7 +143,9 @@ def stage_pt2ccsd_trial(frag: LnoFragData) -> TrialInput:
     unprojected: the meas ctx needs it for e0t1orb.
     """
     if frag.unrestricted:
-        raise ValueError("stage_pt2ccsd_trial needs restricted fragment data; use stage_upt2ccsd_trial.")
+        raise ValueError(
+            "stage_pt2ccsd_trial needs restricted fragment data; use stage_upt2ccsd_trial."
+        )
     if not frag.has_amplitudes:
         raise ValueError("the pt2CCSD trial needs the fragment CCSD amplitudes (run_cc=True).")
 
@@ -338,7 +340,9 @@ def dump_frag(
         g.attrs["frag_name"] = str(frag.frag_name)
         g.attrs["unrestricted"] = bool(frag.unrestricted)
         g.attrs["nfrozen"] = int(frag.nfrozen)
-        g.attrs["lno_thresh_json"] = json.dumps([None if x is None else float(x) for x in frag.lno_thresh])
+        g.attrs["lno_thresh_json"] = json.dumps(
+            [None if x is None else float(x) for x in frag.lno_thresh]
+        )
         g.attrs["efrag_mp"] = float(frag.efrag_mp)
         g.attrs["efrag_cc"] = float(frag.efrag_cc)
         for k in ("t_las", "t_mp", "t_cc", "t_cpu"):
@@ -364,10 +368,13 @@ def load_frag(path: Union[str, Path]) -> tuple[LnoFragData, StagedInputs, dict[s
     """Read back what dump_frag wrote: (frag data, staged ham + guide, file attributes)."""
     path = Path(path)
     staged = _load_staged_uchol(path) if _is_uchol_file(path) else _load_staged_h5(path)
-    with h5py.File(path, "r") as f:
+    with h5py.File(path, "r") as h5file:
+        f: Any = h5file  # h5py's item types are unions pyright cannot narrow
         version = int(f.attrs.get("frag_file_version", -1))
         if version != FRAG_FILE_VERSION:
-            raise ValueError(f"{path}: fragment file version {version}, expected {FRAG_FILE_VERSION}")
+            raise ValueError(
+                f"{path}: fragment file version {version}, expected {FRAG_FILE_VERSION}"
+            )
         attrs = {
             "emf": float(f.attrs["emf"]),
             "fingerprint": json.loads(str(f.attrs["fingerprint_json"])),

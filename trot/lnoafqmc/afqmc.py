@@ -12,12 +12,12 @@ from pathlib import Path
 from typing import Any, Union, cast
 
 import numpy as np
-from numpy.typing import NDArray
 
 from ..afqmc import Afqmc, AfqmcMixed, banner_afqmc
 from ..core.system import WalkerKind
+from ..prop.types import QmcParams
 from ..runtime_provenance import print_runtime_provenance
-from ..setup_mixed import JobMixed, setup_mixed
+from ..setup_mixed import JobMixed
 from ..staging import StagedInputs, TrialInput
 from ..staging import stage as stage_inputs
 from . import io as lno_io
@@ -152,7 +152,8 @@ class LnoFragMixed(AfqmcMixed):
         self.frag = frag
         if trial is None:
             trial = "upt2ccsd" if frag.unrestricted else "pt2ccsd"
-        self.recipe: LnoMixedRecipe = get_mixed_recipe(trial, guide)
+        # the LNO recipe is a MixedRecipe with extra fields; AfqmcMixed declares the base type
+        self.recipe: LnoMixedRecipe = get_mixed_recipe(trial, guide)  # type: ignore[reportIncompatibleVariableOverride]
         self.trial: str = self.recipe.trial
         self.guide: str = self.recipe.guide
         if (self.recipe.ham_basis == "uchol") != frag.unrestricted:
@@ -187,7 +188,9 @@ class LnoFragMixed(AfqmcMixed):
     # ------------------------------------------------------------------ construction
 
     @classmethod
-    def from_frag_data(cls, path: Union[str, Path], *, mf: Any = None, **kwargs: Any) -> "LnoFragMixed":
+    def from_frag_data(
+        cls, path: Union[str, Path], *, mf: Any = None, **kwargs: Any
+    ) -> "LnoFragMixed":
         """
         Re-run one fragment from the file LnoAfqmcMixed(save_frag_data=...) wrote. The
         file carries the fragment hamiltonian and the staged guide, so no mf is needed;
@@ -226,9 +229,15 @@ class LnoFragMixed(AfqmcMixed):
         else:
             if self._scf is None:
                 raise ValueError("LnoFragMixed needs mf to build the fragment hamiltonian.")
-            ham = self.recipe.build_ham(self._scf, frag.lno_coeff, frag.lno_frozen, chol_cut=self.chol_cut)
+            ham = self.recipe.build_ham(
+                self._scf, frag.lno_coeff, frag.lno_frozen, chol_cut=self.chol_cut
+            )
             frozen = frag.lno_frozen[0] if frag.unrestricted else frag.lno_frozen
-            frozen = np.asarray(frozen, dtype=np.int64).reshape(-1) if not isinstance(frozen, int) else None
+            frozen = (
+                np.asarray(frozen, dtype=np.int64).reshape(-1)
+                if not isinstance(frozen, int)
+                else None
+            )
             staged = stage_inputs(
                 frag_mf(self._scf, frag),
                 frozen_orbitals=frozen if frozen is not None and frozen.size else None,
@@ -274,7 +283,7 @@ class LnoFragMixed(AfqmcMixed):
 
         result = run_frag_qmc(
             sys=job.sys,
-            params=job.params,
+            params=cast(QmcParams, job.params),
             ham_data=job.ham_data,
             guide_data=job.trial_data,
             guide_ops=job.trial_ops,
@@ -417,7 +426,9 @@ class LnoAfqmcMixed:
         self.frag_list = list(frag_list)
         self.nfrag_tot = len(self.frag_list)
         self.frag_name_all = (
-            [str(n) for n in frag_name] if frag_name is not None else [f"frag{i}" for i in range(self.nfrag_tot)]
+            [str(n) for n in frag_name]
+            if frag_name is not None
+            else [f"frag{i}" for i in range(self.nfrag_tot)]
         )
         if len(self.frag_name_all) != self.nfrag_tot:
             raise ValueError("frag_name and frag_list have different lengths")
@@ -500,7 +511,9 @@ class LnoAfqmcMixed:
         run_frag = [int(i) for i in run_frag]
         dup = sorted({i for i in run_frag if run_frag.count(i) > 1})
         if dup:
-            raise ValueError(f"run_frag contains duplicate fragment indices: {dup} (run_frag = {run_frag})")
+            raise ValueError(
+                f"run_frag contains duplicate fragment indices: {dup} (run_frag = {run_frag})"
+            )
         bad = sorted({i for i in run_frag if not 0 <= i < self.nfrag_tot})
         if bad:
             raise ValueError(
@@ -553,7 +566,9 @@ class LnoAfqmcMixed:
             return None
         return Path(base) / f"{stem}{frag_idx + 1}.h5"
 
-    def lnoafqmc_kernel(self, frag: LnoFragData) -> tuple[float, float, float, FragQmcResult | None]:
+    def lnoafqmc_kernel(
+        self, frag: LnoFragData
+    ) -> tuple[float, float, float, FragQmcResult | None]:
         """
         The device stage of one fragment: build the fragment hamiltonian, run the AFQMC,
         and release everything it put on the device before returning host floats.
@@ -590,7 +605,9 @@ class LnoAfqmcMixed:
             now = _device_bytes_in_use()
             if baseline is not None and now is not None:
                 mb = (now - baseline) / 1024**2
-                print(f"device memory: {now / 1024**2:.1f} MB in use ({mb:+.1f} MB vs before the fragment)")
+                print(
+                    f"device memory: {now / 1024**2:.1f} MB in use ({mb:+.1f} MB vs before the fragment)"
+                )
                 if self.debug_memory and mb > self.memory_tolerance_mb:
                     raise RuntimeError(
                         f"device memory grew by {mb:.1f} MB over fragment {frag_idx + 1} "
@@ -620,13 +637,24 @@ class LnoAfqmcMixed:
         opts_path = base / f"frag{frag.frag_idx + 1}.opts.json"
         out_path = base / f"frag{frag.frag_idx + 1}.result.json"
         opts_path.write_text(json.dumps(opts))
-        cmd = [sys.executable, "-m", "trot.lnoafqmc.run_frag", str(path), "--options", str(opts_path), "--out", str(out_path)]
+        cmd = [
+            sys.executable,
+            "-m",
+            "trot.lnoafqmc.run_frag",
+            str(path),
+            "--options",
+            str(opts_path),
+            "--out",
+            str(out_path),
+        ]
         print(f"running fragment {frag.frag_idx + 1} in a child process: {' '.join(cmd)}")
         env = dict(os.environ)
         env.setdefault(_ALLOCATOR, "platform")
         proc = subprocess.run(cmd, env=env)
         if proc.returncode != 0:
-            raise RuntimeError(f"fragment {frag.frag_idx + 1} failed in the child process (exit {proc.returncode})")
+            raise RuntimeError(
+                f"fragment {frag.frag_idx + 1} failed in the child process (exit {proc.returncode})"
+            )
         res = json.loads(out_path.read_text())
         return float(res["e_frag"]), float(res["e_frag_err"]), None
 
@@ -645,7 +673,9 @@ class LnoAfqmcMixed:
         print(f"LNO THRESHOLD = {self.lno_thresh_in}")
         print(f"trial = {self.trial}  guide = {self.guide}")
 
-        mlno = solvers.get_lnoccsd(mf, self.lo_coeff, self.frag_list, self.nfrozen, self.lno_thresh_in)
+        mlno = solvers.get_lnoccsd(
+            mf, self.lo_coeff, self.frag_list, self.nfrozen, self.lno_thresh_in
+        )
         lno_thresh = mlno.lno_thresh
         eris = mlno.ao2mo()
 
@@ -655,7 +685,9 @@ class LnoAfqmcMixed:
         self._reset_results()
         self._seeds = np.random.default_rng(self.seed).integers(1, 2**31 - 1, size=self.nfrag_tot)
         if self.max_error is not None:
-            print(f"target_error = {self.target_error:.2e}  ->  per fragment max_error = {self.max_error:.2e}")
+            print(
+                f"target_error = {self.target_error:.2e}  ->  per fragment max_error = {self.max_error:.2e}"
+            )
 
         lno_pct_occ = [None, None]
         lno_norb = [[None, None]] * self.nfrag_tot
@@ -667,8 +699,21 @@ class LnoAfqmcMixed:
         def _cpu_task(i: int) -> LnoFragData:
             fi = run_frag[i]
             return cpu_stage(
-                mlno, mf, self.lo_coeff, self.frag_list[fi], lno_thresh, lno_pct_occ, lno_norb,
-                self.lno_type, eris, i, fi, self.frag_name_all[fi], self.run_mp, self.run_cc, self.nfrozen,
+                mlno,
+                mf,
+                self.lo_coeff,
+                self.frag_list[fi],
+                lno_thresh,
+                lno_pct_occ,
+                lno_norb,
+                self.lno_type,
+                eris,
+                i,
+                fi,
+                self.frag_name_all[fi],
+                self.run_mp,
+                self.run_cc,
+                self.nfrozen,
             )
 
         pipe = CpuPipeline(_cpu_task, nfrag_run, depth)
@@ -703,7 +748,11 @@ class LnoAfqmcMixed:
                 print(f"LNO-CPU wait time (s):    {wait_time:.2f} ({hidden:.1f}% hidden)")
 
                 # ---------------- device stage
-                out_path = lno_io.frag_output_path(self.frag_output, frag_idx) if self.frag_output else None
+                out_path = (
+                    lno_io.frag_output_path(self.frag_output, frag_idx)
+                    if self.frag_output
+                    else None
+                )
                 if self.run_qmc:
                     with lno_io.tee_to_file(out_path, mode="w"):
                         efrag_qmc, efrag_qmc_err, t_qmc, result = self.lnoafqmc_kernel(frag)
@@ -723,7 +772,14 @@ class LnoAfqmcMixed:
                 if self.keep_qmc_results:
                     self.frag_qmc_results[ifrag] = result
                 self.frag_data[ifrag] = LnoFragData(
-                    **{**frag.__dict__, "t1": None, "t2": None, "lno_coeff": None, "uocc_loc": None, "log": ""}
+                    **{
+                        **frag.__dict__,
+                        "t1": None,
+                        "t2": None,
+                        "lno_coeff": None,
+                        "uocc_loc": None,
+                        "log": "",
+                    }
                 )
                 self.n_done = ifrag + 1
                 self._update_totals()
@@ -732,9 +788,17 @@ class LnoAfqmcMixed:
                 if out_path is not None:
                     lno_io.write_frag_summary(
                         out_path,
-                        frag_idx=frag_idx, frag_name=self.frag_name_all[frag_idx], nactocc=frag.nactocc,
-                        norb=frag.nact, efrag_mp=frag.efrag_mp, efrag_cc=frag.efrag_cc, efrag_qmc=efrag_qmc,
-                        efrag_qmc_err=efrag_qmc_err, t_cc=frag.t_cpu, t_wait=wait_time, t_qmc=t_qmc,
+                        frag_idx=frag_idx,
+                        frag_name=self.frag_name_all[frag_idx],
+                        nactocc=frag.nactocc,
+                        norb=frag.nact,
+                        efrag_mp=frag.efrag_mp,
+                        efrag_cc=frag.efrag_cc,
+                        efrag_qmc=efrag_qmc,
+                        efrag_qmc_err=efrag_qmc_err,
+                        t_cc=frag.t_cpu,
+                        t_wait=wait_time,
+                        t_qmc=t_qmc,
                     )
                 if self.lno_output is not None:
                     self._write_lno_output(lno_thresh, depth)
@@ -763,6 +827,7 @@ class LnoAfqmcMixed:
     run = kernel
 
     def _write_lno_output(self, lno_thresh: Any, depth: int) -> None:
+        assert self.lno_output is not None
         k = self.n_done
         lno_io.write_lno_result(
             self.lno_output,

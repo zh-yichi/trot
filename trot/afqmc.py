@@ -1169,7 +1169,7 @@ class AfqmcMixed(Afqmc):
                 print(f"  {'nchol_chunk_used':<{width}} = {job.mix_meas_ctx().nchol_chunk}")
             if trial_cfg.measure_type == "sto_chol":
                 # the head and tail sizes the sampling knobs resolve to, defaults included
-                nchol = int(job.ham_data.nchol)
+                nchol = int(job.ham_data.nchol or 0)
                 n_head, n_samples = resolve_chol_budget(
                     nchol,
                     trial_cfg.n_chol_head,

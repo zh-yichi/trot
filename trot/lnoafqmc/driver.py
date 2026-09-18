@@ -138,7 +138,9 @@ def run_frag_qmc(
         block_fn_sr = mix_block_fn
     else:
         data_sh = NamedSharding(mesh, P("data"))
-        block_fn_sr = partial(mix_block_fn, sr_fn=partial(stochastic_reconfiguration, data_sharding=data_sh))
+        block_fn_sr = partial(
+            mix_block_fn, sr_fn=partial(stochastic_reconfiguration, data_sharding=data_sh)
+        )
 
     run_blocks = make_run_mixed_blocks(
         mixed_block_fn=block_fn_sr,
@@ -247,12 +249,17 @@ def run_frag_qmc(
         dt_per_block = (time.perf_counter() - t_mark) / float(n)
         t_mark = time.perf_counter()
 
-        stats = blocking_analysis_ratio(jnp.asarray(guide_e_sp), jnp.asarray(guide_w_sp), print_q=False)
+        stats = blocking_analysis_ratio(
+            jnp.asarray(guide_e_sp), jnp.asarray(guide_w_sp), print_q=False
+        )
         guide_mu, guide_se = stats["mu"], stats["se_star"]
         guide_w_avg = float(np.mean(guide_w_sp))
 
         frag_stats = blocking_fn(
-            jnp.asarray(wp_sp), *(jnp.asarray(comp_sp[name]) for name in components), printQ=False, final=False
+            jnp.asarray(wp_sp),
+            *(jnp.asarray(comp_sp[name]) for name in components),
+            printQ=False,
+            final=False,
         )
         frag_e, frag_err = (None, None) if frag_stats is None else frag_stats
         guide_se_s = f"{guide_se:10.3e}" if guide_se is not None else f"{'-':>10s}"
@@ -298,7 +305,9 @@ def run_frag_qmc(
 
     frag_stats = blocking_fn(wp_c, *comps_c, printQ=True, final=True)
     if frag_stats is None:
-        print(f"{tag}Too few sampling blocks for a blocking analysis; falling back to the unblocked error.")
+        print(
+            f"{tag}Too few sampling blocks for a blocking analysis; falling back to the unblocked error."
+        )
         frag_stats = blocking_fn(wp_c, *comps_c, printQ=False, final=False)
     if frag_stats is None:
         frag_mean, frag_err = float("nan"), float("nan")

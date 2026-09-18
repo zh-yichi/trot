@@ -21,6 +21,7 @@ Run from the repository root:  python trot/lnoafqmc/examples/lnoafqmc_pt2ccsd.py
 """
 
 import os
+from typing import Any
 
 os.environ["OMP_NUM_THREADS"] = "1"  # LNO orbitals are thread sensitive; keeps runs reproducible
 
@@ -29,7 +30,6 @@ from pyscf import cc, gto, scf, mp
 from pyscf.data.elements import chemcore
 
 from trot.afqmc import AfqmcMixed
-from trot.lnoafqmc import LnoAfqmcMixed, LnoFragMixed, iao_fragment
 
 a = 2  # intra-dimer bond length (Bohr)
 d = 5  # centre-to-centre distance between dimers (Bohr)
@@ -40,10 +40,10 @@ for n in range(nc * na):
     shift = ((n - n % na) // na) * (d - a)
     atoms += f"N {n*a+shift:.5f} 0.00000 0.00000 \n"
 
-mol = gto.M(atom=atoms, basis="sto-6g", spin=0, unit='b', verbose=4)
-mf = scf.RHF(mol).density_fit()  # the fragment integrals come from the DF tensor
+mol = gto.M(atom=atoms, basis="sto-6g", spin=0, unit="b", verbose=4)
+mf: Any = scf.RHF(mol).density_fit()  # the fragment integrals come from the DF tensor
 mf.kernel()
-nfrozen = chemcore(mol)
+nfrozen = int(chemcore(mol))
 
 # IAO local orbitals grouped by atom ("h2heavy" attaches hydrogens to their heavy atom).
 # The LOs must span the occupied orbitals outside the frozen core; LnoAfqmcMixed checks.
@@ -85,7 +85,15 @@ mymp.kernel()
 mycc = cc.CCSD(mf, frozen=nfrozen)
 mycc.kernel()
 
-af = AfqmcMixed(mycc, trial="pt2ccsd_bar", norb_frozen_core=nfrozen, n_walkers=300, n_eql_blocks=80, n_blocks=1200, seed=27)
+af = AfqmcMixed(
+    mycc,
+    trial="pt2ccsd_bar",
+    norb_frozen_core=nfrozen,
+    n_walkers=300,
+    n_eql_blocks=80,
+    n_blocks=1200,
+    seed=27,
+)
 e_ref, err_ref = af.kernel()
 
 # print(f"\nLNO-AFQMC E_corr = {e_qmc:.6f} +/- {e_qmc_err:.6f}")

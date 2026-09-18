@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from typing import Any
 from functools import partial
 
 import numpy as np
@@ -47,8 +47,8 @@ def get_lnoparam(mf, lo_coeff, lno_thresh, lno_pct_occ, lno_norb, loidx, ifrag):
     if isinstance(mf, scf.uhf.UHF):
         orbloc = [lo_coeff[0][:, loidx[0]], lo_coeff[1][:, loidx[1]]]
 
-        def _pick(x, s):
-            return x[s] if isinstance(x, Iterable) else x
+        def _pick(x: Any, s: int) -> Any:
+            return x[s] if isinstance(x, (list, tuple, np.ndarray)) else x
 
         lno_param = [
             [

@@ -7,6 +7,8 @@ import io
 
 import jax
 import jax.numpy as jnp
+from typing import Any
+
 import numpy as np
 import pytest
 from pyscf import cc, gto, scf
@@ -163,7 +165,7 @@ def test_closed_shell_reduces_to_restricted(closed_shell_system):
         mo_t=jnp.asarray(staged_r.data["mo_t"]), t2=jnp.asarray(staged_r.data["t2"])
     )
     nocc = trial_r.nocc
-    sys_u = System_uh(norb=trial_r.norb, nelec=(nocc, nocc))
+    sys_u = System_uh(norb=(trial_r.norb, trial_r.norb), nelec=(nocc, nocc))
     trial_u = make_upt2ccsd_trial_data(stage_upt2ccsd_trial(s["ucc"]).data, sys_u)
 
     ctx_r = build_meas_ctx_r(ham_r, trial_r, Pt2ccsdMeasCfg())
@@ -211,7 +213,9 @@ def test_sto_chol_is_unbiased(o2_system):
 # AfqmcMixed
 # ---------------------------------------------------------------------------
 
-_PARAMS = dict(dt=0.005, n_walkers=4, n_prop_steps=2, n_blocks=20, n_eql_blocks=1, seed=3)
+_PARAMS: dict[str, Any] = dict(
+    dt=0.005, n_walkers=4, n_prop_steps=2, n_blocks=20, n_eql_blocks=1, seed=3
+)
 
 
 def _run(mycc, **kwargs):

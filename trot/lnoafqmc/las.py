@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from functools import partial, reduce
 
+from typing import Any
+
 import numpy as np
 from pyscf import lib, scf
 from pyscf.lib import logger
@@ -30,7 +32,7 @@ print = partial(print, flush=True)
 # --------------------------------------------------------------------------- overlaps
 
 
-def mo_olp(mf, mo1, mo2):
+def mo_olp(mf: Any, mo1: Any, mo2: Any) -> Any:
     """<mo1|mo2> in the AO metric, per spin for a UHF mean field."""
     s1e = mf.get_ovlp()
     if isinstance(mf, scf.uhf.UHF):
@@ -76,7 +78,7 @@ def check_span(mf, lo_coeff_occ, frozen=0, thresh=1e-6):
         span12 = p12[0] < thresh and p12[1] < thresh
         span21 = p21[0] < thresh and p21[1] < thresh
     elif isinstance(mf, scf.rhf.RHF):
-        nocc = np.count_nonzero(mf.mo_occ)
+        nocc = np.count_nonzero(np.asarray(mf.mo_occ))
         mo_occ = mf.mo_coeff[:, frozen:nocc]
         p12, p21 = mo_span(lo_coeff_occ, s1e, mo_occ)
         span12 = p12 < thresh
@@ -178,6 +180,9 @@ def make_rlas(mlno, eris, orbloc, lno_type, lno_param):
         *[u.shape[1] for u in [uocc_loc, uocc_std, uocc_orth]],
     )
 
+    uvir_loc: Any
+    uvir_std: Any
+    uvir_orth: Any
     uvir_loc = reduce(np.dot, (orbloc.T.conj(), s1e, orbvir))
     uvir_loc, uvir_std, uvir_orth = lno.projection_construction(
         uvir_loc, mlno.lo_proj_thresh, mlno.lo_proj_thresh_active
@@ -262,15 +267,15 @@ def make_ulas(mlno, eris, orbloc, lno_type, lno_param):
     log = logger.new_logger(mlno)
     s1e = mlno.s1e
 
-    orboccfrz_core = [None] * 2
-    orbocc = [None] * 2
-    orbvir = [None] * 2
-    orbvirfrz_core = [None] * 2
-    moeocc = [None] * 2
-    moevir = [None] * 2
-    uocc_loc = [None] * 2
-    uocc_std = [None] * 2
-    uocc_orth = [None] * 2
+    orboccfrz_core: list[Any] = [None] * 2
+    orbocc: list[Any] = [None] * 2
+    orbvir: list[Any] = [None] * 2
+    orbvirfrz_core: list[Any] = [None] * 2
+    moeocc: list[Any] = [None] * 2
+    moevir: list[Any] = [None] * 2
+    uocc_loc: list[Any] = [None] * 2
+    uocc_std: list[Any] = [None] * 2
+    uocc_orth: list[Any] = [None] * 2
 
     mo_splits = mlno.split_mo_coeff()
     moe_splits = mlno.split_mo_energy()
@@ -296,11 +301,11 @@ def make_ulas(mlno, eris, orbloc, lno_type, lno_param):
     else:
         raise NotImplementedError("Unsupported LNO type")
 
-    lno_orbfrag = [None] * 2
-    frzfrag = [None] * 2
-    uoccact_loc = [None] * 2
-    can_orbfrag = [None] * 2
-    can_uoccact_loc = [None] * 2
+    lno_orbfrag: list[Any] = [None] * 2
+    frzfrag: list[Any] = [None] * 2
+    uoccact_loc: list[Any] = [None] * 2
+    can_orbfrag: list[Any] = [None] * 2
+    can_uoccact_loc: list[Any] = [None] * 2
     frag_msg = ""
 
     for s in range(2):

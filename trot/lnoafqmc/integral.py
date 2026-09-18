@@ -51,19 +51,18 @@ def _las_idx_one(nao: int, nocc: int, frozen: Any) -> tuple[int, int, int, NDArr
     return nfrzocc, nactocc, ncas, actfrag
 
 
-def get_las_idx(mf: Any, lno_frozen: Any):
+def get_las_idx(mf: Any, lno_frozen: Any) -> Any:
     """
     (ncore, nocc, ncas, actfrag) of the fragment: frozen occupied count, active occupied
     count, active orbital count and the active indices. Each is a pair for a UHF mf.
     """
     nao = mf.mol.nao
+    mo_occ = np.asarray(mf.mo_occ)
     if isinstance(mf, scf.uhf.UHF):
-        out = [
-            _las_idx_one(nao, int(np.count_nonzero(mf.mo_occ[s])), lno_frozen[s]) for s in range(2)
-        ]
+        out = [_las_idx_one(nao, int(np.count_nonzero(mo_occ[s])), lno_frozen[s]) for s in range(2)]
         return tuple(tuple(o[k] for o in out) for k in range(4))
     if isinstance(mf, scf.rhf.RHF):
-        return _las_idx_one(nao, int(np.count_nonzero(mf.mo_occ)), lno_frozen)
+        return _las_idx_one(nao, int(np.count_nonzero(mo_occ)), lno_frozen)
     raise TypeError(f"unsupported mean-field type: {type(mf)}")
 
 
@@ -141,7 +140,7 @@ def cderi2mo(cderi: jax.Array, coeff: jax.Array) -> jax.Array:
 
 
 @jax.jit
-def df2chol_gpu(dferi: jax.Array, max_error: float = 1e-6) -> tuple[jax.Array, jax.Array]:
+def df2chol_gpu(dferi: jax.Array, max_error: float = 1e-6) -> tuple[jax.Array, Any]:
     """
     Pivoted modified cholesky of the pair Gram matrix dferi^T dferi, compiled.
 
@@ -234,9 +233,11 @@ def build_ham_lno_df(mf: Any, lno_coeff: Any, lno_frozen: Any, *, chol_cut: floa
         nelec=(int(nocc), int(nocc)),
         norb=int(ncas),
         chol_cut=float(chol_cut),
-        frozen=np.asarray(lno_frozen, dtype=np.int64).reshape(-1)
-        if not isinstance(lno_frozen, int)
-        else np.zeros((0,), dtype=np.int64),
+        frozen=(
+            np.asarray(lno_frozen, dtype=np.int64).reshape(-1)
+            if not isinstance(lno_frozen, int)
+            else np.zeros((0,), dtype=np.int64)
+        ),
         source_kind="mf",
         basis="restricted",
     )
@@ -260,7 +261,9 @@ def build_ham_ulno_df(mf: Any, lno_coeff: Any, lno_frozen: Any, *, chol_cut: flo
 
     t0 = time.time()
     df_a, df_b = active_df(mf, act)
-    print(f"[lnoafqmc] DF tensors in the active spaces {df_a.shape}, {df_b.shape} in {time.time() - t0:.2f}s")
+    print(
+        f"[lnoafqmc] DF tensors in the active spaces {df_a.shape}, {df_b.shape} in {time.time() - t0:.2f}s"
+    )
 
     t0 = time.time()
     uc = joint_df2chol(df_a, df_b, chol_cut=chol_cut)
@@ -270,7 +273,11 @@ def build_ham_ulno_df(mf: Any, lno_coeff: Any, lno_frozen: Any, *, chol_cut: flo
     )
 
     frozen = tuple(
-        np.asarray(f, dtype=np.int64).reshape(-1) if not isinstance(f, int) else np.zeros((0,), dtype=np.int64)
+        (
+            np.asarray(f, dtype=np.int64).reshape(-1)
+            if not isinstance(f, int)
+            else np.zeros((0,), dtype=np.int64)
+        )
         for f in lno_frozen
     )
     return HamInputU(

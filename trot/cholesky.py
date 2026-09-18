@@ -423,14 +423,14 @@ def _core_uveff(mf: Any, dm_a: NDArray, dm_b: NDArray) -> tuple[NDArray, NDArray
 
     from pyscf import lib
 
-    dm_a = jnp.asarray(dm_a)
-    dm_b = jnp.asarray(dm_b)
-    vj = jnp.zeros_like(dm_a)
-    vk_a = jnp.zeros_like(dm_a)
-    vk_b = jnp.zeros_like(dm_b)
+    dma = jnp.asarray(dm_a)
+    dmb = jnp.asarray(dm_b)
+    vj = jnp.zeros_like(dma)
+    vk_a = jnp.zeros_like(dma)
+    vk_b = jnp.zeros_like(dmb)
     for cderi in with_df.loop():
         cderi = jnp.asarray(lib.unpack_tril(cderi, axis=-1))
-        dvj, dvk_a, dvk_b = _ujk_from_cderi(cderi, dm_a, dm_b)
+        dvj, dvk_a, dvk_b = _ujk_from_cderi(cderi, dma, dmb)
         vj += dvj
         vk_a += dvk_a
         vk_b += dvk_b
@@ -498,10 +498,9 @@ def freeze_core_from_mo_cholesky_uh(
         dm_b = core_b @ core_b.conj().T
         veff_a, veff_b = _core_uveff(mf, dm_a, dm_b)
 
-        e_core = (
-            np.einsum("ij,ji->", dm_a, hcore + 0.5 * veff_a)
-            + np.einsum("ij,ji->", dm_b, hcore + 0.5 * veff_b)
-        ) 
+        e_core = np.einsum("ij,ji->", dm_a, hcore + 0.5 * veff_a) + np.einsum(
+            "ij,ji->", dm_b, hcore + 0.5 * veff_b
+        )
         ecore += float(np.real(e_core))
 
     h1_eff_a = act_a.conj().T @ (hcore + veff_a) @ act_a

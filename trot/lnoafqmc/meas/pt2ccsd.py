@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -135,7 +135,9 @@ def e0t1orb_from_chol(chol: jax.Array, t1: jax.Array, prjlo: jax.Array) -> jax.A
 
 
 def build_meas_ctx(
-    ham_data: HamChol, trial_data: Pt2ccsdTrial, cfg: Pt2ccsdMeasCfg = Pt2ccsdMeasCfg(measure_type="bar")
+    ham_data: HamChol,
+    trial_data: Pt2ccsdTrial,
+    cfg: Pt2ccsdMeasCfg = Pt2ccsdMeasCfg(measure_type="bar"),
 ) -> Pt2ccsdMeasCtx:
     if ham_data.basis != "restricted":
         raise ValueError("the fragment pt2CCSD MeasOps assume HamChol.basis == 'restricted'.")
@@ -144,7 +146,9 @@ def build_meas_ctx(
             f"unknown measure_type {cfg.measure_type!r}; the LNO estimator has only {_MEASURE_TYPES}"
         )
     if cfg.memory_mode not in _MEMORY_MODES:
-        raise ValueError(f"unknown memory_mode {cfg.memory_mode!r}; expected one of {_MEMORY_MODES}")
+        raise ValueError(
+            f"unknown memory_mode {cfg.memory_mode!r}; expected one of {_MEMORY_MODES}"
+        )
 
     nchol = ham_data.nchol
     nchol = int(nchol) if nchol is not None else int(ham_data.chol.shape[0])
@@ -154,7 +158,8 @@ def build_meas_ctx(
     cap = min(requested, nchol) if nchol > 0 else requested
     _, nchol_chunk, _ = equal_chunks(nchol, cap)
 
-    bar = build_bar_intermediates(ham_data, trial_data)
+    # trot's builder reads mo_t / nocc / norb only, which the fragment trial has as well
+    bar = build_bar_intermediates(ham_data, cast(Any, trial_data))
     nocc = trial_data.nocc
     fock_bar = fock_from_chol(nocc, bar["h1_bar"], bar["chol_bar"])
     e0t1orb = e0t1orb_from_chol(ham_data.chol, trial_data.t1, trial_data.prjlo)
@@ -171,7 +176,12 @@ def build_meas_ctx(
 
 
 def _e0bar_frag(
-    green: jax.Array, prjlo: jax.Array, fock_bar: jax.Array, chol_bar: jax.Array, e0t1orb: jax.Array, nchol_chunk: int
+    green: jax.Array,
+    prjlo: jax.Array,
+    fock_bar: jax.Array,
+    chol_bar: jax.Array,
+    e0t1orb: jax.Array,
+    nchol_chunk: int,
 ) -> jax.Array:
     """
     The projected correlation part of <HF| H_bar |walker_bar> / <HF|walker_bar>:
@@ -199,7 +209,12 @@ def _e0bar_frag(
 
 
 def _e0bar_frag_scored(
-    green: jax.Array, prjlo: jax.Array, fock_bar: jax.Array, chol_bar: jax.Array, e0t1orb: jax.Array, nchol_chunk: int
+    green: jax.Array,
+    prjlo: jax.Array,
+    fock_bar: jax.Array,
+    chol_bar: jax.Array,
+    e0t1orb: jax.Array,
+    nchol_chunk: int,
 ) -> tuple[jax.Array, jax.Array]:
     """
     _e0bar_frag, also returning the two-body term per cholesky vector, (nchol,): the
@@ -249,8 +264,16 @@ def energy_kernel_rw_rh_bar(
 
     h1 = meas_ctx.h1_bar
     chol = meas_ctx.chol_bar
-    if h1 is None or chol is None or meas_ctx.exp_t1 is None or meas_ctx.fock_bar is None:
-        raise ValueError("the fragment energy kernel needs the bar intermediates; build the ctx first.")
+    if (
+        h1 is None
+        or chol is None
+        or meas_ctx.exp_t1 is None
+        or meas_ctx.fock_bar is None
+        or meas_ctx.e0t1orb is None
+    ):
+        raise ValueError(
+            "the fragment energy kernel needs the bar intermediates; build the ctx first."
+        )
 
     walker_bar = meas_ctx.exp_t1 @ walker  # (norb, nocc)
 
@@ -263,7 +286,9 @@ def energy_kernel_rw_rh_bar(
     rot_chol = chol[:, :nocc, :]  # (nchol, nocc, norb)
 
     # the projected correlation energy at the walker
-    e0frg = _e0bar_frag(green, prjlo, meas_ctx.fock_bar, chol, meas_ctx.e0t1orb, meas_ctx.nchol_chunk)
+    e0frg = _e0bar_frag(
+        green, prjlo, meas_ctx.fock_bar, chol, meas_ctx.e0t1orb, meas_ctx.nchol_chunk
+    )
 
     # one body energy; only the occupied rows of h1 meet a nonzero row of the green
     hg = jnp.einsum("pi,pi->", h1[:nocc, :], green, optimize="optimal")
@@ -307,10 +332,12 @@ def energy_kernel_rw_rh_bar(
         carry[0] += e2_0_c + e2_0_e
 
         # e2_2_2_1
-        lt2g = jnp.einsum("gpr,pr->g", chol_c.astype(rtype), t2_green.astype(ctype), optimize="optimal")
-        carry[1] += -jnp.einsum("g,g->", lt2g.astype(ctype), tr_gl.astype(ctype), optimize="optimal").astype(
-            jnp.complex128
+        lt2g = jnp.einsum(
+            "gpr,pr->g", chol_c.astype(rtype), t2_green.astype(ctype), optimize="optimal"
         )
+        carry[1] += -jnp.einsum(
+            "g,g->", lt2g.astype(ctype), tr_gl.astype(ctype), optimize="optimal"
+        ).astype(jnp.complex128)
 
         # e2_2_2_2
         lt2_green = jnp.einsum(
@@ -324,14 +351,20 @@ def energy_kernel_rw_rh_bar(
         glgp = jnp.einsum("gir,rb->gib", gl.astype(ctype), greenp.astype(ctype), optimize="optimal")
         lt2_c = jnp.einsum("gia,iajb->gjb", glgp, t2_r, optimize="optimal")
         lt2_e = jnp.einsum("gib,iajb->gja", glgp, t2_r, optimize="optimal")
-        l2t2_c = jnp.einsum("gjb,gjb->", lt2_c.astype(ctype), glgp, optimize="optimal").astype(jnp.complex128)
-        l2t2_e = jnp.einsum("gja,gja->", lt2_e.astype(ctype), glgp, optimize="optimal").astype(jnp.complex128)
+        l2t2_c = jnp.einsum("gjb,gjb->", lt2_c.astype(ctype), glgp, optimize="optimal").astype(
+            jnp.complex128
+        )
+        l2t2_e = jnp.einsum("gja,gja->", lt2_e.astype(ctype), glgp, optimize="optimal").astype(
+            jnp.complex128
+        )
         carry[3] += (2 * l2t2_c - l2t2_e).astype(jnp.complex128)
 
         return carry, 0.0
 
     zero = jnp.zeros((), dtype=jnp.complex128)
-    [e2_0, e2_2_2_1, e2_2_2_2, e2_2_3], _ = lax.scan(scanned_fun, [zero, zero, zero, zero], (chol, rot_chol))
+    [e2_0, e2_2_2_1, e2_2_2_2, e2_2_3], _ = lax.scan(
+        scanned_fun, [zero, zero, zero, zero], (chol, rot_chol)
+    )
 
     e2_2_1 = e2_0 * gt2g
     e2_2_2 = 4 * (e2_2_2_1 + e2_2_2_2)
@@ -377,8 +410,16 @@ def energy_kernel_rw_rh_sto(
 
     h1 = meas_ctx.h1_bar
     chol = meas_ctx.chol_bar
-    if h1 is None or chol is None or meas_ctx.exp_t1 is None or meas_ctx.fock_bar is None:
-        raise ValueError("the fragment energy kernel needs the bar intermediates; build the ctx first.")
+    if (
+        h1 is None
+        or chol is None
+        or meas_ctx.exp_t1 is None
+        or meas_ctx.fock_bar is None
+        or meas_ctx.e0t1orb is None
+    ):
+        raise ValueError(
+            "the fragment energy kernel needs the bar intermediates; build the ctx first."
+        )
 
     nchol = chol.shape[0]
     nchol_chunk = meas_ctx.nchol_chunk
@@ -417,7 +458,9 @@ def energy_kernel_rw_rh_sto(
     rot_all = chol[:, :nocc, :]
     if npad1:
         rot_all = jnp.pad(rot_all, ((0, npad1), (0, 0), (0, 0)))
-    e2_0, _ = lax.scan(scan_e2_0, jnp.zeros((), dtype=c128), rot_all.reshape(n_chunk1, chunk1, nocc, norb))
+    e2_0, _ = lax.scan(
+        scan_e2_0, jnp.zeros((), dtype=c128), rot_all.reshape(n_chunk1, chunk1, nocc, norb)
+    )
 
     # ---- head / tail split ----
     n_head, n_samples = resolve_chol_budget(
@@ -464,7 +507,9 @@ def energy_kernel_rw_rh_sto(
         tr_gl = jnp.einsum("gii->g", gl[:, :, :nocc], optimize="optimal")
 
         # e2_2_2_1
-        lt2g = jnp.einsum("gpr,pr->g", chol_c.astype(rtype), t2_green.astype(ctype), optimize="optimal")
+        lt2g = jnp.einsum(
+            "gpr,pr->g", chol_c.astype(rtype), t2_green.astype(ctype), optimize="optimal"
+        )
         carry[0] += jnp.sum(w_c * (-lt2g.astype(ctype) * tr_gl.astype(ctype))).astype(c128)
 
         # e2_2_2_2
@@ -472,7 +517,11 @@ def energy_kernel_rw_rh_sto(
             "gir,qr->giq", rot_chol_c.astype(rtype), t2_green.astype(ctype), optimize="optimal"
         )
         carry[1] += jnp.sum(
-            w_c * 0.5 * jnp.einsum("giq,giq->g", gl.astype(ctype), lt2_green.astype(ctype), optimize="optimal")
+            w_c
+            * 0.5
+            * jnp.einsum(
+                "giq,giq->g", gl.astype(ctype), lt2_green.astype(ctype), optimize="optimal"
+            )
         ).astype(c128)
 
         # e2_2_3
@@ -641,7 +690,9 @@ def make_pt2ccsd_meas_ops(
     samples_tail = measure_type == "sto_chol" and not (
         isinstance(cfg.n_chol_head, str) and cfg.n_chol_head.lower() == "full"
     )
-    energy_kernel = {"bar": energy_kernel_rw_rh_bar, "sto_chol": energy_kernel_rw_rh_sto}[measure_type]
+    energy_kernel = {"bar": energy_kernel_rw_rh_bar, "sto_chol": energy_kernel_rw_rh_sto}[
+        measure_type
+    ]
 
     meas_ops = MeasOps(
         overlap=overlap_r,

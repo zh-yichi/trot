@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 from jax import tree_util
 
 from ...core.system import System_uh
-from ...trial.upt2ccsd import overlap_u
+from ...trial.upt2ccsd import overlap_u as _overlap_u
 
 __all__ = ["Upt2ccsdTrial", "overlap_u", "make_upt2ccsd_trial_data"]
+
+
+def overlap_u(walker: Any, trial_data: Any) -> jax.Array:
+    """<exp(T1)HF|walker>: trot's overlap, which reads only mo_t_a / mo_t_b."""
+    return _overlap_u(walker, trial_data)
 
 
 @tree_util.register_pytree_node_class
@@ -92,7 +98,7 @@ class Upt2ccsdTrial:
         )
 
 
-def make_upt2ccsd_trial_data(data: dict, sys: System_uh) -> Upt2ccsdTrial:
+def make_upt2ccsd_trial_data(data: dict, sys: System_uh | Any) -> Upt2ccsdTrial:
     return Upt2ccsdTrial(
         mo_t_a=jnp.asarray(data["mo_t_a"])[:, : sys.nup],
         mo_t_b=jnp.asarray(data["mo_t_b"])[:, : sys.ndn],

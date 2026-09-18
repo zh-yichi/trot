@@ -28,6 +28,8 @@ import io
 import contextlib
 
 import jax.numpy as jnp
+from typing import Any
+
 import numpy as np
 import pytest
 from pyscf import cc, gto, scf
@@ -55,7 +57,7 @@ CHOL_CUT = 1e-6
 @pytest.fixture(scope="module")
 def o2():
     mol = gto.M(atom="O 0 0 0; O 0 0 1.208", basis="sto-3g", spin=0, verbose=0)
-    mf = scf.RHF(mol).density_fit()
+    mf: Any = scf.RHF(mol).density_fit()
     mf.kernel()
     nfrozen = int(elements.chemcore(mol))
     lo_coeff, frag_list, frag_name = iao_fragment(mf, nfrozen, frag_type="atom")
@@ -65,16 +67,35 @@ def o2():
     nfrag = len(frag_list)
     frags = [
         pipeline.cpu_stage(
-            mlno, mf, lo_coeff, frag_list[i], mlno.lno_thresh, [None, None], [[None, None]] * nfrag,
-            ["1h", "1h"], eris, i, i, frag_name[i], True, True, nfrozen,
+            mlno,
+            mf,
+            lo_coeff,
+            frag_list[i],
+            mlno.lno_thresh,
+            [None, None],
+            [[None, None]] * nfrag,
+            ["1h", "1h"],
+            eris,
+            i,
+            i,
+            frag_name[i],
+            True,
+            True,
+            nfrozen,
         )
         for i in range(nfrag)
     ]
-    mycc = cc.CCSD(mf, frozen=nfrozen)
+    mycc: Any = cc.CCSD(mf, frozen=nfrozen)
     mycc.kernel()
     return dict(
-        mol=mol, mf=mf, nfrozen=nfrozen, lo_coeff=lo_coeff, frag_list=frag_list,
-        frag_name=frag_name, frags=frags, e_ccsd=float(mycc.e_corr),
+        mol=mol,
+        mf=mf,
+        nfrozen=nfrozen,
+        lo_coeff=lo_coeff,
+        frag_list=frag_list,
+        frag_name=frag_name,
+        frags=frags,
+        e_ccsd=float(mycc.e_corr),
     )
 
 
@@ -85,14 +106,22 @@ def frag0(o2):
     with contextlib.redirect_stdout(io.StringIO()):
         ham = li.build_ham_lno_df(mf, frag.lno_coeff, frag.lno_frozen, chol_cut=CHOL_CUT)
     sys_ = System(norb=ham.norb, nelec=ham.nelec, walker_kind="restricted")
-    ham_data = HamChol(jnp.asarray(ham.h0), jnp.asarray(ham.h1), jnp.asarray(ham.chol), basis="restricted")
+    ham_data = HamChol(
+        jnp.asarray(ham.h0), jnp.asarray(ham.h1), jnp.asarray(ham.chol), basis="restricted"
+    )
     tin = lst.stage_pt2ccsd_trial(frag)
     trial_data = make_pt2ccsd_trial_data(tin.data, sys_)
     ops = lm.make_pt2ccsd_meas_ops(sys_, measure_type="bar", nchol_chunk=3)
     ctx = ops.build_meas_ctx(ham_data, trial_data)
     t2_full = np.asarray(frag.t2).transpose(0, 2, 1, 3)  # unprojected, (i,a,j,b)
     return dict(
-        ham=ham, sys=sys_, ham_data=ham_data, tin=tin, trial_data=trial_data, ops=ops, ctx=ctx,
+        ham=ham,
+        sys=sys_,
+        ham_data=ham_data,
+        tin=tin,
+        trial_data=trial_data,
+        ops=ops,
+        ctx=ctx,
         t2_full=t2_full,
     )
 
@@ -100,7 +129,9 @@ def frag0(o2):
 def _random_walkers(norb, nocc, n, seed=7):
     rng = np.random.default_rng(seed)
     for _ in range(n):
-        yield jnp.asarray(np.linalg.qr(rng.normal(size=(norb, nocc)) + 0.3j * rng.normal(size=(norb, nocc)))[0])
+        yield jnp.asarray(
+            np.linalg.qr(rng.normal(size=(norb, nocc)) + 0.3j * rng.normal(size=(norb, nocc)))[0]
+        )
 
 
 # ----------------------------------------------------------------------------- CPU stage
@@ -114,7 +145,7 @@ def test_fragments_sum_to_canonical_mp2_ccsd(o2):
     e_cc = sum(f.efrag_cc for f in frags)
     from pyscf import mp
 
-    mmp = mp.MP2(o2["mf"], frozen=o2["nfrozen"])
+    mmp: Any = mp.MP2(o2["mf"], frozen=o2["nfrozen"])
     mmp.kernel()
     assert abs(e_mp - mmp.e_corr) < 1e-8
     assert abs(e_cc - o2["e_ccsd"]) < 1e-6
@@ -134,7 +165,11 @@ def test_fragment_hamiltonian_reproduces_hf_energy(frag0, o2):
     ham = frag0["ham"]
     nocc = ham.nelec[0]
     lo = ham.chol[:, :nocc, :nocc]
-    e_hf = ham.h0 + 2 * np.trace(ham.h1[:nocc, :nocc]) + 2 * np.sum(np.trace(lo, axis1=1, axis2=2) ** 2)
+    e_hf = (
+        ham.h0
+        + 2 * np.trace(ham.h1[:nocc, :nocc])
+        + 2 * np.sum(np.trace(lo, axis1=1, axis2=2) ** 2)
+    )
     e_hf -= np.einsum("gij,gji->", lo, lo)
     assert abs(e_hf - o2["mf"].e_tot) < 1e-6
     assert ham.norb == 8 and ham.nelec == (6, 6)
@@ -198,7 +233,9 @@ def test_kernel_partition_of_unity(frag0, o2):
         tds.append(td)
         ctxs.append(ops.build_meas_ctx(ham_data, td))
     for w in _random_walkers(norb, nocc, 4, seed=11):
-        parts = [np.asarray(lm.energy_kernel_rw_rh_bar(w, ham_data, c, t)) for c, t in zip(ctxs, tds)]
+        parts = [
+            np.asarray(lm.energy_kernel_rw_rh_bar(w, ham_data, c, t)) for c, t in zip(ctxs, tds)
+        ]
         full = parts[-1]
         s = parts[0] + parts[1]
         assert np.abs(s[:3] - full[:3]).max() < 1e-9  # t2frg, e0frg, e1frg are additive
@@ -223,8 +260,12 @@ def test_sto_chol_kernel_full_head_exact_parts_and_unbiased(frag0):
     import jax
 
     sys_, ham_data, td, ctx = frag0["sys"], frag0["ham_data"], frag0["trial_data"], frag0["ctx"]
-    full = lm.make_pt2ccsd_meas_ops(sys_, measure_type="sto_chol", nchol_chunk=3, n_chol_head="full")
-    sto = lm.make_pt2ccsd_meas_ops(sys_, measure_type="sto_chol", nchol_chunk=3, n_chol_head=8, n_chol_samples=8)
+    full = lm.make_pt2ccsd_meas_ops(
+        sys_, measure_type="sto_chol", nchol_chunk=3, n_chol_head="full"
+    )
+    sto = lm.make_pt2ccsd_meas_ops(
+        sys_, measure_type="sto_chol", nchol_chunk=3, n_chol_head=8, n_chol_samples=8
+    )
     assert not full.needs_rng("energy") and sto.needs_rng("energy")
     cf, cs = full.build_meas_ctx(ham_data, td), sto.build_meas_ctx(ham_data, td)
     w = next(_random_walkers(sys_.norb, sys_.nup, 1, seed=5))
@@ -236,10 +277,10 @@ def test_sto_chol_kernel_full_head_exact_parts_and_unbiased(frag0):
     keys = jax.random.split(jax.random.PRNGKey(1), 2000)
     outs = np.asarray(jax.vmap(lambda k: lm.energy_kernel_rw_rh_sto(w, ham_data, cs, td, k))(keys))
     assert np.abs(outs[:, [0, 1, 3]] - ref[[0, 1, 3]]).max() < 1e-10
-    e1 = outs[:, 2]
-    assert e1.real.std() > 0  # it does sample
-    assert abs(e1.real.mean() - ref[2].real) < 5 * e1.real.std() / np.sqrt(len(keys))
-    assert abs(e1.imag.mean() - ref[2].imag) < 5 * e1.imag.std() / np.sqrt(len(keys))
+    e1_re, e1_im = np.real(outs[:, 2]), np.imag(outs[:, 2])
+    assert e1_re.std() > 0  # it does sample
+    assert abs(e1_re.mean() - np.real(ref[2])) < 5 * e1_re.std() / np.sqrt(len(keys))
+    assert abs(e1_im.mean() - np.imag(ref[2])) < 5 * e1_im.std() / np.sqrt(len(keys))
 
 
 # ----------------------------------------------------------------------------- statistics
@@ -343,14 +384,27 @@ def test_lno_afqmc_o2_end_to_end(o2, tmp_path, request):
     from trot.afqmc import AfqmcMixed
 
     mf, nfrozen = o2["mf"], o2["nfrozen"]
-    qmc = dict(n_walkers=100, n_eql_blocks=10, n_blocks=60, dt=0.005, n_prop_steps=50)
+    qmc: dict[str, Any] = dict(
+        n_walkers=100, n_eql_blocks=10, n_blocks=60, dt=0.005, n_prop_steps=50
+    )
     out = tmp_path
     with contextlib.redirect_stdout(io.StringIO()):
         lno = LnoAfqmcMixed(
-            mf, o2["lo_coeff"], o2["frag_list"], frag_name=o2["frag_name"], lno_thresh=1e-12,
-            nfrozen=nfrozen, trial="pt2ccsd", seed=17, chol_cut=CHOL_CUT,
-            frag_output=str(out / "fragment.out"), lno_output=str(out / "lno_result.out"),
-            save_frag_data=str(out / "frag_data"), keep_qmc_results=True, debug_memory=True, **qmc,
+            mf,
+            o2["lo_coeff"],
+            o2["frag_list"],
+            frag_name=o2["frag_name"],
+            lno_thresh=1e-12,
+            nfrozen=nfrozen,
+            trial="pt2ccsd",
+            seed=17,
+            chol_cut=CHOL_CUT,
+            frag_output=str(out / "fragment.out"),
+            lno_output=str(out / "lno_result.out"),
+            save_frag_data=str(out / "frag_data"),
+            keep_qmc_results=True,
+            debug_memory=True,
+            **qmc,
         )
         e_qmc, e_qmc_err = lno.kernel()
     init_sum = sum(r.frag_init_energy for r in lno.frag_qmc_results)
@@ -362,12 +416,16 @@ def test_lno_afqmc_o2_end_to_end(o2, tmp_path, request):
     mycc = cc.CCSD(mf, frozen=nfrozen)
     mycc.kernel()
     with contextlib.redirect_stdout(io.StringIO()):
-        af = AfqmcMixed(mycc, trial="pt2ccsd_bar", norb_frozen_core=nfrozen, seed=17, chol_cut=CHOL_CUT, **qmc)
+        af = AfqmcMixed(
+            mycc, trial="pt2ccsd_bar", norb_frozen_core=nfrozen, seed=17, chol_cut=CHOL_CUT, **qmc
+        )
         e_ref, err_ref = af.kernel()
     e_ref_corr = e_ref - mf.e_tot
     assert abs(e_qmc - e_ref_corr) < 3 * np.hypot(e_qmc_err, err_ref)
 
     with contextlib.redirect_stdout(io.StringIO()):
-        fr = LnoFragMixed.from_frag_data(out / "frag_data" / "frag1.h5", seed=int(lno._seeds[0]), **qmc)
+        fr = LnoFragMixed.from_frag_data(
+            out / "frag_data" / "frag1.h5", seed=int(lno._seeds[0]), **qmc
+        )
         e1, err1 = fr.kernel()
     assert abs(e1 - lno.lno_eqmc[0]) < 1e-10 and abs(err1 - lno.lno_eqmc_err[0]) < 1e-10

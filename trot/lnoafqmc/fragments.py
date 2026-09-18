@@ -6,6 +6,8 @@ from collections import defaultdict
 from functools import partial
 
 import h5py
+from typing import Any
+
 import numpy as np
 from pyscf import gto, lo, scf
 from pyscf.data import elements
@@ -126,7 +128,7 @@ def free_atom_minao(mol, occ_tol=1e-6, sv_tol=1e-8, x2c=None):
         for ib in range(a1.nbas):
             shells_by_l[a1.bas_angular(ib)].append((float(a1.bas_exp(ib)[0]), ao_loc[ib]))
 
-        amf = atom_hf.AtomHF1e(a1) if a1.nelectron == 1 else atom_hf.AtomSphAverageRHF(a1)
+        amf: Any = atom_hf.AtomHF1e(a1) if a1.nelectron == 1 else atom_hf.AtomSphAverageRHF(a1)
         if x2c:
             amf = amf.sfx2c1e()
         amf.run()
@@ -172,7 +174,7 @@ def _assert_orthonormal(lo_coeff, s1e):
     assert dev < 1e-8, f"IAOs not orthonormal: max dev {dev:.2e}"
 
 
-def riao_fragment(mf, nfrozen, frag_type="atom", more_loc=None, minao="minao"):
+def riao_fragment(mf, nfrozen, frag_type="atom", more_loc=None, minao: Any = "minao"):
     mol = mf.mol
     s1e = mf.get_ovlp()
     moliao = lo.iao.reference_mol(mol, minao)
@@ -199,7 +201,7 @@ def riao_fragment(mf, nfrozen, frag_type="atom", more_loc=None, minao="minao"):
     return lo_coeff, frag_list, frag_name
 
 
-def uiao_fragment(mf, nfrozen, frag_type="atom", more_loc=None, minao="minao"):
+def uiao_fragment(mf, nfrozen, frag_type="atom", more_loc=None, minao: Any = "minao"):
     mol = mf.mol
     s1e = mf.get_ovlp()
     moliao = lo.iao.reference_mol(mol, minao)
@@ -235,7 +237,7 @@ def iao_fragment(
     nfrozen=None,
     frag_type="h2heavy",
     more_loc=None,
-    minao="minao",
+    minao: Any = "minao",
     x2c=None,
     save2=None,
     read_from=None,
@@ -396,7 +398,9 @@ def load_iao_fragment(filename, mol=None, s1e=None, coord_tol=1e-6, ortho_tol=1e
     mol : if given, the stored molecular fingerprint must match it.
     s1e : if given, the loaded IAOs must be orthonormal w.r.t. it.
     """
-    with h5py.File(filename, "r") as fh5:
+    lo_coeff: Any
+    with h5py.File(filename, "r") as h5file:
+        fh5: Any = h5file  # h5py's item types are unions pyright cannot narrow
         version = int(fh5.attrs.get("version", -1))
         if version != IAO_FILE_VERSION:
             raise ValueError(

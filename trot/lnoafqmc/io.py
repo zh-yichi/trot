@@ -95,19 +95,21 @@ def write_lno_result(
     run_frag: Sequence[int],
     frag_name: Sequence[str],
     lno_size: Sequence[Any],
-    lno_emp: Sequence[float],
-    lno_ecc: Sequence[float],
-    lno_eqmc: Sequence[float],
-    lno_eqmc_err: Sequence[float],
-    lno_cc_time: Sequence[float],
-    lno_wait_time: Sequence[float],
-    lno_qmc_time: Sequence[float],
+    lno_emp: Any,
+    lno_ecc: Any,
+    lno_eqmc: Any,
+    lno_eqmc_err: Any,
+    lno_cc_time: Any,
+    lno_wait_time: Any,
+    lno_qmc_time: Any,
     lno_thresh: Sequence[Any],
     depth: int,
     loop_time: float,
 ) -> None:
     n = len(run_frag)
-    sizes = [f"{np.array(s)}" if not isinstance(s, (int, np.integer)) else f"{int(s)}" for s in lno_size]
+    sizes = [
+        f"{np.array(s)}" if not isinstance(s, (int, np.integer)) else f"{int(s)}" for s in lno_size
+    ]
     lno_max = max((int(np.max(s)) for s in lno_size), default=0)
     e_mp = float(np.sum(lno_emp))
     e_cc = float(np.sum(lno_ecc))
@@ -156,5 +158,7 @@ def write_lno_result(
             f'{"CPU time hidden behind GPU":<28} {hidden:>10.2f} s '
             f"({100.0 * hidden / tot_cc if tot_cc > 0 else 0.0:.1f}%)\n"
         )
-        f.write(f'{"Speedup vs serial":<28} {serial / loop_time if loop_time > 0 else 0.0:>10.2f} x\n')
+        f.write(
+            f'{"Speedup vs serial":<28} {serial / loop_time if loop_time > 0 else 0.0:>10.2f} x\n'
+        )
         f.write("=" * width + "\n\n")

@@ -84,6 +84,8 @@ def cpu_stage(
     _log(f"LNO-LAS: {frag_msg}")
 
     frozen_idx, maskact = solvers.get_maskact(mf, frozen_idx, mlno.mo_occ)
+    nactocc: Any
+    nactvir: Any
     lno_split, nfrzocc, nactocc, nactvir, nfrzvir = las.split_lno(mlno, lno_coeff, frozen_idx)
     can_split = las.split_lno(mlno, can_coeff, frozen_idx)[0]
     t_las = time.perf_counter() - t_start
@@ -159,7 +161,9 @@ class CpuPipeline:
         self.depth = int(depth)
         self.futures: dict[int, Any] = {}
         self.executor = (
-            ThreadPoolExecutor(max_workers=1, thread_name_prefix="lno-cpu") if self.depth > 0 else None
+            ThreadPoolExecutor(max_workers=1, thread_name_prefix="lno-cpu")
+            if self.depth > 0
+            else None
         )
 
     def schedule(self, i: int) -> None:

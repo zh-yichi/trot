@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -65,7 +66,7 @@ def overlap_u(walker: tuple[jax.Array, jax.Array], trial_data: Upt2ccsdTrial) ->
     )
 
 
-def make_upt2ccsd_trial_data(data: dict, sys: System_uh) -> Upt2ccsdTrial:
+def make_upt2ccsd_trial_data(data: dict, sys: System_uh | Any) -> Upt2ccsdTrial:
     return Upt2ccsdTrial(
         mo_t_a=jnp.asarray(data["mo_t_a"])[:, : sys.nup],
         mo_t_b=jnp.asarray(data["mo_t_b"])[:, : sys.ndn],
