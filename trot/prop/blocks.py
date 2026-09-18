@@ -56,6 +56,7 @@ class MixedBlockFn(Protocol):
         observable_names: tuple[str, ...] = (),
         sr_fn: Callable = wk.stochastic_reconfiguration,
         measure_trial: bool = True,
+        components: tuple[str, ...] = ("t2", "e0", "e1"),
     ) -> tuple[PropState, BlockObs]: ...
 
 
@@ -306,18 +307,23 @@ def block_mixed(
     observable_names: tuple[str, ...] = (),
     sr_fn: Callable = wk.stochastic_reconfiguration,
     measure_trial: bool = True,
+    components: tuple[str, ...] = ("t2", "e0", "e1"),
 ) -> tuple[PropState, BlockObs]:
     """
     Block function for mixed sampling -- Trial =! Guide
     propagation(Guide) + measurement(Trial)
-    currently only support pt2CCSD trial
+
+    The trial's energy kernel returns ``len(components)`` numbers per walker (a scalar
+    counts as one), named by ``components``. Each is averaged over the walkers with the
+    absorbed weight wp_i = w_i <T|phi_i> / <G|phi_i> and returned as the scalar
+    ``"trial_<name>"``, next to ``"trial_weight"`` = sum(wp). How the averaged components
+    combine into an energy is the trial recipe's business (its energy_fn), not this
+    function's. The default names are the pt2CCSD ones.
 
     measure_trial=False skips the trial estimator entirely and returns guide scalars
     only. During equilibration the walkers are governed purely by the guide, so the
     trial energy is not used for anything and evaluating it is wasted work. The returned
     BlockObs then has no trial_* keys, so callers must branch on the same flag.
-    TODO generalize the output of trial kernel to multiple variable
-         without saving each term according to their names
     """
 
     # propagation is guided with the guiding wavefunction
@@ -401,24 +407,31 @@ def block_mixed(
         rng_key, sub = jax.random.split(state.rng_key)
         state = state._replace(rng_key=rng_key)
         walker_keys = jax.random.split(sub, wk.n_walkers(state.walkers))
-        pt2results = wk.vmap_chunked(
+        results = wk.vmap_chunked(
             trial_e_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None, 0)
         )(state.walkers, ham_data, trial_meas_ctx, trial_data, walker_keys)
     else:
-        pt2results = wk.vmap_chunked(
+        results = wk.vmap_chunked(
             trial_e_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
         )(state.walkers, ham_data, trial_meas_ctx, trial_data)
-    trial_t2s, trial_e0s, trial_e1s = pt2results[:, 0], pt2results[:, 1], pt2results[:, 2]
+    # (n_walkers, n_components); a scalar kernel is the one-component case
+    results = jnp.reshape(results, (wk.n_walkers(state.walkers), -1))
+    if results.shape[1] != len(components):
+        raise ValueError(
+            f"the trial energy kernel returns {results.shape[1]} numbers per walker but the "
+            f"recipe names {len(components)} components {components}"
+        )
     trial_overlaps = wk.vmap_chunked(
         trial_meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None)
     )(walkers_new, trial_data)
     trial_weights = (
         guide_weights * trial_overlaps / guide_overlaps
-    )  # w_trial = w_guide * <G|walker>/<T|walker>
+    )  # wp = w_guide * <T|walker> / <G|walker>
     trial_w_block = jnp.sum(trial_weights)
-    trial_t2_block = jnp.sum(trial_weights * trial_t2s) / trial_w_block
-    trial_e0_block = jnp.sum(trial_weights * trial_e0s) / trial_w_block
-    trial_e1_block = jnp.sum(trial_weights * trial_e1s) / trial_w_block
+    trial_comp_blocks = {
+        f"trial_{name}": jnp.sum(trial_weights * results[:, i]) / trial_w_block
+        for i, name in enumerate(components)
+    }
 
     # performing SR at the end of Block propagation and measurement (Guide)
     key, subkey = jax.random.split(state.rng_key)
@@ -439,9 +452,7 @@ def block_mixed(
             "guide_weight": guide_w_block,
             "guide_energy": guide_e_block,
             "trial_weight": trial_w_block,
-            "trial_t2": trial_t2_block,
-            "trial_e0": trial_e0_block,
-            "trial_e1": trial_e1_block,
+            **trial_comp_blocks,
         },
         observables=obs_samples,
     )

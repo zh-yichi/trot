@@ -27,6 +27,15 @@ import jax.numpy as jnp
 FRAG_COMPONENTS = ("t2frg", "e0frg", "e1frg", "e0")
 
 
+def frag_pt2ccsd_energy_fn(h0, t2frg, e0frg, e1frg, e0):
+    """
+    The fragment energy from its four averaged components, E_F = <e0frg> + <e1frg>
+    - <t2frg><e0>. h0 is taken for the signature shared with trot's energy_fn's and
+    ignored: the fragment estimator is a correlation energy.
+    """
+    return e0frg + e1frg - t2frg * e0
+
+
 def clean_frag_pt2ccsd(ept_sp, weights, t2frg_sp, e0frg_sp, e1frg_sp, e0_sp, zeta=20):
     """
     Drop outlier blocks of the fragment estimator, by the rule of clean_pt2ccsd: a block
@@ -56,7 +65,7 @@ def _frag_pt2ccsd_energy(weights, t2frg_sp, e0frg_sp, e1frg_sp, e0_sp):
     e0frg_avg = jnp.mean(weights * e0frg_sp) / wt_avg
     e1frg_avg = jnp.mean(weights * e1frg_sp) / wt_avg
     e0_avg = jnp.mean(weights * e0_sp) / wt_avg
-    return e0frg_avg + e1frg_avg - t2frg_avg * e0_avg
+    return frag_pt2ccsd_energy_fn(None, t2frg_avg, e0frg_avg, e1frg_avg, e0_avg)
 
 
 def _frag_pt2ccsd_delta_method_error(weights, t2frg_sp, e0frg_sp, e1frg_sp, e0_sp):

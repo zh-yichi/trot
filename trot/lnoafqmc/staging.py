@@ -161,6 +161,67 @@ def stage_pt2ccsd_trial(frag: LnoFragData) -> TrialInput:
     )
 
 
+def stage_cisd_guide(frag: LnoFragData) -> TrialInput:
+    """
+    The fragment CISD as a guide: trot's _stage_cisd_input on the fragment CCSD
+    amplitudes, unprojected. ci1 = t1, ci2 = t2 + t1 t1 in (i, a, j, b), with the
+    reference in the leading nactocc orbitals of the active LNO basis, which is where
+    build_ham_lno_df puts it. The frozen LNOs are already out of the hamiltonian, so
+    there is no trial core or outer block.
+    """
+    if frag.unrestricted:
+        raise ValueError("stage_cisd_guide needs restricted fragment data; use stage_ucisd_guide.")
+    if not frag.has_amplitudes:
+        raise ValueError("the CISD guide needs the fragment CCSD amplitudes (run_cc=True).")
+    t1 = np.asarray(frag.t1, dtype=np.float64)
+    t2 = np.asarray(frag.t2, dtype=np.float64)
+    ci2 = (t2 + np.einsum("ia,jb->ijab", t1, t1)).transpose(0, 2, 1, 3)
+    data = {
+        "ci1": t1,
+        "ci2": ci2,
+        "nocc_t_core": np.array(0, dtype=np.int64),
+        "nvir_t_outer": np.array(0, dtype=np.int64),
+    }
+    return TrialInput(
+        kind="cisd", data=data, frozen=_as_frozen_array(frag.lno_frozen), source_kind="cc"
+    )
+
+
+def stage_ucisd_guide(frag: LnoFragData) -> TrialInput:
+    """
+    The fragment UCISD as a guide, in the conventions of trot's _stage_ucisd_input: same
+    spin doubles antisymmetrized, everything (i, a, j, b), each spin in its own LNO
+    basis with the reference in its leading nactocc orbitals (build_ham_ulno_df's
+    layout). mo_coeff_s is that identity reference; the uchol kernels never rotate.
+    """
+    if not frag.unrestricted:
+        raise ValueError("stage_ucisd_guide needs unrestricted fragment data.")
+    if not frag.has_amplitudes:
+        raise ValueError("the UCISD guide needs the fragment CCSD amplitudes (run_cc=True).")
+    t1a, t1b = (np.asarray(t, dtype=np.float64) for t in frag.t1)
+    t2aa, t2ab, t2bb = (np.asarray(t, dtype=np.float64) for t in frag.t2)
+
+    ci2aa = t2aa + 2.0 * np.einsum("ia,jb->ijab", t1a, t1a)
+    ci2aa = 0.5 * (ci2aa - ci2aa.transpose(0, 1, 3, 2))
+    ci2bb = t2bb + 2.0 * np.einsum("ia,jb->ijab", t1b, t1b)
+    ci2bb = 0.5 * (ci2bb - ci2bb.transpose(0, 1, 3, 2))
+    ci2ab = t2ab + np.einsum("ia,jb->ijab", t1a, t1b)
+
+    nocc_a, nvir_a = t1a.shape
+    nocc_b, nvir_b = t1b.shape
+    data = {
+        "mo_coeff_a": np.eye(nocc_a + nvir_a)[:, :nocc_a],
+        "mo_coeff_b": np.eye(nocc_b + nvir_b)[:, :nocc_b],
+        "ci1a": t1a,
+        "ci1b": t1b,
+        "ci2aa": ci2aa.transpose(0, 2, 1, 3),
+        "ci2ab": ci2ab.transpose(0, 2, 1, 3),
+        "ci2bb": ci2bb.transpose(0, 2, 1, 3),
+    }
+    frozen = np.concatenate([_as_frozen_array(f) for f in frag.lno_frozen])
+    return TrialInput(kind="ucisd", data=data, frozen=frozen, source_kind="cc")
+
+
 def stage_upt2ccsd_trial(frag: LnoFragData) -> TrialInput:
     """
     The unrestricted fragment pt2CCSD trial, in the conventions of trot's

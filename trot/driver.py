@@ -11,7 +11,8 @@ from jax import lax
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from .core.ops import MeasOps, TrialOps
+from . import walkers as wk
+from .core.ops import MeasOps, TrialOps, k_energy
 from .core.system import System
 from .prop.blocks import BlockFn, MixedBlockFn
 from .prop.types import PropOps, PropState, QmcParamsBase, QmcParams, QmcParamsFp
@@ -22,9 +23,9 @@ from .stat_utils import (
     reject_outliers,
     pt2ccsd_blocking,
     clean_pt2ccsd,
+    pt2ccsd_energy_fn,
 )
 from .walkers import stochastic_reconfiguration
-from .meas.pt2ccsd import get_init_pt2trial_energy
 
 print = partial(print, flush=True)
 
@@ -40,7 +41,15 @@ class QmcResult(NamedTuple):
 
 
 class MixedQmcResult(NamedTuple):
-    # currently only support pt2CCSD
+    """
+    The result of a mixed guide/trial run.
+
+    The trial's block data is the absorbed block weight sum(wp) and the wp-averaged
+    components of its energy kernel, keyed by the recipe's component names; the recipe's
+    energy_fn combines them. For the pt2CCSD trials the components are "t2", "e0", "e1"
+    and are also reachable as trial_block_t2s / e0s / e1s.
+    """
+
     guide_mean_energy: jax.Array
     guide_stderr_energy: jax.Array
     guide_block_energies: jax.Array
@@ -48,9 +57,19 @@ class MixedQmcResult(NamedTuple):
     trial_mean_energy: jax.Array
     trial_stderr_energy: jax.Array
     trial_block_weights: jax.Array
-    trial_block_t2s: jax.Array
-    trial_block_e0s: jax.Array
-    trial_block_e1s: jax.Array
+    trial_block_components: dict[str, jax.Array]
+
+    @property
+    def trial_block_t2s(self) -> jax.Array | None:
+        return self.trial_block_components.get("t2")
+
+    @property
+    def trial_block_e0s(self) -> jax.Array | None:
+        return self.trial_block_components.get("e0")
+
+    @property
+    def trial_block_e1s(self) -> jax.Array | None:
+        return self.trial_block_components.get("e1")
 
 
 def _weighted_block_mean(values: jax.Array, weights: jax.Array) -> jax.Array:
@@ -408,6 +427,47 @@ def run_qmc(
     )
 
 
+def _init_trial_energy(
+    state: PropState,
+    ham_data: Any,
+    trial_data: Any,
+    trial_meas_ops: MeasOps,
+    trial_meas_ctx: Any,
+    params: QmcParams,
+    components: tuple[str, ...],
+    energy_fn: Callable[..., Any],
+) -> tuple[jax.Array, jax.Array]:
+    """
+    The tau = 0 row: the trial energy of the initial population, sum_i wp_i c_i / sum_i wp_i
+    per component and energy_fn on top, and the absorbed weight sum_i wp_i with
+    wp_i = w_i <T|phi_i> / <G|phi_i>.
+    """
+    kernel = trial_meas_ops.require_kernel(k_energy)
+    n = wk.n_walkers(state.walkers)
+    if trial_meas_ops.needs_rng(k_energy):
+        keys = jax.random.split(state.rng_key, n)
+        out = wk.vmap_chunked(kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None, 0))(
+            state.walkers, ham_data, trial_meas_ctx, trial_data, keys
+        )
+    else:
+        out = wk.vmap_chunked(kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None))(
+            state.walkers, ham_data, trial_meas_ctx, trial_data
+        )
+    out = jnp.reshape(out, (n, -1))
+    if out.shape[1] != len(components):
+        raise ValueError(
+            f"the trial energy kernel returns {out.shape[1]} numbers per walker but the "
+            f"recipe names {len(components)} components {components}"
+        )
+    trial_overlaps = wk.vmap_chunked(
+        trial_meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None)
+    )(state.walkers, trial_data)
+    wp = state.weights * trial_overlaps / state.overlaps
+    w_sum = jnp.sum(wp)
+    avgs = [jnp.sum(wp * out[:, i]) / w_sum for i in range(len(components))]
+    return jnp.asarray(energy_fn(ham_data.h0, *avgs)) + 0j, w_sum
+
+
 def run_mixed_qmc(
     *,
     sys: System,
@@ -421,6 +481,11 @@ def run_mixed_qmc(
     trial_meas_ops: MeasOps,
     mix_block_fn: MixedBlockFn,
     blocking_fn: Callable[..., Any] = pt2ccsd_blocking,
+    components: tuple[str, ...] = ("t2", "e0", "e1"),
+    energy_fn: Callable[..., Any] = pt2ccsd_energy_fn,
+    clean_fn: Callable[..., Any] = clean_pt2ccsd,
+    outlier_zeta: float = 20.0,
+    trial_name: str = "trial",
     state: PropState | None = None,
     guide_meas_ctx: Any | None = None,
     trial_meas_ctx: Any | None = None,
@@ -436,9 +501,14 @@ def run_mixed_qmc(
     Though we also measure the energy against the Guide to update the
     e_estimate and use as a reference to remove extreme outliers.
 
-    AFQMC energy against the Trial is only measured during the sampling
-    NOTE Currently only support pt2CCSD trial without observables
-    TODO make it more general to other type of mixing guide-trial
+    The trial is described by what its energy kernel returns per walker (components,
+    in order), how the wp-averaged components combine into an energy (energy_fn), the
+    blocking analysis (blocking_fn) and the block outlier filter (clean_fn). These four
+    come together from the recipe. The defaults are the pt2CCSD ones.
+
+    AFQMC energy against the Trial is measured at tau = 0 and during sampling; not
+    during equilibration. target_error stops the sampling once the trial energy's
+    (delta method) error is below it.
 
     Returns:
       MixedQmcResult with energy statistics plus block-level observable estimates.
@@ -467,21 +537,24 @@ def run_mixed_qmc(
         )
 
     assert trial_meas_ctx is not None
-    trial_energy0, trial_weights0 = get_init_pt2trial_energy(
-        init_state=state,
-        ham_data=ham_data,
-        trial_data=trial_data,
-        trial_meas_ops=trial_meas_ops,
-        trial_meas_ctx=trial_meas_ctx,
-        params=params,
+    trial_energy0, trial_weights0 = _init_trial_energy(
+        state,
+        ham_data,
+        trial_data,
+        trial_meas_ops,
+        trial_meas_ctx,
+        params,
+        components,
+        energy_fn,
     )
 
-    if mesh is None or mesh.size == 1:
-        mix_block_fn_sr = mix_block_fn
-    else:
+    # the block function is told what the trial kernel returns; the sr_fn binding for a
+    # sharded population is the same mechanism
+    mix_block_fn_sr = partial(mix_block_fn, components=components)
+    if mesh is not None and mesh.size > 1:
         data_sh = NamedSharding(mesh, P("data"))
         sr_sharded = partial(stochastic_reconfiguration, data_sharding=data_sh)
-        mix_block_fn_sr = partial(mix_block_fn, sr_fn=sr_sharded)
+        mix_block_fn_sr = partial(mix_block_fn_sr, sr_fn=sr_sharded)
 
     run_blocks = make_run_mixed_blocks(
         mixed_block_fn=mix_block_fn_sr,
@@ -501,15 +574,8 @@ def run_mixed_qmc(
     print_every = params.n_eql_blocks // 5 if params.n_eql_blocks >= 5 else 0
     guide_block_e_eq = []
     guide_block_w_eq = []
-    trial_block_w_eq = []
-    trial_block_t2_eq = []
-    trial_block_e0_eq = []
-    trial_block_e1_eq = []
-    # guide_block_obs_eq = {name: [] for name in observable_names}
     guide_block_e_eq.append(state.e_estimate)
     guide_block_w_eq.append(jnp.sum(state.weights))
-    # trial_block_e_eq.append(trial_energy0)
-    # trial_block_w_eq.append(jnp.sum(trial_weights0))
     print("\nEquilibration:")
     print("E_Trial is not measured till the sampling phase\n")
     if print_every:
@@ -571,16 +637,6 @@ def run_mixed_qmc(
     guide_block_w_eq = jnp.asarray(guide_block_w_eq)
     guide_block_e_eq = jnp.asarray(guide_block_e_eq)
 
-    trial_block_w_eq = jnp.asarray(trial_block_w_eq)
-    trial_block_t2_eq = jnp.asarray(trial_block_t2_eq)
-    trial_block_e0_eq = jnp.asarray(trial_block_e0_eq)
-    trial_block_e1_eq = jnp.asarray(trial_block_e1_eq)
-
-    # block_obs_eq = {
-    #     name: (jnp.concatenate(block_obs_eq[name], axis=0) if len(block_obs_eq[name]) > 0 else None)
-    #     for name in observable_names
-    # }
-
     # sampling
     print("\nSampling:\n")
     if target_error is None:
@@ -590,11 +646,8 @@ def run_mixed_qmc(
     guide_block_w_sp = []
     guide_block_e_sp = []
     trial_block_w_sp = []
-    trial_block_t2_sp = []
-    trial_block_e0_sp = []
-    trial_block_e1_sp = []
+    trial_comp_sp: dict[str, list] = {name: [] for name in components}
 
-    # block_obs_sp = {name: [] for name in observable_names}
     if print_every:
         print(
             f"{'':4s}{'block':>9s}  {'Guide_E_avg':>14s}  {'Guide_E_err':>10s}  {'Guide_W':>12s}  "
@@ -616,14 +669,9 @@ def run_mixed_qmc(
             measure_trial=True,
         )
         # guide
-        # guide_w_chunk = scalars_chunk["guide_weight"]
-        # guide_e_chunk = scalars_chunk["guide_energy"]
         guide_block_w_sp.extend(scalars_chunk["guide_weight"].tolist())
         guide_block_e_sp.extend(scalars_chunk["guide_energy"].tolist())
-        # for i, name in enumerate(observable_names):
-        #     block_obs_sp[name].append(obs_chunk[i])
         guide_w_avg = jnp.mean(jnp.asarray(guide_block_w_sp))
-        # guide_e_avg = jnp.mean(jnp.asarray(guide_block_w_sp) * jnp.asarray(guide_block_e_sp)) / guide_w_avg
         elapsed = time.perf_counter() - t0
         dt_per_block = (time.perf_counter() - t_mark) / float(n)
         t_mark = time.perf_counter()
@@ -635,22 +683,14 @@ def run_mixed_qmc(
         nodes = int(state.node_encounters)
         # trial
         trial_block_w_sp.extend(scalars_chunk["trial_weight"].tolist())
-        trial_block_t2_sp.extend(scalars_chunk["trial_t2"].tolist())
-        trial_block_e0_sp.extend(scalars_chunk["trial_e0"].tolist())
-        trial_block_e1_sp.extend(scalars_chunk["trial_e1"].tolist())
-        # trial_w_avg = jnp.mean(jnp.asarray(trial_block_w_sp))
-        # trial_t2_avg = jnp.mean(jnp.asarray(trial_block_w_sp) * jnp.asarray(trial_block_t2_sp)) / trial_w_avg
-        # trial_e0_avg = jnp.mean(jnp.asarray(trial_block_w_sp) * jnp.asarray(trial_block_e0_sp)) / trial_w_avg
-        # trial_e1_avg = jnp.mean(jnp.asarray(trial_block_w_sp) * jnp.asarray(trial_block_e1_sp)) / trial_w_avg
-        # trial_e_avg = ham_data.h0 + trial_e0_avg + trial_e1_avg - trial_t2_avg * trial_e0_avg
+        for name in components:
+            trial_comp_sp[name].extend(scalars_chunk[f"trial_{name}"].tolist())
         # progress reporting only: no blocking sweep, so this stays defined while the
         # run is still accumulating blocks. Returns None if there is nothing to report.
         trial_stats = blocking_fn(
             ham_data.h0,
             jnp.asarray(trial_block_w_sp),
-            jnp.asarray(trial_block_t2_sp),
-            jnp.asarray(trial_block_e0_sp),
-            jnp.asarray(trial_block_e1_sp),
+            *(jnp.asarray(trial_comp_sp[name]) for name in components),
             printQ=False,
             final=False,
         )
@@ -660,7 +700,6 @@ def run_mixed_qmc(
             f"[blk {start + n:4d}/{params.n_blocks}]  "
             f"{guide_mu:14.10f}  "
             f"{(f'{guide_se:10.3e}' if guide_se is not None else ' ' * 10)}  "
-            # f"{float(guide_e_avg):16.10f}  "
             f"{float(guide_w_avg):12.6e}  "
             f"{(f'{float(trial_e_avg.real):14.10f}' if trial_e_avg is not None else ' ' * 14)}  "
             f"{(f'{float(trial_error.real):10.3e}' if trial_error is not None else ' ' * 10)}  "
@@ -668,7 +707,12 @@ def run_mixed_qmc(
             f"{dt_per_block:9.3f}  "
             f"{elapsed:8.1f}"
         )
-        if guide_se is not None and guide_se <= target_error and target_error > 0.0:
+        # the energy this run reports is the trial's, so that is the error to stop on
+        if (
+            target_error > 0.0
+            and trial_error is not None
+            and float(jnp.real(trial_error)) <= target_error
+        ):
             print(f"\nTarget error {target_error:.3e} reached at block {start + n}.")
             break
 
@@ -689,61 +733,28 @@ def run_mixed_qmc(
     guide_block_w_sp = jnp.asarray(guide_data_clean[:, 1])
     guide_keep_mask = jnp.asarray(guide_keep_mask)
 
-    # Trial
+    # Trial: the trial is not measured during equilibration, so the returned block
+    # arrays are the sampling ones
     trial_block_w_sp = jnp.asarray(trial_block_w_sp)
-    trial_block_t2_sp = jnp.asarray(trial_block_t2_sp)
-    trial_block_e0_sp = jnp.asarray(trial_block_e0_sp)
-    trial_block_e1_sp = jnp.asarray(trial_block_e1_sp)
-    trial_block_w_all = jnp.concatenate([trial_block_w_eq, trial_block_w_sp])
-    trial_block_t2_all = jnp.concatenate([trial_block_t2_eq, trial_block_t2_sp])
-    trial_block_e0_all = jnp.concatenate([trial_block_e0_eq, trial_block_e0_sp])
-    trial_block_e1_all = jnp.concatenate([trial_block_e1_eq, trial_block_e1_sp])
-    # esmitate of pt2ccsd energy sample, biased
-    trial_block_e_sp = (
-        ham_data.h0 + trial_block_e0_sp + trial_block_e1_sp - trial_block_t2_sp * trial_block_e0_sp
-    )
-    # trial_data_clean, trial_keep_mask = reject_outliers(
-    #     jnp.column_stack((trial_block_e_sp.real,
-    #                       trial_block_w_sp,
-    #                       trial_block_t2_sp,
-    #                       trial_block_e0_sp,
-    #                       trial_block_e1_sp)),
-    #                       obs=0)
-    # trial_block_e_sp = trial_data_clean[:, 0]
-    # trial_block_w_sp = trial_data_clean[:, 1]
-    # trial_block_t2_sp = trial_data_clean[:, 2]
-    # trial_block_e0_sp = trial_data_clean[:, 3]
-    # trial_block_e1_sp = trial_data_clean[:, 4]
-    print("Clean AFQMC/pt2CCSD Observation...")
-    (
-        trial_block_w_sp_clean,
-        trial_block_t2_sp_clean,
-        trial_block_e0_sp_clean,
-        trial_block_e1_sp_clean,
-    ) = clean_pt2ccsd(
-        trial_block_e_sp.real,
-        trial_block_w_sp,
-        trial_block_t2_sp,
-        trial_block_e0_sp,
-        trial_block_e1_sp,
-        zeta=20,
+    trial_comps_sp = [jnp.asarray(trial_comp_sp[name]) for name in components]
+    trial_block_w_all = trial_block_w_sp
+    trial_comps_all = {name: c for name, c in zip(components, trial_comps_sp)}
+    # per block estimate of the trial energy, for the outlier filter only
+    trial_block_e_sp = jnp.asarray(energy_fn(ham_data.h0, *trial_comps_sp))
+    print(f"Clean AFQMC/{trial_name} Observation...")
+    trial_block_w_sp_clean, *trial_comps_sp_clean = clean_fn(
+        trial_block_e_sp.real, trial_block_w_sp, *trial_comps_sp, zeta=outlier_zeta
     )
 
     print(
-        f"\nRejected {len(trial_block_w_sp) - len(trial_block_w_sp_clean)} AFQMC/pt2CCSD outlier blocks."
+        f"\nRejected {len(trial_block_w_sp) - len(trial_block_w_sp_clean)} AFQMC/{trial_name} outlier blocks."
     )
 
     print("\nFinal blocking analysis:")
     guide_stats = blocking_analysis_ratio(guide_block_e_sp, guide_block_w_sp, print_q=True)
     guide_e_mean, guide_e_err = guide_stats["mu"], guide_stats["se_star"]
 
-    trial_args = (
-        ham_data.h0,
-        trial_block_w_sp_clean,
-        trial_block_t2_sp_clean,
-        trial_block_e0_sp_clean,
-        trial_block_e1_sp_clean,
-    )
+    trial_args = (ham_data.h0, trial_block_w_sp_clean, *trial_comps_sp_clean)
     trial_stats = blocking_fn(*trial_args, printQ=True, final=True)
     if trial_stats is None:
         # too few blocks for a blocking sweep; fall back to the unblocked estimate, which
@@ -757,11 +768,11 @@ def run_mixed_qmc(
     if trial_stats is None:
         trial_e_mean = jnp.asarray(float("nan"))
         trial_e_err = jnp.asarray(float("nan"))
-        print("AFQMC/pt2CCSD energy = not enough samples to report")
+        print(f"AFQMC/{trial_name} energy = not enough samples to report")
     else:
         trial_e_mean, trial_e_err = trial_stats
         print(
-            f"AFQMC/pt2CCSD energy = {trial_e_mean.real:.6f} +/- {trial_e_err.real:.6f} (1-sigma)"
+            f"AFQMC/{trial_name} energy = {trial_e_mean.real:.6f} +/- {trial_e_err.real:.6f} (1-sigma)"
         )
 
     return MixedQmcResult(
@@ -772,12 +783,7 @@ def run_mixed_qmc(
         trial_mean_energy=trial_e_mean,
         trial_stderr_energy=trial_e_err,
         trial_block_weights=trial_block_w_all,
-        trial_block_t2s=trial_block_t2_all,
-        trial_block_e0s=trial_block_e0_all,
-        trial_block_e1s=trial_block_e1_all,
-        # block_observables=block_obs_all,
-        # observable_means=obs_means,
-        # observable_stderrs=obs_stderrs,
+        trial_block_components=trial_comps_all,
     )
 
 

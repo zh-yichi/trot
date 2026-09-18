@@ -256,8 +256,8 @@ def test_pt2ccsd_recipe_selects_its_own_blocking():
     assert rec.mixed_block_fn is block_mixed
     assert rec.blocking_fn is pt2ccsd_blocking
 
-    with pytest.raises(ValueError, match="unknown mixed recipe"):
-        get_mixed_recipe("cisd")
+    with pytest.raises(ValueError, match="unknown mixed trial"):
+        get_mixed_recipe("no_such_trial")
     assert ("rhf", "pt2ccsd") in available_mixed_recipes()
 
 

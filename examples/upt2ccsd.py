@@ -77,10 +77,11 @@ print(f"UCCSD energy: {mycc.e_tot:.10f} Ha")
 
 af = AfqmcMixed(
     mycc,
+    guide="ucisd",
     trial="upt2ccsd_bar",
     dt=0.005,
     n_walkers=300,
-    n_blocks=300,
+    n_blocks=600,
     n_eql_blocks=80,
     seed=17,
     mixed_precision=False,
@@ -93,10 +94,11 @@ print(f"Reference (UCCSD)      : {mycc.e_tot:.6f} Ha")
 
 af = AfqmcMixed(
     mycc,
-    trial="upt2ccsd",
+    guide="uhf",
+    trial="upt2ccsd_bar",
     dt=0.005,
     n_walkers=300,
-    n_blocks=300,
+    n_blocks=600,
     n_eql_blocks=80,
     seed=17,
     mixed_precision=False,

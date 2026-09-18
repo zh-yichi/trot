@@ -392,3 +392,48 @@ def test_ulno_afqmc_o2_triplet_end_to_end(o2t, tmp_path, request):
         )
         e1, err1 = fr.kernel()
     assert abs(e1 - lno.lno_eqmc[0]) < 1e-10 and abs(err1 - lno.lno_eqmc_err[0]) < 1e-10
+
+
+# ----------------------------------------------------------------------------- UCISD guide
+
+
+def test_ucisd_guide_recipe():
+    from trot.lnoafqmc.mixed import available_mixed_recipes, get_mixed_recipe
+    from trot.lnoafqmc.staging import stage_ucisd_guide
+
+    assert ("ucisd", "upt2ccsd") in available_mixed_recipes()
+    rec = get_mixed_recipe("upt2ccsd", guide="ucisd")
+    assert rec.guide == "ucisd" and rec.walker_kind == "unrestricted" and rec.ham_basis == "uchol"
+    assert rec.needs_amplitudes and rec.stage_guide is stage_ucisd_guide
+
+
+@pytest.mark.slow
+def test_ucisd_guide_fragments(o2t, request):
+    """
+    The fragment UCISD guide on the uchol fragment hamiltonian: the guide bundle is the
+    meas.ucisd_uh one, the walkers start from the reference determinant so the tau = 0
+    fragment energies add up to the LNO-CCSD energy, and a short run is finite.
+    """
+    if not request.config.getoption("--run-slow"):
+        pytest.skip("need --run-slow option to run")
+    import contextlib
+    import io
+
+    from trot.lnoafqmc import LnoFragMixed
+    from trot.meas.ucisd_uh import force_bias_kernel_uw_uh, overlap_uw_uh
+    from trot.trial.ucisd import UcisdTrial
+
+    mf = o2t["mf"]
+    qmc = dict(n_walkers=4, n_eql_blocks=2, n_blocks=12, dt=0.01, n_prop_steps=2)
+    e_init = 0.0
+    for frag in o2t["frags"]:
+        with contextlib.redirect_stdout(io.StringIO()):
+            fm = LnoFragMixed(mf, frag, guide="ucisd", chol_cut=CHOL_CUT, seed=5, **qmc)
+            job = fm.build_job()
+            assert isinstance(job.trial_data, UcisdTrial)
+            assert job.meas_ops.overlap is overlap_uw_uh
+            assert job.meas_ops.kernels["force_bias"] is force_bias_kernel_uw_uh
+            e, err = fm.kernel()
+        assert np.isfinite(e) and np.isfinite(fm.guide_e_tot)
+        e_init += fm.qmc_result.frag_init_energy
+    assert abs(e_init - o2t["e_ccsd"]) < 1e-6

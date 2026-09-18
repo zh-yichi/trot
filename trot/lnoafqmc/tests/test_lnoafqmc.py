@@ -429,3 +429,74 @@ def test_lno_afqmc_o2_end_to_end(o2, tmp_path, request):
         )
         e1, err1 = fr.kernel()
     assert abs(e1 - lno.lno_eqmc[0]) < 1e-10 and abs(err1 - lno.lno_eqmc_err[0]) < 1e-10
+
+
+# ----------------------------------------------------------------------------- CISD guide
+
+
+def test_cisd_guide_recipe():
+    from trot.lnoafqmc.staging import stage_cisd_guide
+
+    assert ("cisd", "pt2ccsd") in available_mixed_recipes()
+    rec = get_mixed_recipe("pt2ccsd", guide="cisd")
+    assert rec.guide == "cisd" and rec.walker_kind == "restricted"
+    assert rec.needs_amplitudes and rec.stage_guide is stage_cisd_guide
+    assert get_mixed_recipe("pt2ccsd").guide == "rhf"
+    with pytest.raises(ValueError, match="hamiltonians|walker kind|no LNO recipe"):
+        get_mixed_recipe("pt2ccsd", guide="ucisd")
+
+
+def test_cisd_guide_staging_matches_trot(o2):
+    """The fragment CISD guide is what trot's _stage_cisd_input builds from the amplitudes."""
+    from trot.lnoafqmc.staging import stage_cisd_guide
+
+    frag = o2["frags"][0]
+    tin = stage_cisd_guide(frag)
+    assert tin.kind == "cisd"
+    t1 = np.asarray(frag.t1)
+    t2 = np.asarray(frag.t2)
+    ci2 = (t2 + np.einsum("ia,jb->ijab", t1, t1)).transpose(0, 2, 1, 3)
+    np.testing.assert_allclose(np.asarray(tin.data["ci1"]), t1)
+    np.testing.assert_allclose(np.asarray(tin.data["ci2"]), ci2)
+
+
+@pytest.mark.slow
+def test_cisd_guide_fragments(o2, tmp_path, request):
+    """
+    Under the fragment CISD guide the walkers start from the reference determinant, so
+    the tau = 0 fragment energies still add up to the LNO-CCSD energy; a short run gives
+    finite numbers; and a fragment file written with one guide can be re-run with
+    another.
+    """
+    if not request.config.getoption("--run-slow"):
+        pytest.skip("need --run-slow option to run")
+    from trot.trial.cisd import CisdTrial
+
+    mf = o2["mf"]
+    qmc: dict[str, Any] = dict(n_walkers=4, n_eql_blocks=2, n_blocks=12, dt=0.01, n_prop_steps=2)
+    e_init = 0.0
+    for frag in o2["frags"]:
+        with contextlib.redirect_stdout(io.StringIO()):
+            fm = LnoFragMixed(mf, frag, guide="cisd", chol_cut=CHOL_CUT, seed=5, **qmc)
+            job = fm.build_job()
+            assert isinstance(job.trial_data, CisdTrial)
+            assert job.staged.trial.kind == "cisd"
+            assert job.meas_ops.has_kernel("force_bias")
+            e, err = fm.kernel()
+        assert np.isfinite(e) and np.isfinite(fm.guide_e_tot)
+        e_init += fm.qmc_result.frag_init_energy
+    assert abs(e_init - o2["e_ccsd"]) < 1e-6
+
+    # file written with the HF guide, re-run with the CISD guide rebuilt from its amplitudes
+    frag = o2["frags"][0]
+    with contextlib.redirect_stdout(io.StringIO()):
+        path = LnoFragMixed(mf, frag, chol_cut=CHOL_CUT).save(tmp_path / "frag1.h5")
+        fm2 = LnoFragMixed.from_frag_data(path, guide="cisd", **qmc)
+        job2 = fm2.build_job()
+    assert isinstance(job2.trial_data, CisdTrial)
+    # and the other way round: a file carries the guide it was written with, so asking
+    # for an HF guide from a CISD file is refused rather than silently changed
+    with contextlib.redirect_stdout(io.StringIO()):
+        path3 = LnoFragMixed(mf, frag, guide="cisd", chol_cut=CHOL_CUT).save(tmp_path / "frag1c.h5")
+        with pytest.raises(ValueError, match="stages as 'cisd'"):
+            LnoFragMixed.from_frag_data(path3, **qmc).build_job()

@@ -96,7 +96,8 @@ class LnoFragMixed(AfqmcMixed):
     mf : pyscf RHF/UHF, density fitted. None when built from a fragment file.
     frag : LnoFragData, the CPU stage of the fragment (LNOs, amplitudes).
     trial, guide : the recipe (lnoafqmc.mixed); defaults "pt2ccsd" (RHF) / "upt2ccsd" (UHF)
-        with the HF guide.
+        with the HF guide. guide="cisd" / "ucisd" propagates with the fragment's own
+        CISD, built from its CCSD amplitudes in the active LNO basis.
     max_error : early-stop target of the fragment error; None runs all n_blocks.
     stop_ratio, min_blocks : stop once err < stop_ratio * max_error and at least
         min_blocks sampling blocks are in (0.7, 120 as in afqmc).
@@ -161,8 +162,8 @@ class LnoFragMixed(AfqmcMixed):
             raise ValueError(f"trial={self.trial!r} does not fit {kind} fragment data.")
         if self.recipe.needs_amplitudes and not frag.has_amplitudes:
             raise ValueError(
-                f"trial={self.trial!r} needs the fragment CCSD amplitudes, but the fragment "
-                "data has none (run_cc=False?)."
+                f"guide={self.guide!r} / trial={self.trial!r} need the fragment CCSD "
+                "amplitudes, but the fragment data has none (run_cc=False?)."
             )
         self.basis_a = None
         self.basis_b = None
@@ -224,8 +225,17 @@ class LnoFragMixed(AfqmcMixed):
             return self._staged
 
         frag = self.frag
+        guide_spec = self.recipe.guide_spec
+        assert guide_spec is not None
+        # a guide built from the fragment amplitudes (CISD, UCISD) rather than staged from
+        # the mean field; None for the HF guides
+        guide_input = self.recipe.stage_guide(frag) if self.recipe.stage_guide is not None else None
         if self._preloaded_staged is not None:
             staged = self._preloaded_staged
+            if guide_input is not None and staged.trial.kind not in guide_spec.kinds:
+                # the file carries the guide it was written with; keep its hamiltonian and
+                # put the requested guide next to it
+                staged = StagedInputs(ham=staged.ham, trial=guide_input, meta=staged.meta)
         else:
             if self._scf is None:
                 raise ValueError("LnoFragMixed needs mf to build the fragment hamiltonian.")
@@ -245,11 +255,12 @@ class LnoFragMixed(AfqmcMixed):
                 chol_cut=self.chol_cut,
                 verbose=self.verbose,
                 ham=cast(Any, ham),
+                trial=guide_input,
             )
-        if staged.trial.kind != self.guide:
+        if staged.trial.kind not in guide_spec.kinds:
             raise ValueError(
-                f"guide={self.guide!r} was requested but the mean field stages as "
-                f"{staged.trial.kind!r} in the fragment basis."
+                f"guide={self.guide!r} was requested but the fragment stages as "
+                f"{staged.trial.kind!r}; the recipe needs one of {sorted(guide_spec.kinds)}."
             )
         self._trial_input = self.recipe.stage_trial(frag)
 
@@ -296,6 +307,7 @@ class LnoFragMixed(AfqmcMixed):
             blocking_fn=self.recipe.blocking_fn,
             clean_fn=self.recipe.clean_fn,
             components=self.recipe.components,
+            energy_fn=self.recipe.energy_fn,
             max_error=self.max_error,
             stop_ratio=self.stop_ratio,
             min_blocks=self.min_blocks,
@@ -456,8 +468,8 @@ class LnoAfqmcMixed:
         self.run_qmc = bool(run_qmc)
         if self.run_qmc and self.recipe.needs_amplitudes and not self.run_cc:
             raise ValueError(
-                f"run_qmc=True with trial={self.trial!r} requires run_cc=True: the trial needs "
-                "the fragment t1/t2 amplitudes."
+                f"run_qmc=True with guide={self.guide!r} / trial={self.trial!r} requires "
+                "run_cc=True: they need the fragment t1/t2 amplitudes."
             )
 
         self.run_frag = self._resolve_run_frag(run_frag)

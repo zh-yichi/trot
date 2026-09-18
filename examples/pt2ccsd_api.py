@@ -25,12 +25,12 @@ from trot.afqmc import AfqmcMixed
 a = 2  # intra-dimer bond length (Bohr)
 d = 100  # centre-to-centre distance between dimers (Bohr)
 na = 2  # atoms per monomer (H2)
-nc = 8  # number of monomers
+nc = 1  # number of monomers
 
 atoms = ""
 for n in range(nc * na):
     shift = ((n - n % na) // na) * (d - a)
-    atoms += f"H {n*a+shift:.5f} 0.00000 0.00000 \n"
+    atoms += f"N {n*a+shift:.5f} 0.00000 0.00000 \n"
 
 mol = gto.M(atom=atoms, basis="sto6g", unit="b", verbose=4)
 
@@ -42,7 +42,7 @@ mf = scf.RHF(mol)
 mf.kernel()
 print(f"RHF  energy: {mf.e_tot:.10f} Ha")
 
-mycc = cc.CCSD(mf)
+mycc = cc.CCSD(mf).set_frozen()
 mycc.kernel()
 print(f"CCSD energy: {mycc.e_tot:.10f} Ha")
 

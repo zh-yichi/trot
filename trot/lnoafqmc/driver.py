@@ -17,6 +17,7 @@ from ..driver import make_run_mixed_blocks
 from ..prop.types import PropOps, PropState, QmcParams
 from ..stat_utils import blocking_analysis_ratio, reject_outliers
 from ..walkers import stochastic_reconfiguration
+from .stat_utils import frag_pt2ccsd_energy_fn
 
 print = partial(print, flush=True)
 
@@ -57,30 +58,34 @@ def _init_frag_energy(
     trial_meas_ops: MeasOps,
     trial_meas_ctx: Any,
     components: tuple[str, ...],
+    energy_fn: Callable[..., Any] = frag_pt2ccsd_energy_fn,
+    n_chunks: int = 1,
 ) -> tuple[float, float]:
     """
-    The tau = 0 line: the fragment estimator on the first initial walker, and the total
-    absorbed weight of the initial population, sum_i w_i <T|phi_i>/<G|phi_i>.
+    The tau = 0 line: the fragment estimator of the initial population, its components
+    averaged with the absorbed weight wp_i = w_i <T|phi_i>/<G|phi_i> and combined with
+    the recipe's energy_fn, and the total absorbed weight sum_i wp_i.
     """
-    walker_0 = wk.take_walkers(init_state.walkers, jnp.array([0]))
     kernel = trial_meas_ops.require_kernel(k_energy)
+    n = wk.n_walkers(init_state.walkers)
     if trial_meas_ops.needs_rng(k_energy):
-        keys = jax.random.split(init_state.rng_key, wk.n_walkers(walker_0))
-        out = wk.vmap_chunked(kernel, n_chunks=1, in_axes=(0, None, None, None, 0))(
-            walker_0, ham_data, trial_meas_ctx, trial_data, keys
+        keys = jax.random.split(init_state.rng_key, n)
+        out = wk.vmap_chunked(kernel, n_chunks=n_chunks, in_axes=(0, None, None, None, 0))(
+            init_state.walkers, ham_data, trial_meas_ctx, trial_data, keys
         )
     else:
-        out = wk.vmap_chunked(kernel, n_chunks=1, in_axes=(0, None, None, None))(
-            walker_0, ham_data, trial_meas_ctx, trial_data
+        out = wk.vmap_chunked(kernel, n_chunks=n_chunks, in_axes=(0, None, None, None))(
+            init_state.walkers, ham_data, trial_meas_ctx, trial_data
         )
-    c = {name: out[0, i] for i, name in enumerate(components)}
-    e_init = float(jnp.real(c["e0frg"] + c["e1frg"] - c["t2frg"] * c["e0"]))
-
-    trial_overlaps = wk.vmap_chunked(trial_meas_ops.overlap, n_chunks=1, in_axes=(0, None))(
+    out = jnp.reshape(out, (n, -1))
+    trial_overlaps = wk.vmap_chunked(trial_meas_ops.overlap, n_chunks=n_chunks, in_axes=(0, None))(
         init_state.walkers, trial_data
     )
-    w_init = float(jnp.real(jnp.sum(init_state.weights * trial_overlaps / init_state.overlaps)))
-    return e_init, w_init
+    wp = init_state.weights * trial_overlaps / init_state.overlaps
+    w_sum = jnp.sum(wp)
+    avgs = [jnp.sum(wp * out[:, i]) / w_sum for i in range(len(components))]
+    e_init = float(jnp.real(energy_fn(ham_data.h0, *avgs)))
+    return e_init, float(jnp.real(w_sum))
 
 
 def run_frag_qmc(
@@ -98,6 +103,7 @@ def run_frag_qmc(
     blocking_fn: Callable[..., Any],
     clean_fn: Callable[..., Any],
     components: tuple[str, ...],
+    energy_fn: Callable[..., Any] = frag_pt2ccsd_energy_fn,
     max_error: float | None = None,
     stop_ratio: float = 0.7,
     min_blocks: int = 120,
@@ -131,7 +137,14 @@ def run_frag_qmc(
         )
 
     e_init, w_init = _init_frag_energy(
-        state, ham_data, trial_data, trial_meas_ops, trial_meas_ctx, components
+        state,
+        ham_data,
+        trial_data,
+        trial_meas_ops,
+        trial_meas_ctx,
+        components,
+        energy_fn,
+        n_chunks=params.n_chunks,
     )
 
     if mesh is None or mesh.size == 1:
@@ -296,7 +309,8 @@ def run_frag_qmc(
 
     wp = jnp.asarray(wp_sp)
     comps = {name: jnp.asarray(comp_sp[name]) for name in components}
-    ept_sp = jnp.real(comps["e0frg"] + comps["e1frg"] - comps["t2frg"] * comps["e0"])
+    # per block estimate of the fragment energy, for the outlier filter only
+    ept_sp = jnp.real(jnp.asarray(energy_fn(ham_data.h0, *(comps[name] for name in components))))
     (wp_c, *comps_c), mask = clean_fn(
         ept_sp, wp, *(comps[name] for name in components), zeta=outlier_zeta
     )

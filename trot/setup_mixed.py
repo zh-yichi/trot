@@ -102,9 +102,14 @@ class JobMixed(Job):
             # trial: measurement
             trial_data=self.mix_trial_data,
             trial_meas_ops=self.mix_trial_meas_ops,
-            # both come from the recipe, so they can never be mismatched
+            # all from the recipe, so the kernel's components, the energy formula, the
+            # blocking analysis and the outlier filter can never be mismatched
             mix_block_fn=self.recipe.mixed_block_fn,
             blocking_fn=self.recipe.blocking_fn,
+            components=self.recipe.components,
+            energy_fn=self.recipe.energy_fn,
+            clean_fn=self.recipe.clean_fn,
+            trial_name=self.recipe.trial,
             **driver_kwargs,
         )
 
@@ -193,6 +198,17 @@ def setup_mixed(
     )
     job = cast(JobMixed, job)
 
+    # a guide with its own bundle for this hamiltonian (the UCISD guide on the uchol
+    # hamiltonian, which _make_trial_bundle would have built as UHF) replaces the default
+    # one, unless the caller overrode the bundle explicitly
+    guide_spec = rec.guide_spec
+    basis = getattr(job.ham_data, "basis", "restricted")
+    make_bundle = (guide_spec.make_bundle or {}).get(basis) if guide_spec is not None else None
+    if make_bundle is not None and trial_data is None and trial_ops is None and meas_ops is None:
+        job.trial_data, job.trial_ops, job.meas_ops = make_bundle(
+            job.sys, job.staged, mixed_precision
+        )
+
     # attach the measurement trial
     job.recipe = rec
     job.mix_trial_data = rec.make_trial_data(trial_input.data, job.sys)
@@ -202,9 +218,9 @@ def setup_mixed(
     if max_memory is not None:
         if rec.plan_chunking is None:
             raise ValueError(
-                f"trial {rec.trial!r} measures with the unchunked energy kernel, which "
-                "has nothing for max_memory to size. Use trial='pt2ccsd_chunk' or "
-                "'pt2ccsd_bar', or drop max_memory."
+                f"trial {rec.trial!r} has no memory model, so there is nothing for "
+                "max_memory to size; drop max_memory (for pt2CCSD use trial='pt2ccsd_chunk' "
+                "or 'pt2ccsd_bar', which are chunked)."
             )
         assert job.params is not None
         plan = rec.plan_chunking(

@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Dict, Iterable, cast
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 
 if TYPE_CHECKING:
@@ -499,3 +500,187 @@ def pt2ccsd_blocking(
             print(f"No plateau found, using max error = {err.real:.6f}")
 
     return energy_avg.real, err.real
+
+
+# ----------------------------------------------------------------------------------
+# Component estimators for mixed guide/trial AFQMC.
+#
+# A trial's energy kernel returns k named components per walker, and the energy is a
+# function of their wp-weighted averages,
+#
+#     E = energy_fn(h0, <c_1>, ..., <c_k>),      <c> = sum(w c) / sum(w)
+#
+# where w is the absorbed weight w_i <T|phi_i> / <G|phi_i>. An ordinary trial (HF, CISD)
+# has one component, the local energy, and the identity energy_fn; pt2CCSD has three and
+# the nonlinear energy_fn above (pt2ccsd_energy_fn). The functions below are the generic
+# versions of _pt2ccsd_energy, _pt2ccsd_delta_method_error, pt2ccsd_blocking and
+# clean_pt2ccsd, for any energy_fn. pt2ccsd_blocking itself is kept for the pt2CCSD
+# recipe, so its numbers stay exactly what they were.
+# ----------------------------------------------------------------------------------
+
+
+def pt2ccsd_energy_fn(h0, t2, e0, e1):
+    """The pt2CCSD energy from its three averaged components."""
+    return h0 + e0 + e1 - t2 * e0
+
+
+def eloc_energy_fn(h0, e_loc):
+    """A trial whose kernel returns the full local energy, h0 included."""
+    return e_loc
+
+
+def component_energy(energy_fn, h0, weights, *comps):
+    """E = energy_fn(h0, <c_1>, ..., <c_k>) with <c> = sum(w c) / sum(w)."""
+    wt_avg = jnp.mean(weights)
+    avgs = [jnp.mean(weights * c) / wt_avg for c in comps]
+    return energy_fn(h0, *avgs)
+
+
+def component_delta_method_error(energy_fn, h0, weights, *comps):
+    """
+    Weight aware naive error of a component estimator, without blocking.
+
+    In aggregate form E = energy_fn(h0, A_1 / W, ..., A_k / W) with W = sum(w) and
+    A_i = sum(w c_i). Each sample's contribution to the aggregates is propagated through
+    a first order linearization (the partials come from jax, holomorphic in the
+    aggregates) to its influence on E, and the variance of the mean is taken.
+
+    Ignores autocorrelation between blocks, so it underestimates the true error; it is
+    for progress reporting and early stopping, not for a final number.
+    """
+    w = jnp.asarray(weights, dtype=jnp.complex128)
+    n = w.shape[0]
+    cs = [jnp.asarray(c, dtype=jnp.complex128) for c in comps]
+    aggs = jnp.stack([jnp.sum(w)] + [jnp.sum(w * c) for c in cs])
+
+    def f(a):
+        return jnp.asarray(energy_fn(h0, *(a[1:] / a[0])), dtype=jnp.complex128)
+
+    g = jax.grad(f, holomorphic=True)(aggs)
+    infl = g[0] * w
+    for i, c in enumerate(cs):
+        infl = infl + g[i + 1] * (w * c)
+    infl = infl.real
+    var_mean = jnp.sum(infl**2) * n / (n - 1)
+    return jnp.sqrt(var_mean).real
+
+
+def clean_components(e_sp, weights, *comps, zeta=20):
+    """
+    Drop outlier blocks of a component estimator, by the rule of clean_pt2ccsd: a block
+    whose energy sits more than zeta median absolute deviations from the median goes.
+
+    Returns the kept (weights, *comps).
+    """
+    d = jnp.abs(e_sp - jnp.median(e_sp))
+    d_med = jnp.median(d)
+    d_med = jnp.where(d_med == 0, 1e-10, d_med)
+    z = d / d_med
+    mask = z < zeta
+    if int(jnp.sum(~mask)) > 0:
+        print(
+            f"Remove outlier blocks zeta {z[~mask]} \n"
+            f"                    energy {e_sp[~mask]} \n"
+            f"                    weight {jnp.asarray(weights).real[~mask]} "
+        )
+    return (weights[mask],) + tuple(c[mask] for c in comps)
+
+
+def make_component_blocking(energy_fn, label="mixed"):
+    """
+    Build the blocking analysis of a component estimator with the given energy_fn.
+
+    The returned function has the signature of pt2ccsd_blocking,
+
+        blocking(h0, weights, *comps, printQ=False, min_blocks=5, plateau_window=2,
+                 plateau_tol=0.04, final=True) -> (energy, error) | None
+
+    final=True   full blocking sweep over block sizes, with plateau detection.
+    final=False  no blocking; the delta method error of component_delta_method_error.
+
+    Returns None when there are too few samples for the requested analysis.
+    """
+
+    def blocking(
+        h0,
+        weights,
+        *comps,
+        printQ=False,
+        min_blocks=5,
+        plateau_window=2,
+        plateau_tol=0.04,
+        final=True,
+    ):
+        nsample = len(weights)
+        if nsample < 2:
+            return None
+
+        energy_avg = component_energy(energy_fn, h0, weights, *comps)
+
+        if not final:
+            return energy_avg.real, component_delta_method_error(energy_fn, h0, weights, *comps)
+
+        max_size = max(1, nsample // min_blocks)
+        block_errs = []
+        block_means = []
+        block_sizes = []
+
+        for block_size in range(1, max_size + 1):
+            n_blocks = nsample // block_size
+            if n_blocks < min_blocks:
+                break
+            sl = slice(0, n_blocks * block_size)
+            wt = weights[sl].reshape(n_blocks, block_size)
+            block_wt = jnp.sum(wt, axis=1)
+            block_avgs = [
+                jnp.sum((weights[sl] * c[sl]).reshape(n_blocks, block_size), axis=1) / block_wt
+                for c in comps
+            ]
+            block_energy = jnp.asarray(energy_fn(h0, *block_avgs)).real
+            block_sizes.append(block_size)
+            block_means.append(jnp.mean(block_energy))
+            block_errs.append(jnp.std(block_energy, ddof=1) / jnp.sqrt(n_blocks))
+
+        if not block_errs:
+            return None
+
+        errs = jnp.array(block_errs)
+        plateau_idx = None
+        if len(errs) >= plateau_window + 1:
+            for i in range(1, len(errs) - plateau_window + 1):
+                window = errs[i : i + plateau_window]
+                rel_changes = jnp.abs(jnp.diff(window) / window[:-1])
+                if jnp.all(rel_changes < plateau_tol):
+                    plateau_idx = i
+                    break
+
+        if plateau_idx is not None:
+            err = jnp.mean(errs[plateau_idx : plateau_idx + plateau_window])
+        else:
+            err = errs.max()
+
+        if printQ:
+            print(f"Performing Blocking Analysis for the AFQMC/{label} energy...")
+            print(f"{'Bsz':>4s}  {'NB':>4s}  {'Nsp':>4s}  {'Energy':>11s}  {'Error':>8s}")
+            if plateau_idx is not None:
+                print_end = min(len(block_errs), plateau_idx + plateau_window + 3)
+            else:
+                print_end = len(block_errs)
+            for i in range(print_end):
+                bs = block_sizes[i]
+                nb = nsample // bs
+                marker = "  <--" if (plateau_idx is not None and i == plateau_idx) else ""
+                print(
+                    f"{bs:4d}  {nb:4d}  {bs*nb:4d}  {block_means[i]:11.6f}  {block_errs[i]:8.6f}{marker}"
+                )
+            if plateau_idx is not None:
+                print(
+                    f"Plateau found at block size {block_sizes[plateau_idx]}, error = {err.real:.6f}"
+                )
+            else:
+                print(f"No plateau found, using max error = {err.real:.6f}")
+
+        return energy_avg.real, err.real
+
+    blocking.__name__ = f"{label}_blocking"
+    return blocking
