@@ -897,3 +897,168 @@ def run_afqmc_lno_helper(
 # Backward-compatible aliases
 AFQMC = Afqmc
 AFQMCFp = AfqmcFp
+
+
+# ======================================================================================
+# unrestricted (uchol) hamiltonian
+# ======================================================================================
+
+from .setup_u import setup_uh as setup_job_uh  # noqa: E402
+from .staging_u import dump_uh as dump_staged_uh  # noqa: E402
+from .staging_u import load_uh as load_staged_uh  # noqa: E402
+from .staging_u import stage_uh as stage_inputs_uh  # noqa: E402
+
+
+class AfqmcUh(Afqmc):
+    """
+    AFQMC with an unrestricted (uchol) hamiltonian.
+
+    Alpha and beta each keep their own orbital basis, so h1 and the cholesky vectors are
+    carried per spin and norb_a may differ from norb_b. The auxiliary field index stays
+    shared between the spins, so the opposite spin interaction is recovered from
+    L^a_g and L^b_g. Contrast with ``Afqmc(mf); af.walker_kind = "unrestricted"``, which
+    uses unrestricted *walkers* against a hamiltonian built in the alpha MO basis alone.
+
+        af = AfqmcUh(mf)                       # mf a pyscf UHF, or rhf.to_uhf()
+        mean, err = af.kernel()
+
+    Two independently chosen orbital sets, which may differ in size (their leading
+    columns must be the occupied orbitals of that spin):
+
+        af = AfqmcUh(mf, basis_a=c_a, basis_b=c_b)
+
+    Parameters
+    ----------
+    mf_or_cc : Any
+        pyscf UHF mean field. (Correlated trials on the uchol hamiltonian are not wired
+        yet; the trial is the UHF determinant.)
+    basis_a, basis_b : NDArray, optional
+        Orbital bases for the two spins. Default to the UHF alpha and beta coefficients.
+    norb_frozen_core : int | (int, int), optional
+        Frozen core orbitals, the same number for both spins or a pair (n_a, n_b).
+    The remaining parameters are those of ``Afqmc``. Only unrestricted walkers are
+    supported; ``walker_kind`` is fixed to "unrestricted".
+    """
+
+    params_cls = QmcParams
+    job_cls = Job
+    setup_fn = staticmethod(setup_job_uh)
+
+    def __init__(
+        self,
+        mf_or_cc: Any,
+        *,
+        basis_a: NDArray | None = None,
+        basis_b: NDArray | None = None,
+        norb_frozen_core: int | tuple[int, int] | None = None,
+        norb_frozen: int | tuple[int, int] | None = None,
+        chol_cut: float = 1e-5,
+        cache: Union[str, Path] | None = None,
+        n_eql_blocks: int | None = None,
+        n_blocks: int | None = None,
+        seed: int | None = None,
+        dt: float | None = None,
+        n_walkers: int | None = None,
+        n_chunks: int | None = None,
+        error_method: Literal["gamma", "blocking"] | None = None,
+        cisd_workflow: CisdWorkflowConfig | None = None,
+    ):
+        from .cholesky_u import normalize_frozen_core_uh
+
+        if cisd_workflow is not None:
+            raise ValueError("cisd_workflow is not supported on the unrestricted hamiltonian.")
+        if norb_frozen_core is not None and norb_frozen is not None:
+            if normalize_frozen_core_uh(norb_frozen_core) != normalize_frozen_core_uh(norb_frozen):
+                raise ValueError(
+                    "norb_frozen_core and norb_frozen must match when both are passed."
+                )
+        frozen = norb_frozen_core if norb_frozen_core is not None else norb_frozen
+        frozen_uh = normalize_frozen_core_uh(frozen)
+
+        # the base class resolves an integer core only; the per spin pair is kept here
+        super().__init__(
+            mf_or_cc,
+            norb_frozen_core=None,
+            chol_cut=chol_cut,
+            cache=cache,
+            n_eql_blocks=n_eql_blocks,
+            n_blocks=n_blocks,
+            seed=seed,
+            dt=dt,
+            n_walkers=n_walkers,
+            n_chunks=n_chunks,
+            error_method=error_method,
+        )
+        self.norb_frozen_core = frozen_uh
+        self.norb_frozen = frozen_uh
+        self.basis_a = None if basis_a is None else np.asarray(basis_a)
+        self.basis_b = None if basis_b is None else np.asarray(basis_b)
+        # alpha and beta live in different orbital spaces, so no other kind applies
+        self.walker_kind = "unrestricted"
+
+    def _key(self) -> tuple:
+        return super()._key() + (
+            None if self.basis_a is None else id(self.basis_a),
+            None if self.basis_b is None else id(self.basis_b),
+        )
+
+    def stage(self, *, force: bool = False) -> StagedInputs:
+        """
+        Build the unrestricted hamiltonian and the UHF trial (staging_u.stage_uh). The
+        staged inputs carry a HamInputU in the ham slot.
+        """
+        if isinstance(self._obj, StagedInputs):
+            if self._staged is None or force:
+                self._staged = self._obj
+                self._cache_key = self._key()
+                self._job = None
+            return self._staged
+
+        key = self._key()
+        if self._staged is not None and self._cache_key == key and not force:
+            return self._staged
+
+        staged = stage_inputs_uh(
+            self._obj,
+            norb_frozen_core=self.norb_frozen_core,
+            chol_cut=self.chol_cut,
+            basis_a=self.basis_a,
+            basis_b=self.basis_b,
+            cache=self.cache,
+            overwrite=self.overwrite_cache if self.cache is not None else False,
+            verbose=self.verbose,
+        )
+        self._staged = staged
+        self._cache_key = key
+        self._job = None
+        return staged
+
+    def save_staged(self, path: Union[str, Path]) -> None:
+        """Write the staged uchol inputs to a single file (staging_u.dump_uh)."""
+        staged = self.stage()
+        destination = Path(path).expanduser().resolve()
+        if self.cache is not None and self.cache.exists():
+            if destination != self.cache:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(self.cache, destination)
+            return
+        dump_staged_uh(staged, destination)
+
+    @classmethod
+    def _from_staged_common(cls, path: Union[str, Path], **kwargs: Any):
+        cache_path = Path(path).expanduser().resolve()
+        staged = load_staged_uh(cache_path)
+        meta = staged.meta
+
+        kwargs.pop("cisd_workflow", None)
+        af = cls(
+            None,
+            norb_frozen_core=(int(meta["frozen"][0]), int(meta["frozen"][1])),
+            chol_cut=meta["chol_cut"],
+            cache=cache_path,
+            **kwargs,
+        )
+        af._staged = staged
+        af.source_kind = meta["source_kind"]
+        af._cache_key = af._key()
+        return af

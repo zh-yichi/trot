@@ -1,0 +1,376 @@
+"""
+Staging for the unrestricted (uchol) hamiltonian.
+
+The companion of staging.py for the case where alpha and beta keep their own orbital
+basis. Nothing in staging.py is changed: this module builds a HamInputU, stages the
+trial half through staging's own functions, and carries the result in a StagedInputs
+whose ham slot holds the HamInputU.
+
+    HamInputU          the unrestricted inputs, each spin in its own basis
+    build_ham_uchol    HamInputU from a pyscf mean field (UHF, or an RHF via to_uhf)
+    stage_uh           StagedInputs (HamInputU + TrialInput + meta), with optional cache
+    dump_uh / load_uh  the h5 layout, ham/{h1_a,h1_b,chol_a,chol_b} with basis "uchol"
+    is_uchol_file      whether a staged file was written by dump_uh
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, Tuple, Union
+
+import h5py
+import numpy as np
+from numpy.typing import NDArray
+
+from .cholesky_u import (
+    ao_cholesky,
+    freeze_core_from_mo_cholesky_uh,
+    normalize_frozen_core_uh,
+    rotate_chol_to_mo,
+)
+from .staging import (
+    STAGE_FORMAT_VERSION,
+    StagedInputs,
+    StagedMfOrCc,
+    TrialInput,
+    _freeze_from_meta_value,
+    _stage_begin,
+    _stage_end,
+    _to_json_str,
+)
+
+Array = Any
+
+
+@dataclass(frozen=True, slots=True)
+class HamInputU:
+    """
+    Unrestricted ham inputs, each spin in its own orthonormal one particle basis.
+
+    The reference determinant of spin s occupies the leading nelec[s] orbitals of that
+    spin's basis (the basis is that spin's MOs, or the columns the caller passed as
+    basis_s, in that order), which is what the uchol trials and walkers assume.
+    """
+
+    h0: float
+    h1_a: Array  # (norb_a, norb_a)
+    h1_b: Array  # (norb_b, norb_b)
+    chol_a: Array  # (nchol, norb_a, norb_a)
+    chol_b: Array  # (nchol, norb_b, norb_b)
+    nelec: Tuple[int, int]  # active electrons
+    norb: Tuple[int, int]  # active orbitals per spin
+    chol_cut: float
+    frozen: Tuple[int, int]  # frozen core orbitals per spin
+    source_kind: str  # "mf" or "cc"
+    basis: str = "uchol"
+
+    @property
+    def nchol(self) -> int:
+        return int(self.chol_a.shape[0])
+
+
+def _uhf_bases(staged: StagedMfOrCc) -> tuple[NDArray, NDArray]:
+    mo = staged.mo_coeff
+    # pyscf gives UHF coefficients either as a (2, nao, nmo) array or as a pair
+    if not isinstance(mo, (tuple, list)):
+        mo_arr = np.asarray(mo)
+        if mo_arr.ndim != 3 or mo_arr.shape[0] != 2:
+            raise ValueError(
+                "build_ham_uchol needs a UHF-like object with (mo_a, mo_b) coefficients "
+                "(convert an RHF with mf.to_uhf()), or explicit basis_a / basis_b."
+            )
+        return np.asarray(mo_arr[0]), np.asarray(mo_arr[1])
+    if len(mo) != 2:
+        raise ValueError(
+            "build_ham_uchol needs a UHF-like object with (mo_a, mo_b) coefficients, "
+            "or explicit basis_a / basis_b."
+        )
+    return np.asarray(mo[0]), np.asarray(mo[1])
+
+
+def build_ham_uchol(
+    obj: Any,
+    *,
+    chol_cut: float = 1e-5,
+    basis_a: NDArray | None = None,
+    basis_b: NDArray | None = None,
+    norb_frozen_core: int | Tuple[int, int] | None = None,
+    verbose: bool = False,
+) -> HamInputU:
+    """
+    Build an unrestricted cholesky hamiltonian from a pyscf UHF (or CC) object.
+
+    The AO ERIs are cholesky decomposed once (staging's chunked_cholesky, with the same
+    cutoff semantics as the restricted hamiltonian) and the vectors are projected into
+    the alpha and beta bases,
+
+        L^s_g = C_s^dag L_g C_s,     h1^s = C_s^dag hcore C_s,
+
+    so the field index g is shared and the orbital dimensions are per spin.
+
+    basis_a / basis_b default to the object's UHF alpha and beta coefficients. Pass them
+    explicitly to use two independently chosen orbital sets, which may differ in size;
+    the leading columns of each must be that spin's occupied orbitals.
+
+    norb_frozen_core is an int (same core for both spins) or a pair (n_a, n_b). The core
+    energy and potential are built from the projected cholesky vectors, as staging does
+    for the restricted hamiltonian (cholesky_u.freeze_core_from_mo_cholesky_uh).
+    """
+    n_core = normalize_frozen_core_uh(norb_frozen_core)
+    # StagedMfOrCc validates the object; an int core keeps its checks, a pair is
+    # validated below against each spin
+    staged = StagedMfOrCc(obj, max(n_core) if n_core[0] != n_core[1] else n_core[0])
+    mf = staged.mf.mf
+    mol = mf.mol
+
+    if basis_a is None or basis_b is None:
+        mo_a, mo_b = _uhf_bases(staged)
+        basis_a = mo_a if basis_a is None else np.asarray(basis_a)
+        basis_b = mo_b if basis_b is None else np.asarray(basis_b)
+    basis_a = np.asarray(basis_a)
+    basis_b = np.asarray(basis_b)
+    if basis_a.ndim != 2 or basis_b.ndim != 2 or basis_a.shape[0] != basis_b.shape[0]:
+        raise ValueError(
+            "basis_a and basis_b must be (nao, norb_s) coefficient matrices over the same "
+            f"AO basis, got {basis_a.shape} and {basis_b.shape}."
+        )
+
+    h0 = float(mf.energy_nuc())
+    hcore = np.asarray(mf.get_hcore())
+    chol_ao = ao_cholesky(mol, chol_cut=chol_cut, verbose=verbose)
+
+    t_proj = time.time()
+    h1_a = np.asarray(basis_a.conj().T @ hcore @ basis_a)
+    h1_b = np.asarray(basis_b.conj().T @ hcore @ basis_b)
+    # the rotation reuses its input storage when nao == norb, so the alpha call would
+    # otherwise clobber chol_ao and the beta call would rotate it a second time. Hand
+    # alpha a copy and let beta consume the original (its last use).
+    chol_a = rotate_chol_to_mo(np.array(chol_ao, copy=True), basis_a)
+    chol_b = rotate_chol_to_mo(chol_ao, basis_b)
+    del chol_ao
+    print(
+        f"[stage] projected chol into the alpha/beta bases "
+        f"({basis_a.shape[1]}, {basis_b.shape[1]} orbitals) in {time.time() - t_proj:.2f}s"
+    )
+
+    nelec: Tuple[int, int] = (int(mol.nelec[0]), int(mol.nelec[1]))
+
+    h0, h1_a, h1_b, chol_a, chol_b, nelec = freeze_core_from_mo_cholesky_uh(
+        h0=h0,
+        h1_a=h1_a,
+        h1_b=h1_b,
+        chol_a=chol_a,
+        chol_b=chol_b,
+        norb_frozen=n_core,
+        nelec=nelec,
+    )
+
+    norb = (int(h1_a.shape[0]), int(h1_b.shape[0]))
+    print(
+        f"[stage] uchol ham ready: norb={norb} nchol={chol_a.shape[0]} "
+        f"nelec={nelec} frozen={n_core} h0={h0:.10f}"
+    )
+
+    return HamInputU(
+        h0=h0,
+        h1_a=np.asarray(h1_a),
+        h1_b=np.asarray(h1_b),
+        chol_a=np.asarray(chol_a),
+        chol_b=np.asarray(chol_b),
+        nelec=nelec,
+        norb=norb,
+        chol_cut=float(chol_cut),
+        frozen=n_core,
+        source_kind=staged.source,
+        basis="uchol",
+    )
+
+
+def _uhf_trial_input(ham: HamInputU) -> TrialInput:
+    """
+    The UHF trial in the uchol layout: each spin's reference determinant is the leading
+    nelec[s] columns of the identity in that spin's active basis.
+    """
+    norb_a, norb_b = ham.norb
+    data = {
+        "mo_a": np.eye(norb_a)[:, : ham.nelec[0]],
+        "mo_b": np.eye(norb_b)[:, : ham.nelec[1]],
+    }
+    return TrialInput(
+        kind="uhf",
+        data=data,
+        frozen=np.asarray(ham.frozen, dtype=np.int64),
+        source_kind=ham.source_kind,
+    )
+
+
+def stage_uh(
+    obj: Any,
+    *,
+    norb_frozen_core: int | Tuple[int, int] | None = None,
+    chol_cut: float = 1e-5,
+    basis_a: NDArray | None = None,
+    basis_b: NDArray | None = None,
+    cache: Union[str, Path] | None = None,
+    overwrite: bool = False,
+    verbose: bool = False,
+) -> StagedInputs:
+    """
+    Stage the unrestricted hamiltonian and the UHF trial from a pyscf mean field.
+
+    Mirrors staging.stage for the uchol layout. The returned StagedInputs carries a
+    HamInputU in its ham slot (StagedInputs.ham is typed as the restricted HamInput).
+    With cache set, an existing file is loaded unless overwrite=True, and a fresh
+    staging is written there.
+    """
+    cache_path = Path(cache).expanduser().resolve() if cache is not None else None
+    if cache_path is not None and cache_path.exists() and not overwrite:
+        return load_uh(cache_path)
+
+    t0 = time.time()
+    t_ham = _stage_begin("building unrestricted Hamiltonian")
+    ham = build_ham_uchol(
+        obj,
+        chol_cut=chol_cut,
+        basis_a=basis_a,
+        basis_b=basis_b,
+        norb_frozen_core=norb_frozen_core,
+        verbose=verbose,
+    )
+    _stage_end(t_ham, "Hamiltonian ready", details=f"norb={ham.norb} nchol={ham.nchol}")
+
+    t_trial = _stage_begin("building trial input")
+    trial = _uhf_trial_input(ham)
+    _stage_end(t_trial, "trial input ready", details=f"kind={trial.kind}")
+
+    mol = StagedMfOrCc(obj, 0).mol
+    meta: Dict[str, Any] = {
+        "format_version": STAGE_FORMAT_VERSION,
+        "timestamp_unix": time.time(),
+        "source_kind": ham.source_kind,
+        "frozen": [int(n) for n in ham.frozen],
+        "chol_cut": ham.chol_cut,
+        "ham_basis": "uchol",
+        "mol": {
+            "nao": int(mol.nao),
+            "nelectron": int(mol.nelectron),
+            "spin": int(mol.spin),
+            "charge": int(mol.charge),
+            "basis": getattr(mol, "basis", None),
+        },
+    }
+
+    staged = StagedInputs(ham=ham, trial=trial, meta=meta)  # type: ignore[arg-type]
+
+    if cache_path is not None:
+        dump_uh(staged, cache_path)
+
+    if verbose:
+        print(f"[stage] done in {time.time() - t0:.2f}s | norb={ham.norb} nchol={ham.nchol}")
+
+    return staged
+
+
+# ======================================================================================
+# h5 layout
+# ======================================================================================
+
+
+def is_uchol_file(path: Union[str, Path]) -> bool:
+    p = Path(path).expanduser().resolve()
+    with h5py.File(p, "r") as f:
+        return str(f["ham"].attrs.get("basis", "")) == "uchol"
+
+
+def dump_uh(staged: StagedInputs, path: Union[str, Path]) -> None:
+    """
+    Write staged uchol inputs to a single h5 file: staging's layout with the ham group
+    holding h1_a/h1_b/chol_a/chol_b, norb and frozen as integer pairs, and
+    attrs["basis"] == "uchol".
+    """
+    ham: Any = staged.ham
+    if getattr(ham, "basis", None) != "uchol":
+        raise ValueError("dump_uh expects a StagedInputs carrying a HamInputU.")
+    p = Path(path).expanduser().resolve()
+    t_dump = _stage_begin(f"writing staged uchol inputs to {p}")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(p, "w") as f:
+        f.attrs["meta_json"] = json.dumps(staged.meta)
+
+        gham = f.create_group("ham")
+        gham.create_dataset("h0", data=np.array(ham.h0))
+        gham.create_dataset("h1_a", data=ham.h1_a)
+        gham.create_dataset("h1_b", data=ham.h1_b)
+        gham.create_dataset("chol_a", data=ham.chol_a)
+        gham.create_dataset("chol_b", data=ham.chol_b)
+        gham.create_dataset("nelec", data=np.array(ham.nelec, dtype=np.int64))
+        gham.create_dataset("norb", data=np.array(ham.norb, dtype=np.int64))
+        gham.create_dataset("frozen", data=np.array(ham.frozen, dtype=np.int64))
+        gham.attrs["chol_cut"] = ham.chol_cut
+        gham.attrs["source_kind"] = ham.source_kind
+        gham.attrs["basis"] = "uchol"
+
+        gtr = f.create_group("trial")
+        gtr.attrs["kind"] = staged.trial.kind
+        frozen = staged.trial.frozen
+        if isinstance(frozen, np.ndarray):
+            gtr.create_dataset("frozen", data=np.asarray(frozen, dtype=np.int64))
+        else:
+            gtr.attrs["frozen"] = int(frozen)
+        gtr.attrs["source_kind"] = staged.trial.source_kind
+        gdata = gtr.create_group("data")
+        for k, v in staged.trial.data.items():
+            gdata.create_dataset(k, data=np.asarray(v))
+    _stage_end(t_dump, "staged uchol inputs written")
+
+
+def load_uh(path: Union[str, Path]) -> StagedInputs:
+    """Load staged uchol inputs written by dump_uh."""
+    p = Path(path).expanduser().resolve()
+    t_load = _stage_begin(f"loading staged uchol inputs from {p}")
+    with h5py.File(p, "r") as f:
+        meta = json.loads(_to_json_str(f.attrs["meta_json"]))
+        gham: Any = f["ham"]
+        if str(gham.attrs.get("basis", "")) != "uchol":
+            raise ValueError(f"{p} is not a uchol staged file; use staging.load.")
+        nelec = np.array(gham["nelec"])
+        norb = np.array(gham["norb"])
+        frozen = np.array(gham["frozen"])
+        ham = HamInputU(
+            h0=float(np.array(gham["h0"]).item()),
+            h1_a=np.array(gham["h1_a"]),
+            h1_b=np.array(gham["h1_b"]),
+            chol_a=np.array(gham["chol_a"]),
+            chol_b=np.array(gham["chol_b"]),
+            nelec=(int(nelec[0]), int(nelec[1])),
+            norb=(int(norb[0]), int(norb[1])),
+            chol_cut=float(gham.attrs["chol_cut"]),
+            frozen=(int(frozen[0]), int(frozen[1])),
+            source_kind=str(gham.attrs["source_kind"]),
+            basis="uchol",
+        )
+
+        gtr: Any = f["trial"]
+        gdata = gtr["data"]
+        trial_data = {k: np.array(gdata[k]) for k in gdata.keys()}
+        if "frozen" in gtr:
+            trial_frozen: Any = np.asarray(gtr["frozen"][...], dtype=np.int64)
+        else:
+            trial_frozen = int(gtr.attrs["frozen"])
+        trial = TrialInput(
+            kind=str(gtr.attrs["kind"]),
+            data=trial_data,
+            frozen=trial_frozen,
+            source_kind=str(gtr.attrs["source_kind"]),
+        )
+    if "frozen" in meta and not isinstance(meta["frozen"], list):
+        meta["frozen"] = _freeze_from_meta_value(meta["frozen"])
+    _stage_end(
+        t_load,
+        "staged uchol inputs loaded",
+        details=f"norb={ham.norb} nchol={ham.nchol} trial={trial.kind}",
+    )
+    return StagedInputs(ham=ham, trial=trial, meta=meta)  # type: ignore[arg-type]
