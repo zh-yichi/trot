@@ -919,7 +919,8 @@ class AfqmcUh(Afqmc):
     L^a_g and L^b_g. Contrast with ``Afqmc(mf); af.walker_kind = "unrestricted"``, which
     uses unrestricted *walkers* against a hamiltonian built in the alpha MO basis alone.
 
-        af = AfqmcUh(mf)                       # mf a pyscf UHF, or rhf.to_uhf()
+        af = AfqmcUh(mf)                       # mf a pyscf UHF, or rhf.to_uhf(): UHF trial
+        af = AfqmcUh(mycc)                     # mycc a pyscf UCCSD: CC-derived UCISD trial
         mean, err = af.kernel()
 
     Two independently chosen orbital sets, which may differ in size (their leading
@@ -930,12 +931,13 @@ class AfqmcUh(Afqmc):
     Parameters
     ----------
     mf_or_cc : Any
-        pyscf UHF mean field. (Correlated trials on the uchol hamiltonian are not wired
-        yet; the trial is the UHF determinant.)
+        pyscf UHF mean field (trial: the UHF determinant) or UCCSD object (trial: the
+        UCISD built from the CC amplitudes, each spin in its own MO basis).
     basis_a, basis_b : NDArray, optional
-        Orbital bases for the two spins. Default to the UHF alpha and beta coefficients.
+        Orbital bases for the two spins. Default to the object's alpha and beta MOs.
     norb_frozen_core : int | (int, int), optional
-        Frozen core orbitals, the same number for both spins or a pair (n_a, n_b).
+        Frozen core orbitals, the same number for both spins or a pair (n_a, n_b). For a
+        UCCSD object it is cc.frozen and need not be given.
     The remaining parameters are those of ``Afqmc``. Only unrestricted walkers are
     supported; ``walker_kind`` is fixed to "unrestricted".
     """
@@ -973,7 +975,8 @@ class AfqmcUh(Afqmc):
                     "norb_frozen_core and norb_frozen must match when both are passed."
                 )
         frozen = norb_frozen_core if norb_frozen_core is not None else norb_frozen
-        frozen_uh = normalize_frozen_core_uh(frozen)
+        # None stays None: for a CC object the core is cc.frozen, resolved at staging
+        frozen_uh = None if frozen is None else normalize_frozen_core_uh(frozen)
 
         # the base class resolves an integer core only; the per spin pair is kept here
         super().__init__(
@@ -1020,7 +1023,7 @@ class AfqmcUh(Afqmc):
 
         staged = stage_inputs_uh(
             self._obj,
-            norb_frozen_core=self.norb_frozen_core,
+            norb_frozen_core=cast(Any, self.norb_frozen_core),
             chol_cut=self.chol_cut,
             basis_a=self.basis_a,
             basis_b=self.basis_b,
@@ -1029,7 +1032,11 @@ class AfqmcUh(Afqmc):
             verbose=self.verbose,
         )
         self._staged = staged
-        self._cache_key = key
+        # the resolved per spin core (from cc.frozen for a CC object)
+        frozen_pair: Any = staged.ham.frozen  # StagedInputs.ham is typed as the restricted HamInput
+        self.norb_frozen_core = (int(frozen_pair[0]), int(frozen_pair[1]))
+        self.norb_frozen = self.norb_frozen_core
+        self._cache_key = self._key()
         self._job = None
         return staged
 

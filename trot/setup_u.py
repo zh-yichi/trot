@@ -102,9 +102,19 @@ def _make_trial_bundle_uh(
         _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind} (uchol)")
         return trial_data, trial_ops, meas_ops
 
+    if kind == "ucisd":
+        from .meas.ucisd_uh import make_ucisd_meas_ops_uh
+        from .trial.ucisd_uh import make_ucisd_trial_data_uh, make_ucisd_trial_ops_uh
+
+        trial_data = make_ucisd_trial_data_uh(tr.data, sys)
+        trial_ops = make_ucisd_trial_ops_uh(sys)
+        meas_ops = make_ucisd_meas_ops_uh(sys, mixed_precision=mixed_precision)
+        _setup_end(t_bundle, "trial bundle ready", details=f"kind={kind} (uchol)")
+        return trial_data, trial_ops, meas_ops
+
     raise ValueError(
         f"Unsupported TrialInput.kind for the unrestricted hamiltonian: {tr.kind!r} "
-        "(only 'uhf' is wired so far)."
+        "(wired so far: 'uhf', 'ucisd')."
     )
 
 
@@ -180,8 +190,9 @@ def setup_uh(
 ) -> Job:
     """
     Assemble a runnable AFQMC Job on the unrestricted hamiltonian from a pyscf UHF (or
-    RHF converted with to_uhf) object, a StagedInputs carrying a HamInputU, or a path to
-    a file written by staging_u.dump_uh.
+    RHF converted with to_uhf) object with the UHF trial, a UCCSD object with the
+    CC-derived UCISD trial, a StagedInputs carrying a HamInputU, or a path to a file
+    written by staging_u.dump_uh.
 
         job = setup_uh(mf)
         job.kernel()

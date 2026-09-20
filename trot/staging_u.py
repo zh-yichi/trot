@@ -7,8 +7,11 @@ trial half through staging's own functions, and carries the result in a StagedIn
 whose ham slot holds the HamInputU.
 
     HamInputU          the unrestricted inputs, each spin in its own basis
-    build_ham_uchol    HamInputU from a pyscf mean field (UHF, or an RHF via to_uhf)
-    stage_uh           StagedInputs (HamInputU + TrialInput + meta), with optional cache
+    build_ham_uchol    HamInputU from a pyscf UHF mean field (or an RHF via to_uhf), or
+                       from a UCCSD object (bases = the CC orbitals, core = cc.frozen)
+    stage_uh           StagedInputs (HamInputU + TrialInput + meta), with optional cache;
+                       the trial is the UHF determinant for a mean field and the
+                       CC-derived UCISD for a UCCSD object
     dump_uh / load_uh  the h5 layout, ham/{h1_a,h1_b,chol_a,chol_b} with basis "uchol"
     is_uchol_file      whether a staged file was written by dump_uh
 """
@@ -37,8 +40,10 @@ from .staging import (
     StagedMfOrCc,
     TrialInput,
     _freeze_from_meta_value,
+    _is_cc_like,
     _stage_begin,
     _stage_end,
+    _stage_trial_input,
     _to_json_str,
 )
 
@@ -91,6 +96,38 @@ def _uhf_bases(staged: StagedMfOrCc) -> tuple[NDArray, NDArray]:
     return np.asarray(mo[0]), np.asarray(mo[1])
 
 
+def _staged_obj_uh(obj: Any, norb_frozen_core: Any) -> tuple[StagedMfOrCc, Tuple[int, int]]:
+    """
+    The validated pyscf object and the per spin frozen core.
+
+    For a CC object the core is cc.frozen (an int, the same for both spins, as pyscf's
+    UCCSD amplitudes require); norb_frozen_core may repeat it but not contradict it. For a
+    mean field it is norb_frozen_core, an int or a pair.
+    """
+    if _is_cc_like(obj):
+        cc_frozen = getattr(obj, "frozen", None)
+        if cc_frozen is not None and not isinstance(cc_frozen, (int, np.integer)):
+            raise NotImplementedError(
+                "list-valued cc.frozen is not supported on the unrestricted hamiltonian; "
+                "freeze an integer core in the UCCSD."
+            )
+        cc_core = int(cc_frozen or 0)
+        n_core = normalize_frozen_core_uh(norb_frozen_core)
+        if norb_frozen_core is not None and n_core != (cc_core, cc_core):
+            raise ValueError(
+                f"norb_frozen_core={n_core} contradicts cc.frozen={cc_core}; the trial "
+                "amplitudes fix the frozen core of a CC object."
+            )
+        n_core = (cc_core, cc_core)
+        # StagedCc checks the count against cc.frozen and copies the CC orbitals onto mf
+        return StagedMfOrCc(obj, cc_core), n_core
+
+    n_core = normalize_frozen_core_uh(norb_frozen_core)
+    # StagedMf validates the object; an int core keeps its checks, a pair is validated
+    # against each spin by the frozen core routine
+    return StagedMfOrCc(obj, max(n_core) if n_core[0] != n_core[1] else n_core[0]), n_core
+
+
 def build_ham_uchol(
     obj: Any,
     *,
@@ -101,7 +138,7 @@ def build_ham_uchol(
     verbose: bool = False,
 ) -> HamInputU:
     """
-    Build an unrestricted cholesky hamiltonian from a pyscf UHF (or CC) object.
+    Build an unrestricted cholesky hamiltonian from a pyscf UHF (or UCCSD) object.
 
     The AO ERIs are cholesky decomposed once (staging's chunked_cholesky, with the same
     cutoff semantics as the restricted hamiltonian) and the vectors are projected into
@@ -115,14 +152,12 @@ def build_ham_uchol(
     explicitly to use two independently chosen orbital sets, which may differ in size;
     the leading columns of each must be that spin's occupied orbitals.
 
-    norb_frozen_core is an int (same core for both spins) or a pair (n_a, n_b). The core
-    energy and potential are built from the projected cholesky vectors, as staging does
-    for the restricted hamiltonian (cholesky_u.freeze_core_from_mo_cholesky_uh).
+    norb_frozen_core is an int (same core for both spins) or a pair (n_a, n_b); for a
+    CC object it is cc.frozen. The core energy and potential are built from the
+    projected cholesky vectors, as staging does for the restricted hamiltonian
+    (cholesky_u.freeze_core_from_mo_cholesky_uh).
     """
-    n_core = normalize_frozen_core_uh(norb_frozen_core)
-    # StagedMfOrCc validates the object; an int core keeps its checks, a pair is
-    # validated below against each spin
-    staged = StagedMfOrCc(obj, max(n_core) if n_core[0] != n_core[1] else n_core[0])
+    staged, n_core = _staged_obj_uh(obj, norb_frozen_core)
     mf = staged.mf.mf
     mol = mf.mol
 
@@ -189,6 +224,29 @@ def build_ham_uchol(
     )
 
 
+def _trial_input_uh(staged: StagedMfOrCc, ham: HamInputU) -> TrialInput:
+    """
+    The trial for the uchol layout: the UCISD built from the CC amplitudes of a UCCSD
+    object (staging._stage_ucisd_input; its coefficients are already in each spin's own
+    MO basis, and the rotations it also stages are ignored by the uchol trial), or the
+    UHF determinant of a mean field.
+    """
+    if staged.source == "cc":
+        if staged.kind != "uccsd":
+            raise ValueError(
+                f"the unrestricted hamiltonian takes a UCCSD object, got kind {staged.kind!r}; "
+                "convert a restricted CCSD with pyscf.cc.addons.convert_to_uccsd."
+            )
+        tin = _stage_trial_input(staged)
+        return TrialInput(
+            kind=tin.kind,
+            data=tin.data,
+            frozen=np.asarray(ham.frozen, dtype=np.int64),
+            source_kind=tin.source_kind,
+        )
+    return _uhf_trial_input(ham)
+
+
 def _uhf_trial_input(ham: HamInputU) -> TrialInput:
     """
     The UHF trial in the uchol layout: each spin's reference determinant is the leading
@@ -219,7 +277,8 @@ def stage_uh(
     verbose: bool = False,
 ) -> StagedInputs:
     """
-    Stage the unrestricted hamiltonian and the UHF trial from a pyscf mean field.
+    Stage the unrestricted hamiltonian and the trial: the UHF determinant from a pyscf
+    mean field, the CC-derived UCISD from a UCCSD object.
 
     Mirrors staging.stage for the uchol layout. The returned StagedInputs carries a
     HamInputU in its ham slot (StagedInputs.ham is typed as the restricted HamInput).
@@ -242,11 +301,12 @@ def stage_uh(
     )
     _stage_end(t_ham, "Hamiltonian ready", details=f"norb={ham.norb} nchol={ham.nchol}")
 
+    staged_obj, _ = _staged_obj_uh(obj, norb_frozen_core)
     t_trial = _stage_begin("building trial input")
-    trial = _uhf_trial_input(ham)
+    trial = _trial_input_uh(staged_obj, ham)
     _stage_end(t_trial, "trial input ready", details=f"kind={trial.kind}")
 
-    mol = StagedMfOrCc(obj, 0).mol
+    mol = staged_obj.mol
     meta: Dict[str, Any] = {
         "format_version": STAGE_FORMAT_VERSION,
         "timestamp_unix": time.time(),
