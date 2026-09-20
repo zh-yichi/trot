@@ -11,7 +11,8 @@ orbital dimensions are per spin. See trot/ham/chol_u.py.
     normalize_frozen_core_uh       (n_core_a, n_core_b) from an int or a pair
     freeze_core_from_mo_cholesky_uh
                                    unrestricted frozen core from the MO cholesky vectors
-    equal_chunks, chunk_rot_chol   fixed shape chunking of a cholesky axis for lax.scan
+    equal_chunks, max_equal_chunk_pad, chunk_rot_chol
+                                   fixed shape chunking of a cholesky axis for lax.scan
 """
 
 from __future__ import annotations
@@ -209,6 +210,18 @@ def equal_chunks(n: int, max_chunk: int) -> tuple[int, int, int]:
     n_chunks = -(-n // max_chunk)
     chunk = -(-n // n_chunks)
     return (n_chunks, chunk, n_chunks * chunk - n)
+
+
+def max_equal_chunk_pad(n: int) -> int:
+    """
+    The largest zero padding equal_chunks can leave for n items over every possible
+    chunk cap, about sqrt(n). Memory models use it to bound the padded copy a kernel
+    builds whatever chunk size is later chosen.
+    """
+    n = int(n)
+    if n <= 0:
+        return 0
+    return max(equal_chunks(n, cap)[2] for cap in range(1, n + 1))
 
 
 def chunk_rot_chol(rot_chol: jax.Array, nchol_chunk: int | None) -> jax.Array:

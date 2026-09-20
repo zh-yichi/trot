@@ -11,7 +11,9 @@ whose ham slot holds the HamInputU.
                        from a UCCSD object (bases = the CC orbitals, core = cc.frozen)
     stage_uh           StagedInputs (HamInputU + TrialInput + meta), with optional cache;
                        the trial is the UHF determinant for a mean field and the
-                       CC-derived UCISD for a UCCSD object
+                       CC-derived UCISD for a UCCSD object (trial_kind picks one)
+    stage_upt2ccsd_trial_uh
+                       the unrestricted pt2CCSD trial of a UCCSD object, for the mixed runs
     dump_uh / load_uh  the h5 layout, ham/{h1_a,h1_b,chol_a,chol_b} with basis "uchol"
     is_uchol_file      whether a staged file was written by dump_uh
 """
@@ -224,14 +226,21 @@ def build_ham_uchol(
     )
 
 
-def _trial_input_uh(staged: StagedMfOrCc, ham: HamInputU) -> TrialInput:
+def _trial_input_uh(
+    staged: StagedMfOrCc, ham: HamInputU, trial_kind: str | None = None
+) -> TrialInput:
     """
     The trial for the uchol layout: the UCISD built from the CC amplitudes of a UCCSD
     object (staging._stage_ucisd_input; its coefficients are already in each spin's own
     MO basis, and the rotations it also stages are ignored by the uchol trial), or the
-    UHF determinant of a mean field.
+    UHF determinant of a mean field. trial_kind="uhf" asks for the determinant even from
+    a CC object (a mixed run with the UHF guide); "ucisd" needs a CC object.
     """
-    if staged.source == "cc":
+    if trial_kind is not None and trial_kind not in ("uhf", "ucisd"):
+        raise ValueError(f"trial_kind must be 'uhf' or 'ucisd', got {trial_kind!r}")
+    if trial_kind == "ucisd" and staged.source != "cc":
+        raise ValueError("the UCISD trial needs a UCCSD object.")
+    if staged.source == "cc" and trial_kind != "uhf":
         if staged.kind != "uccsd":
             raise ValueError(
                 f"the unrestricted hamiltonian takes a UCCSD object, got kind {staged.kind!r}; "
@@ -275,10 +284,12 @@ def stage_uh(
     cache: Union[str, Path] | None = None,
     overwrite: bool = False,
     verbose: bool = False,
+    trial_kind: str | None = None,
 ) -> StagedInputs:
     """
     Stage the unrestricted hamiltonian and the trial: the UHF determinant from a pyscf
-    mean field, the CC-derived UCISD from a UCCSD object.
+    mean field, the CC-derived UCISD from a UCCSD object (or its UHF determinant with
+    trial_kind="uhf").
 
     Mirrors staging.stage for the uchol layout. The returned StagedInputs carries a
     HamInputU in its ham slot (StagedInputs.ham is typed as the restricted HamInput).
@@ -303,7 +314,7 @@ def stage_uh(
 
     staged_obj, _ = _staged_obj_uh(obj, norb_frozen_core)
     t_trial = _stage_begin("building trial input")
-    trial = _trial_input_uh(staged_obj, ham)
+    trial = _trial_input_uh(staged_obj, ham, trial_kind)
     _stage_end(t_trial, "trial input ready", details=f"kind={trial.kind}")
 
     mol = staged_obj.mol
@@ -332,6 +343,54 @@ def stage_uh(
         print(f"[stage] done in {time.time() - t0:.2f}s | norb={ham.norb} nchol={ham.nchol}")
 
     return staged
+
+
+def _thouless(t1: NDArray) -> NDArray:
+    # |psi'> = exp(t1_ia a+_a a_i)|psi>, |psi> the leading nocc orbitals; the generator is
+    # nilpotent so exp(X) = 1 + X exactly. Returns the mo_coeff of psi' in the MO basis.
+    nocc, nvir = t1.shape
+    exp_t1 = np.eye(nocc + nvir, dtype=np.float64)
+    exp_t1[:nocc, nocc:] = t1
+    return exp_t1.T[:, :nocc]
+
+
+def stage_upt2ccsd_trial_uh(cc: Any, *, frozen: Any = None) -> TrialInput:
+    """
+    The unrestricted pt2CCSD trial of a pyscf UCCSD object, for the uchol layout.
+
+    Each spin is expressed in its own MO basis, the basis build_ham_uchol builds that
+    spin's hamiltonian in, so its reference occupies the leading nocc orbitals. Returns a
+    TrialInput of kind "upt2ccsd" with data {"mo_t_a", "mo_t_b", "t2aa", "t2ab", "t2bb"}:
+    mo_t_s is the Thouless reference exp(T1_s)|HF_s>, and the doubles are (i, a, j, b)
+    with the same spin blocks antisymmetrized. frozen may repeat cc.frozen; the core is
+    always the CC object's.
+    """
+    staged, n_core = _staged_obj_uh(cc, frozen)
+    if staged.kind != "uccsd":
+        raise ValueError(
+            f"the unrestricted pt2CCSD trial needs a UCCSD object, got kind {staged.kind!r}; "
+            "convert a restricted CCSD with pyscf.cc.addons.convert_to_uccsd."
+        )
+    t1a, t1b = (np.asarray(t, dtype=np.float64) for t in staged.t1)
+    t2aa, t2ab, t2bb = (np.asarray(t, dtype=np.float64) for t in staged.t2)
+
+    # antisymmetrize the same spin blocks (a no-op on pyscf's, which already are), then
+    # (i,j,a,b) -> (i,a,j,b)
+    t2aa = 0.5 * (t2aa - t2aa.transpose(0, 1, 3, 2))
+    t2bb = 0.5 * (t2bb - t2bb.transpose(0, 1, 3, 2))
+    data = {
+        "mo_t_a": _thouless(t1a),
+        "mo_t_b": _thouless(t1b),
+        "t2aa": t2aa.transpose(0, 2, 1, 3),
+        "t2ab": t2ab.transpose(0, 2, 1, 3),
+        "t2bb": t2bb.transpose(0, 2, 1, 3),
+    }
+    return TrialInput(
+        kind="upt2ccsd",
+        data=data,
+        frozen=np.asarray(n_core, dtype=np.int64),
+        source_kind="cc",
+    )
 
 
 # ======================================================================================

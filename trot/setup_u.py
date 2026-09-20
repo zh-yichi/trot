@@ -187,6 +187,7 @@ def setup_uh(
     # extra kwargs
     params_kwargs: dict[str, Any] | None = None,
     prop_kwargs: dict[str, Any] | None = None,
+    job_cls: type[Job] = Job,
 ) -> Job:
     """
     Assemble a runnable AFQMC Job on the unrestricted hamiltonian from a pyscf UHF (or
@@ -246,7 +247,7 @@ def setup_uh(
     if block_fn is None:
         block_fn = default_block
 
-    return Job(
+    return job_cls(
         staged=staged,
         sys=sys,  # type: ignore[arg-type]
         params=qmc_params,
