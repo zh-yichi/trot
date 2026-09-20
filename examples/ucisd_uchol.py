@@ -1,6 +1,6 @@
 from pyscf import cc, gto, scf
 
-from trot.afqmc import AfqmcUh, Afqmc
+from trot.afqmc import AfqmcUh
 
 # AFQMC with an unrestricted hamiltonian and the UCISD trial built from UCCSD amplitudes.
 # Alpha and beta each keep their own MO basis, so the CC amplitudes are used exactly in
