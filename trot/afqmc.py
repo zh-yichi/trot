@@ -1415,6 +1415,16 @@ class AfqmcMixed(Afqmc):
         self._job = job
         return job
 
+    def _frozen_core_label(self, meta: dict) -> Any:
+        """
+        What dump_flags prints as nfrozen: the frozen core count, an int for the
+        restricted hamiltonian and a per spin pair for the unrestricted one. Subclasses
+        whose staged meta carries something else (LnoFragMixed: the frozen LNO indices)
+        override this.
+        """
+        frozen = meta.get("frozen")
+        return tuple(int(n) for n in frozen) if isinstance(frozen, (list, tuple)) else frozen
+
     def dump_flags(self, job: Job) -> None:  # type: ignore[override]
         """Both wavefunctions are listed, each with the kernels it measures with."""
         from .core.ops import k_energy, k_force_bias
@@ -1423,9 +1433,7 @@ class AfqmcMixed(Afqmc):
         meta = job.staged.meta
         sys = job.sys
 
-        # an int for the restricted hamiltonian, a per spin pair for the unrestricted one
-        frozen = meta.get("frozen")
-        nfrozen = tuple(int(n) for n in frozen) if isinstance(frozen, (list, tuple)) else frozen
+        nfrozen = self._frozen_core_label(meta)
 
         print("\n******** AFQMC ********")
         print(f" nfrozen         = {nfrozen}")
