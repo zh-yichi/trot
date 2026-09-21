@@ -30,21 +30,25 @@ import h5py
 import numpy as np
 from numpy.typing import NDArray
 
-from .cholesky_u import (
+from .cholesky import (
     ao_cholesky,
+    df_cderi,
     freeze_core_from_mo_cholesky_uh,
     normalize_frozen_core_uh,
     rotate_chol_to_mo,
 )
 from .staging import (
     STAGE_FORMAT_VERSION,
+    HamInput,
     StagedInputs,
     StagedMfOrCc,
     TrialInput,
+    _freeze_core_from_mo_cholesky,
     _freeze_from_meta_value,
     _is_cc_like,
     _stage_begin,
     _stage_end,
+    _stage_ham_input,
     _stage_trial_input,
     _to_json_str,
 )
@@ -142,9 +146,10 @@ def build_ham_uchol(
     """
     Build an unrestricted cholesky hamiltonian from a pyscf UHF (or UCCSD) object.
 
-    The AO ERIs are cholesky decomposed once (staging's chunked_cholesky, with the same
-    cutoff semantics as the restricted hamiltonian) and the vectors are projected into
-    the alpha and beta bases,
+    The AO two-electron integrals are cholesky decomposed once (cholesky.ao_cholesky:
+    from the DF tensor of a density fitted mean field, otherwise staging's
+    chunked_cholesky of the exact ERIs, with the same cutoff semantics as the restricted
+    hamiltonian) and the vectors are projected into the alpha and beta bases,
 
         L^s_g = C_s^dag L_g C_s,     h1^s = C_s^dag hcore C_s,
 
@@ -157,7 +162,7 @@ def build_ham_uchol(
     norb_frozen_core is an int (same core for both spins) or a pair (n_a, n_b); for a
     CC object it is cc.frozen. The core energy and potential are built from the
     projected cholesky vectors, as staging does for the restricted hamiltonian
-    (cholesky_u.freeze_core_from_mo_cholesky_uh).
+    (cholesky.freeze_core_from_mo_cholesky_uh).
     """
     staged, n_core = _staged_obj_uh(obj, norb_frozen_core)
     mf = staged.mf.mf
@@ -177,7 +182,7 @@ def build_ham_uchol(
 
     h0 = float(mf.energy_nuc())
     hcore = np.asarray(mf.get_hcore())
-    chol_ao = ao_cholesky(mol, chol_cut=chol_cut, verbose=verbose)
+    chol_ao = ao_cholesky(mf, chol_cut=chol_cut, verbose=verbose)
 
     t_proj = time.time()
     h1_a = np.asarray(basis_a.conj().T @ hcore @ basis_a)
@@ -223,6 +228,55 @@ def build_ham_uchol(
         frozen=n_core,
         source_kind=staged.source,
         basis="uchol",
+    )
+
+
+def stage_ham_input_df(obj: Any, *, chol_cut: float = 1e-5, verbose: bool = False) -> HamInput:
+    """
+    staging._stage_ham_input with the AO cholesky vectors of cholesky.ao_cholesky: from
+    the DF tensor when the mean field is density fitted, else the same modified cholesky
+    of the exact ERIs (then this simply defers to staging's own builder). obj is a pyscf
+    mf/cc object or a StagedMfOrCc; the frozen core is its afqmc_frozen. Hand the result
+    to staging.stage(..., ham=) to get the restricted hamiltonian of a DF mean field on
+    the same footing as the mean field, as AfqmcMixed does.
+    """
+    staged = obj if isinstance(obj, StagedMfOrCc) else StagedMfOrCc(obj, None)
+    scf_obj = staged.mf
+    mf = scf_obj.mf
+    if df_cderi(mf) is None:
+        return _stage_ham_input(staged, chol_cut=chol_cut, verbose=verbose)
+    if scf_obj.kind == "ghf":
+        raise NotImplementedError("DF cholesky staging is not wired for GHF objects.")
+
+    mol = staged.mol
+    basis_coeff = np.asarray(scf_obj.mo_coeff[0] if scf_obj.kind == "uhf" else scf_obj.mo_coeff)
+    h0 = float(scf_obj.energy_nuc())
+    h1 = np.asarray(basis_coeff.T.conj() @ scf_obj.get_hcore() @ basis_coeff)
+    chol_vec = ao_cholesky(mf, chol_cut=chol_cut, verbose=verbose)
+    chol = rotate_chol_to_mo(chol_vec, basis_coeff)
+    norb = int(basis_coeff.shape[1])
+
+    nelec: Tuple[int, int] = (int(mol.nelec[0]), int(mol.nelec[1]))
+    norb_frozen = scf_obj.afqmc_frozen
+    if not isinstance(norb_frozen, (int, np.integer)):
+        raise ValueError("stage_ham_input_df takes an integer frozen core count.")
+    norb_frozen = int(norb_frozen)
+    if norb_frozen > 0:
+        h0, h1, chol, nelec = _freeze_core_from_mo_cholesky(
+            h0=h0, h1=h1, chol=chol, norb_frozen=norb_frozen, nelec=nelec
+        )
+        norb = norb - norb_frozen
+
+    return HamInput(
+        h0=h0,
+        h1=np.asarray(h1),
+        chol=np.asarray(chol),
+        nelec=nelec,
+        norb=norb,
+        chol_cut=float(chol_cut),
+        frozen=norb_frozen,
+        source_kind=staged.source,
+        basis="restricted",
     )
 
 

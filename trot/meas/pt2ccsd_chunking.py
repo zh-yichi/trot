@@ -15,7 +15,7 @@ holds what decides that size:
     device_memory_budget_bytes
                               a budget from the device allocator limit, when it reports one
 
-The chunk is chosen against a budget with minimal zero padding (cholesky_u.equal_chunks).
+The chunk is chosen against a budget with minimal zero padding (cholesky.equal_chunks).
 Only when a single cholesky vector per step still does not fit are the walkers chunked,
 and the cholesky chunk is then chosen again against the smaller walker count. The walker
 chunk count the plan settles on is a floor: the driver's automatic walker chunking may
@@ -30,7 +30,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from ..cholesky_u import equal_chunks, max_equal_chunk_pad
+from ..cholesky import equal_chunks, max_equal_chunk_pad
 
 # cholesky vectors per scan step when neither a budget nor a chunk size is given
 DEFAULT_NCHOL_CHUNK = 100

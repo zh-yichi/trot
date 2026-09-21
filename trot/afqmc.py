@@ -965,7 +965,7 @@ class AfqmcUh(Afqmc):
         error_method: Literal["gamma", "blocking"] | None = None,
         cisd_workflow: CisdWorkflowConfig | None = None,
     ):
-        from .cholesky_u import normalize_frozen_core_uh
+        from .cholesky import normalize_frozen_core_uh
 
         if cisd_workflow is not None:
             raise ValueError("cisd_workflow is not supported on the unrestricted hamiltonian.")
@@ -1079,6 +1079,8 @@ import math  # noqa: E402
 
 from .mixed import MixedRecipe, get_mixed_recipe  # noqa: E402
 from .setup_mixed import JobMixed, setup_mixed  # noqa: E402
+from .staging import StagedMfOrCc  # noqa: E402
+from .staging_u import stage_ham_input_df  # noqa: E402
 
 
 def _kernel_location(fn: Any) -> str:
@@ -1313,8 +1315,11 @@ class AfqmcMixed(Afqmc):
         The guide is staged by the branch's ordinary staging from the object the guide
         spec picks (the mean field for the HF guides, the CC object for the CISD ones), so
         its data, ops and propagator are exactly those of a plain run with that
-        wavefunction; on the unrestricted hamiltonian by staging_u.stage_uh. The trial is
-        staged by its own spec. Both get the CC object's frozen core.
+        wavefunction; on the unrestricted hamiltonian by staging_u.stage_uh. The cholesky
+        vectors of the hamiltonian come from the density fitting tensor when the mean
+        field is density fitted (cholesky.ao_cholesky), else from the exact AO ERIs as
+        staging does. The trial is staged by its own spec. Both get the CC object's
+        frozen core.
         """
         key = self._key()
         if self._staged is not None and self._cache_key == key and not force:
@@ -1336,13 +1341,27 @@ class AfqmcMixed(Afqmc):
                 trial_kind=self.guide,
             )
         else:
+            guide_src = guide_spec.source_obj(self._obj)
+            # the cholesky vectors come from the DF tensor when the mean field is density
+            # fitted (staging_u.stage_ham_input_df); otherwise this is staging's own builder
+            cache_hit = self.cache is not None and self.cache.exists() and not self.overwrite_cache
+            ham = (
+                None
+                if cache_hit
+                else stage_ham_input_df(
+                    StagedMfOrCc(guide_src, norb_frozen),
+                    chol_cut=self.chol_cut,
+                    verbose=self.verbose,
+                )
+            )
             staged = stage_inputs(
-                guide_spec.source_obj(self._obj),
+                guide_src,
                 norb_frozen_core=norb_frozen,
                 chol_cut=self.chol_cut,
                 cache=self.cache,
                 overwrite=self.overwrite_cache if self.cache is not None else False,
                 verbose=self.verbose,
+                ham=ham,
             )
         if staged.trial.kind not in guide_spec.kinds:
             raise ValueError(

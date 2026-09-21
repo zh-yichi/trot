@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from ..cholesky_u import chunk_rot_chol
+from ..cholesky import chunk_rot_chol
 from ..core.ops import MeasOps, k_energy, k_force_bias
 from ..ham.chol_u import HamCholU
 from ..trial.uhf import UhfTrial, overlap_u
