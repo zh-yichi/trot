@@ -276,6 +276,11 @@ class LnoFragMixed(AfqmcMixed):
 
     # ------------------------------------------------------------------ run
 
+    def _frozen_core_label(self, meta: dict) -> Any:
+        # the staged meta carries the frozen LNO indices (occupied and virtual); the
+        # AFQMC banner's nfrozen is the frozen core count, an int or a per spin pair
+        return self.frag.nfrzocc
+
     def dump_flags(self, job: JobMixed) -> None:
         frag = self.frag
         print(f"\n******** LNO fragment {frag.frag_idx + 1} [{frag.frag_name}] ********")

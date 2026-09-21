@@ -171,6 +171,26 @@ def test_fragment_hamiltonian_reproduces_hf_energy(frag0, o2):
     assert ham.norb == 8 and ham.nelec == (6, 6)
 
 
+def test_restricted_core_matches_unrestricted_route(o2):
+    """The restricted effective core (2J - K) is the unrestricted one at D^a = D^b = D."""
+    mf, frag = o2["mf"], o2["frags"][0]
+    ncore, _, ncas, actfrag = li.get_las_idx(mf, frag.lno_frozen)
+    assert ncore > 0
+    core = np.asarray(frag.lno_coeff)[:, :ncore]
+    act = np.asarray(frag.lno_coeff)[:, actfrag]
+    e_r, h1_r = li.lno_effective_core_r(mf, core, act)
+    e_u, (h1_a, h1_b) = li.lno_effective_core_u(mf, (core, core), (act, act))
+    assert abs(e_r - e_u) < 1e-10
+    assert np.abs(h1_r - h1_a).max() < 1e-12 and np.abs(h1_r - h1_b).max() < 1e-12
+    assert h1_r.shape == (ncas, ncas)
+    e_d, h1_d = li.lno_effective_core(mf, core, act)
+    assert e_d == e_r and np.array_equal(h1_d, h1_r)
+    # the DF J and K on the device agree with pyscf's DF get_jk
+    dm = core @ core.T
+    vj, vk = mf.get_jk(mf.mol, dm, hermi=1)
+    assert np.abs(li.core_rveff(mf, dm) - (2 * vj - vk)).max() < 1e-9
+
+
 def test_las_ordering_is_asserted(o2):
     with pytest.raises(ValueError):
         li.get_las_idx(o2["mf"], np.array([0, 3]))

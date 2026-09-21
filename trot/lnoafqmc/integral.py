@@ -21,7 +21,7 @@ print = partial(print, flush=True)
 #
 #   1. the effective core energy and one-electron integrals come from the frozen
 #      occupied LNOs, with J and K built from the DF tensor on the device
-#      (afqmc h1e_ras / h1e_uas, here lno_effective_core);
+#      (afqmc h1e_ras / h1e_uas, here lno_effective_core_r / lno_effective_core_u);
 #   2. the cholesky vectors of the local active space are compressed straight from the
 #      whole system's DF 3-index tensor mf.with_df, rotated into the active space one aux
 #      block at a time (cderi2mo) and then decomposed there: a pivoted modified cholesky
@@ -84,6 +84,43 @@ def _require_df_x64(mf: Any) -> None:
 
 
 @jax.jit
+def _rjk_from_cderi(cderi: jax.Array, dm: jax.Array):
+    """J[D], K[D] from one (naux, nao, nao) block of DF vectors, restricted."""
+    cderi_dm = jnp.einsum("gik,kj->gij", cderi, dm)
+    vj = jnp.einsum("gkk,gij->ij", cderi_dm, cderi)
+    vk = jnp.einsum("gik,gkj->ij", cderi_dm, cderi)
+    return vj, vk
+
+
+def core_rveff(mf: Any, dm: NDArray) -> NDArray:
+    """
+    V = 2 J[D] - K[D] for a restricted core density, in the AO basis (afqmc's
+    get_rveff_df / get_rveff).
+
+    A density fitted mf is contracted block by block on the device, which is much faster
+    than pyscf's DF get_jk; otherwise this is mf.get_jk with the exact ERIs. Without
+    jax_enable_x64 the device path would be single precision, so it falls back to
+    mf.get_jk (still density fitted) there too.
+    """
+    with_df = getattr(mf, "with_df", None)
+    if with_df is None or not jax.config.read("jax_enable_x64"):
+        vj, vk = mf.get_jk(mf.mol, np.asarray(dm), hermi=1)
+        return 2.0 * vj - vk
+
+    from pyscf import lib
+
+    dm_j = jnp.asarray(dm)
+    vj = jnp.zeros_like(dm_j)
+    vk = jnp.zeros_like(dm_j)
+    for cderi in with_df.loop():
+        cderi = jnp.asarray(lib.unpack_tril(cderi, axis=-1))
+        dvj, dvk = _rjk_from_cderi(cderi, dm_j)
+        vj += dvj
+        vk += dvk
+    return np.asarray(2.0 * vj - vk)
+
+
+@jax.jit
 def _ujk_from_cderi(cderi: jax.Array, dm_a: jax.Array, dm_b: jax.Array):
     """J[D^a + D^b], K[D^a], K[D^b] from one (naux, nao, nao) block of DF vectors."""
     dm_tot = dm_a + dm_b
@@ -123,49 +160,66 @@ def core_uveff(mf: Any, dm_a: NDArray, dm_b: NDArray) -> tuple[NDArray, NDArray]
     return np.asarray(vj - vk_a), np.asarray(vj - vk_b)
 
 
-def lno_effective_core(mf: Any, core: Any, act: Any) -> tuple[float, Any]:
+def lno_effective_core_r(mf: Any, core: Any, act: Any) -> tuple[float, NDArray]:
     """
-    E_core and h1eff of the fragment, exactly as afqmc's h1e_ras / h1e_uas.
+    E_core and h1eff of a restricted fragment, as afqmc's h1e_ras. core / act are the
+    frozen occupied and the active LNO coefficients (nao, ncore) / (nao, ncas). With
+    D = C_c C_c^T and V = 2 J[D] - K[D] (core_rveff, the DF tensor on the device):
 
-    core / act are the frozen occupied and the active LNO coefficients, (C_c, C_a) for a
-    restricted mf or ((C_c^a, C_c^b), (C_a^a, C_a^b)) for a UHF one. With
-    D^s = C_c^s C_c^s^T and V^s = J[D^a + D^b] - K[D^s] (core_uveff below, the
-    DF tensor on the device):
-
-        E_core = E_nuc + sum_s tr(D^s h) + 1/2 sum_s tr(D^s V^s)
-        h1eff^s = C_a^s^T (h + V^s) C_a^s
-
-    which for D^a = D^b = D is the restricted E_nuc + 2 tr(D h) + tr(D V), V = 2J - K.
+        E_core = E_nuc + 2 tr(D h) + tr(D V)
+        h1eff  = C_a^T (h + V) C_a
     """
     _require_df_x64(mf)
     hcore = np.asarray(mf.get_hcore())
     e_core = float(mf.energy_nuc())
-
-    if isinstance(mf, scf.uhf.UHF):
-        cores = [np.asarray(c) for c in core]
-        acts = [np.asarray(c) for c in act]
-        if cores[0].shape[1] == 0 and cores[1].shape[1] == 0:
-            veff = (0.0, 0.0)
-        else:
-            dms = [c @ c.conj().T for c in cores]
-            veff = core_uveff(mf, dms[0], dms[1])
-            for s in range(2):
-                e_core += float(np.einsum("ij,ji->", dms[s], hcore).real)
-                e_core += 0.5 * float(np.einsum("ij,ji->", dms[s], veff[s]).real)
-        h1eff = tuple(acts[s].conj().T @ (hcore + veff[s]) @ acts[s] for s in range(2))
-        return e_core, h1eff
-
     core = np.asarray(core)
     act = np.asarray(act)
+
     if core.shape[1] == 0:
-        veff = 0.0
+        veff = np.zeros_like(hcore)
     else:
         dm = core @ core.conj().T
-        veff = core_uveff(mf, dm, dm)[0]  # J[2D] - K[D]
+        veff = core_rveff(mf, dm)
         e_core += 2.0 * float(np.einsum("ij,ji->", dm, hcore).real)
         e_core += float(np.einsum("ij,ji->", dm, veff).real)
     h1eff = act.conj().T @ (hcore + veff) @ act
-    return e_core, h1eff
+    return e_core, np.asarray(h1eff)
+
+
+def lno_effective_core_u(mf: Any, core: Any, act: Any) -> tuple[float, tuple[NDArray, NDArray]]:
+    """
+    E_core and h1eff of an unrestricted fragment, as afqmc's h1e_uas. core / act are the
+    per spin pairs ((C_c^a, C_c^b), (C_a^a, C_a^b)). With D^s = C_c^s C_c^s^T and
+    V^s = J[D^a + D^b] - K[D^s] (core_uveff):
+
+        E_core  = E_nuc + sum_s tr(D^s h) + 1/2 sum_s tr(D^s V^s)
+        h1eff^s = C_a^s^T (h + V^s) C_a^s
+    """
+    _require_df_x64(mf)
+    hcore = np.asarray(mf.get_hcore())
+    e_core = float(mf.energy_nuc())
+    cores = [np.asarray(c) for c in core]
+    acts = [np.asarray(c) for c in act]
+
+    if cores[0].shape[1] == 0 and cores[1].shape[1] == 0:
+        veff = (np.zeros_like(hcore), np.zeros_like(hcore))
+    else:
+        dms = [c @ c.conj().T for c in cores]
+        veff = core_uveff(mf, dms[0], dms[1])
+        for s in range(2):
+            e_core += float(np.einsum("ij,ji->", dms[s], hcore).real)
+            e_core += 0.5 * float(np.einsum("ij,ji->", dms[s], veff[s]).real)
+    h1eff = tuple(np.asarray(acts[s].conj().T @ (hcore + veff[s]) @ acts[s]) for s in range(2))
+    return e_core, (h1eff[0], h1eff[1])
+
+
+def lno_effective_core(mf: Any, core: Any, act: Any) -> tuple[float, Any]:
+    """lno_effective_core_u for a UHF mean field, lno_effective_core_r for an RHF one."""
+    if isinstance(mf, scf.uhf.UHF):
+        return lno_effective_core_u(mf, core, act)
+    if isinstance(mf, scf.rhf.RHF):
+        return lno_effective_core_r(mf, core, act)
+    raise TypeError(f"unsupported mean-field type: {type(mf)}")
 
 
 # --------------------------------------------------------------------------- cholesky
