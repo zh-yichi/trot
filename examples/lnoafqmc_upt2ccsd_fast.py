@@ -42,15 +42,14 @@ lno = LnoAfqmcMixed(
     run_frag=[0],
     lno_thresh=1e-6,
     nfrozen=nfrozen,
-    trial="upt2ccsd",  # the default for a UHF mf; guide=None -> the UHF guide, or guide="ucisd"
+    trial="upt2ccsd_fast",  # the default for a UHF mf; guide=None -> the UHF guide, or guide="ucisd"
     target_error=1e-5,
     n_walkers=300,
     n_eql_blocks=80,
     n_blocks=400,
     dt=0.005,
     seed=27,
-    mixed_precision=False,
-    # frag_output="./fragment.out",
-    # lno_output="./lno_result_fast.out",
+    guide_mixed_precision=False,
+    trial_mixed_precision=True, # specify mixed precision separately
 )
 e_qmc, e_qmc_err = lno.kernel()

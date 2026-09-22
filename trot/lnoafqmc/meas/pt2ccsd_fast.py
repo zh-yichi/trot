@@ -202,21 +202,31 @@ def energy_kernel_rw_rh_fast(
     # ---- the one-body T2 intermediate t2g (nocc, nvir): the direct and exchange halves
     # of the bar kernel in one contraction each with t2x, the first index closed with gc,
     # the second factor of the projector applied after the contraction over (j, b)
-    t2g = 0.5 * jnp.einsum("Ia,Iajb->jb", gc, t2x, optimize="optimal")
+    # Precision policy: everything that carries T2 (t2g and what is built from it, the
+    # T2 contractions in the scan) runs in the mixed dtypes of the cfg; the greens
+    # function pieces, e0 and the projected e0frg stay in double. The casts of the
+    # constant tensors are done once, outside the scan.
+    t2x_r = t2x.astype(rtype)
+    uc_c = uc.astype(ctype)
+    gf_c = gf.astype(ctype)
+    t2g = 0.5 * jnp.einsum("Ia,Iajb->jb", gc.astype(ctype), t2x_r, optimize="optimal")
     t2g = t2g + 0.5 * jnp.einsum(
-        "kI,Ia->ka", uc, jnp.einsum("Iajb,jb->Ia", t2x, gf, optimize="optimal"), optimize="optimal"
-    )
-    gt2g = jnp.einsum("ia,ia->", t2g, gf, optimize="optimal")
-    t2_green = greenp @ t2g.T @ green  # (norb, norb), for the one-body term only
-    e1_2 = 2 * hg * gt2g - 2 * jnp.einsum("pq,pq->", h1, t2_green, optimize="optimal")
+        "kI,Ia->ka",
+        uc_c,
+        jnp.einsum("Iajb,jb->Ia", t2x_r, gf_c, optimize="optimal"),
+        optimize="optimal",
+    )  # ctype
+    gt2g = jnp.einsum("ia,ia->", t2g, gf_c, optimize="optimal").astype(c128)
+    # (norb, norb), for the one-body term only
+    t2_green = greenp.astype(ctype) @ t2g.T @ green.astype(ctype)
+    e1_2 = 2 * hg * gt2g - 2 * jnp.einsum(
+        "pq,pq->", h1.astype(rtype), t2_green, optimize="optimal"
+    ).astype(c128)
 
     # ---- two body terms, one scan over the cholesky chunks; both tensors are padded the
     # same way, so the leftover contributes to nothing
     chol, _, _, _ = pad_reshape_chol(meas_ctx.chol_bar, meas_ctx.nchol_chunk)
     chol_ov_u, _, _, _ = pad_reshape_chol(meas_ctx.chol_ov_u, meas_ctx.nchol_chunk)
-
-    t2x_r = t2x.astype(rtype)
-    uc_c = uc.astype(ctype)
 
     def scanned_fun(carry, x):
         chol_c, cu_c = x  # (k, norb, norb), (k, nlo, nvir)
@@ -249,21 +259,23 @@ def energy_kernel_rw_rh_fast(
         e2frg_e = jnp.einsum("gIj,gjI->", a_ij, b_ji, optimize="optimal")
         carry[1] += (e2frg_c - e2frg_e).astype(c128)
 
+        glgp_c = glgp.astype(ctype)
+
         # e2_2_2_1 = -sum_g tr(L_g t2_green) tr(gl_g), with tr(L_g t2_green) = <t2g, glgp_g>
-        lt2g = jnp.einsum("jb,gjb->g", t2g, glgp, optimize="optimal")
-        carry[2] += -jnp.einsum("g,g->", lt2g, tr_gl, optimize="optimal").astype(c128)
+        lt2g = jnp.einsum("jb,gjb->g", t2g, glgp_c, optimize="optimal")
+        carry[2] += -jnp.einsum("g,g->", lt2g, tr_gl.astype(ctype), optimize="optimal").astype(c128)
 
         # e2_2_2_2 = 1/2 sum_g <gl_g, L_g t2_green^T> = 1/2 sum_g sum_{ij} (glgp_g t2g^T)_{ij} gl_{g,ji}
-        z = jnp.einsum("gib,jb->gij", glgp, t2g, optimize="optimal")  # (k, nocc, nocc)
-        carry[3] += 0.5 * jnp.einsum("gij,gji->", z, gl_oo, optimize="optimal").astype(c128)
+        z = jnp.einsum("gib,jb->gij", glgp_c, t2g, optimize="optimal")  # (k, nocc, nocc)
+        carry[3] += 0.5 * jnp.einsum(
+            "gij,gji->", z, gl_oo.astype(ctype), optimize="optimal"
+        ).astype(c128)
 
         # e2_2_3: the projector's second factor closes glgp on the local index, then one
         # contraction with the exchange folded doubles
-        glgpu = jnp.einsum("kI,gka->gIa", uc_c, glgp.astype(ctype), optimize="optimal")
+        glgpu = jnp.einsum("kI,gka->gIa", uc_c, glgp_c, optimize="optimal")
         lt2 = jnp.einsum("gIa,Iajb->gjb", glgpu, t2x_r, optimize="optimal")
-        carry[4] += jnp.einsum(
-            "gjb,gjb->", lt2.astype(ctype), glgp.astype(ctype), optimize="optimal"
-        ).astype(c128)
+        carry[4] += jnp.einsum("gjb,gjb->", lt2, glgp_c, optimize="optimal").astype(c128)
 
         return carry, None
 

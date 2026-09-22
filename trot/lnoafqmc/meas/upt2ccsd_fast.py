@@ -33,6 +33,10 @@ Terms, with gc_s = U_s^H gf_s, gu_s = U_s^T gf_s, fu_s = U_s^H f_ov,s and cu_g,s
     e2_2_2_2       sum_s sum_{ij} (glgp_s t2g_s^T)_{ij} gl_oo,s_{ji}             (o^2 v)
     e2_2_3         1/2 sum_g sum_blocks <glgpu_(first spin) t2*_u, glgp_(second spin)>
                    with glgpu_s = U_s^H glgp_s                                    (L o v^2 per block)
+
+Precision: everything that carries T2 (t2g_s and the one-body term built from it, the
+e2_2_2 terms, the T2 contraction) runs in the mixed dtypes of the cfg; the greens
+function pieces, e0 and the projected e0frg stay in double.
 """
 
 from __future__ import annotations
@@ -199,6 +203,8 @@ def _t2g(
     trial_data: Upt2ccsdFastTrial,
     gf: tuple[jax.Array, jax.Array],
     gc: tuple[jax.Array, jax.Array],
+    rtype: Any,
+    ctype: Any,
 ) -> tuple[jax.Array, jax.Array]:
     """
     The (o_s, v_s) one-body T2 intermediates t2g_s of the bar kernel (the matrices its
@@ -206,17 +212,17 @@ def _t2g(
     local index: a block's first pair closes with gc_s, its second pair with gf of the
     other slot and the projector's second factor after. The (a, b) antisymmetry of the
     same-spin blocks turns their exchange terms into the direct ones (see the module
-    docstring), so every block takes two contractions.
+    docstring), so every block takes two contractions. Runs in the mixed dtypes.
     """
     t2aa, t2ab, t2ba, t2bb = (
-        trial_data.t2aa_u,
-        trial_data.t2ab_u,
-        trial_data.t2ba_u,
-        trial_data.t2bb_u,
+        trial_data.t2aa_u.astype(rtype),
+        trial_data.t2ab_u.astype(rtype),
+        trial_data.t2ba_u.astype(rtype),
+        trial_data.t2bb_u.astype(rtype),
     )
-    uc_a, uc_b = trial_data.u_a.conj(), trial_data.u_b.conj()
-    gf_a, gf_b = gf
-    gc_a, gc_b = gc
+    uc_a, uc_b = trial_data.u_a.conj().astype(ctype), trial_data.u_b.conj().astype(ctype)
+    gf_a, gf_b = (g.astype(ctype) for g in gf)
+    gc_a, gc_b = (g.astype(ctype) for g in gc)
 
     # alpha ov: 2 (aa direct - aa exchange) + ab (contracted over beta) + ba (over beta)
     t2g_a = (
@@ -243,7 +249,10 @@ def _walker(
     walker: tuple[jax.Array, jax.Array],
     meas_ctx: Upt2ccsdFastMeasCtx,
     trial_data: Upt2ccsdFastTrial,
+    rtype: Any,
+    ctype: Any,
 ) -> _Walker:
+    c128 = jnp.complex128
     nocc = trial_data.nocc
     nvir = trial_data.nvir
     u = (trial_data.u_a, trial_data.u_b)
@@ -265,14 +274,25 @@ def _walker(
     e1_0 = sum(
         jnp.einsum("pq,pq->", h1[s][: nocc[s], :], green[s], optimize="optimal") for s in range(2)
     )
-    t2g = _t2g(trial_data, (gf[0], gf[1]), (gc[0], gc[1]))
+    # everything that carries T2 runs in the mixed dtypes (the precision policy of
+    # meas/pt2ccsd_fast.py); the greens functions, e0 and e0frg stay in double
+    t2g = _t2g(trial_data, (gf[0], gf[1]), (gc[0], gc[1]), rtype, ctype)  # ctype
     # <P T2>: the spin sum of <t2g_s, gf_s> counts every block twice
-    gt2g = 0.5 * sum(jnp.einsum("ia,ia->", t2g[s], gf[s], optimize="optimal") for s in range(2))
+    gt2g_s = [
+        jnp.einsum("ia,ia->", t2g[s], gf[s].astype(ctype), optimize="optimal") for s in range(2)
+    ]
+    gt2g = (0.5 * (gt2g_s[0] + gt2g_s[1])).astype(c128)
     # the one-body term needs the (n_s, n_s) t2_green_s once per walker
-    e1_2 = e1_0 * gt2g - sum(
-        jnp.einsum("pq,pq->", h1[s], greenp[s] @ t2g[s].T @ green[s], optimize="optimal")
+    h1t2_s = [
+        jnp.einsum(
+            "pq,pq->",
+            h1[s].astype(rtype),
+            greenp[s].astype(ctype) @ t2g[s].T @ green[s].astype(ctype),
+            optimize="optimal",
+        )
         for s in range(2)
-    )
+    ]
+    e1_2 = e1_0 * gt2g - (h1t2_s[0] + h1t2_s[1]).astype(c128)
     return _Walker(
         green=(green[0], green[1]),
         gf=(gf[0], gf[1]),
@@ -302,7 +322,7 @@ def energy_kernel_uw_uh_fast(
     ctype = cfg.mixed_complex_dtype
     c128 = jnp.complex128
 
-    w = _walker(walker, meas_ctx, trial_data)
+    w = _walker(walker, meas_ctx, trial_data, rtype, ctype)
     nocc = trial_data.nocc
     uc = (trial_data.u_a.conj().astype(ctype), trial_data.u_b.conj().astype(ctype))
     t2_r = (
@@ -355,32 +375,35 @@ def energy_kernel_uw_uh_fast(
             )
         carry[1] += e2frg.astype(c128)
 
+        glgp_c = [g.astype(ctype) for g in glgp]
+
         # e2_2_2_1 = -sum_g tr(gl_g) sum_s <L_s, t2_green_s>, with <L_s, t2_green_s> = <t2g_s, glgp_s>
-        lt2g = sum(jnp.einsum("jb,gjb->g", w.t2g[s], glgp[s], optimize="optimal") for s in range(2))
-        carry[2] += -jnp.einsum("g,g->", lt2g, tr_gl, optimize="optimal").astype(c128)
+        lt2g = sum(
+            jnp.einsum("jb,gjb->g", w.t2g[s], glgp_c[s], optimize="optimal") for s in range(2)
+        )
+        carry[2] += -jnp.einsum("g,g->", lt2g, tr_gl.astype(ctype), optimize="optimal").astype(c128)
 
         # e2_2_2_2 = sum_s <gl_s, L_s t2_green_s^T> = sum_s sum_{ij} (glgp_s t2g_s^T)_{ij} gl_oo,s_{ji}
         e2222 = jnp.zeros((), dtype=c128)
         for s in range(2):
-            z = jnp.einsum("gib,jb->gij", glgp[s], w.t2g[s], optimize="optimal")
-            e2222 += jnp.einsum("gij,gji->", z, gl_oo[s], optimize="optimal")
+            z = jnp.einsum("gib,jb->gij", glgp_c[s], w.t2g[s], optimize="optimal")
+            e2222 += jnp.einsum("gij,gji->", z, gl_oo[s].astype(ctype), optimize="optimal").astype(
+                c128
+            )
         carry[3] += e2222
 
         # e2_2_3 = 1/2 sum_blocks: the projector's second factor closes glgp on the local
         # index of the block's first spin, then one contraction per block
-        glgpu = [
-            jnp.einsum("kI,gka->gIa", uc[s], glgp[s].astype(ctype), optimize="optimal")
-            for s in range(2)
-        ]
+        glgpu = [jnp.einsum("kI,gka->gIa", uc[s], glgp_c[s], optimize="optimal") for s in range(2)]
         lt2_a = jnp.einsum("gIa,Iajb->gjb", glgpu[0], t2_r[0], optimize="optimal") + jnp.einsum(
             "gIa,Iajb->gjb", glgpu[1], t2_r[2], optimize="optimal"
         )  # aa + ba, closes with glgp_a
         lt2_b = jnp.einsum("gIa,Iajb->gjb", glgpu[1], t2_r[3], optimize="optimal") + jnp.einsum(
             "gIa,Iajb->gjb", glgpu[0], t2_r[1], optimize="optimal"
         )  # bb + ab, closes with glgp_b
-        e223 = jnp.einsum(
-            "gjb,gjb->", lt2_a.astype(ctype), glgp[0].astype(ctype), optimize="optimal"
-        ) + jnp.einsum("gjb,gjb->", lt2_b.astype(ctype), glgp[1].astype(ctype), optimize="optimal")
+        e223 = jnp.einsum("gjb,gjb->", lt2_a, glgp_c[0], optimize="optimal") + jnp.einsum(
+            "gjb,gjb->", lt2_b, glgp_c[1], optimize="optimal"
+        )
         carry[4] += (0.5 * e223).astype(c128)
 
         return carry, None
