@@ -218,10 +218,17 @@ class LnoFragMixed(AfqmcMixed):
             staged = None
         return cls(mf, frag, staged=staged, emf=attrs["emf"], **kwargs)
 
-    def save(self, path: Union[str, Path]) -> Path:
-        """Write the self-contained fragment file (see staging.dump_frag)."""
+    def save(self, path: Union[str, Path], *, amplitudes: str | None = None) -> Path:
+        """
+        Write the self-contained fragment file (see staging.dump_frag). With the fast
+        trials the doubles are stored projected on the fragment (nlo/nocc the size of
+        t2), which is all they need; the other trials store the full CCSD doubles, which
+        the CISD guides need as well. amplitudes="full" / "projected" overrides that.
+        """
+        if amplitudes is None:
+            amplitudes = "projected" if self.trial.endswith("_fast") else "full"
         staged = self.stage()
-        return dump_frag(path, self.frag, staged, self._scf, emf=self.emf)
+        return dump_frag(path, self.frag, staged, self._scf, emf=self.emf, amplitudes=amplitudes)
 
     def _key(self) -> tuple:
         return super()._key() + (id(self.frag), self.trial, self.guide)
@@ -241,16 +248,23 @@ class LnoFragMixed(AfqmcMixed):
         frag = self.frag
         guide_spec = self.recipe.guide_spec
         assert guide_spec is not None
-        # a guide built from the fragment amplitudes (CISD, UCISD) rather than staged from
-        # the mean field; None for the HF guides
-        guide_input = self.recipe.stage_guide(frag) if self.recipe.stage_guide is not None else None
+
+        # a guide built from the fragment data (the CISD ones from the amplitudes, the
+        # UHF one as the identity of the uchol layout) rather than staged from the mean
+        # field; None for the RHF guide. A file carries the guide it was written with, so
+        # it is only rebuilt when a different one is asked for
+        def guide_from_frag() -> Any:
+            return self.recipe.stage_guide(frag) if self.recipe.stage_guide is not None else None
+
         if self._preloaded_staged is not None:
             staged = self._preloaded_staged
-            if guide_input is not None and staged.trial.kind not in guide_spec.kinds:
-                # the file carries the guide it was written with; keep its hamiltonian and
-                # put the requested guide next to it
-                staged = StagedInputs(ham=staged.ham, trial=guide_input, meta=staged.meta)
+            if staged.trial.kind not in guide_spec.kinds:
+                guide_input = guide_from_frag()
+                if guide_input is not None:
+                    # keep the file's hamiltonian and put the requested guide next to it
+                    staged = StagedInputs(ham=staged.ham, trial=guide_input, meta=staged.meta)
         else:
+            guide_input = guide_from_frag()
             if self._scf is None:
                 raise ValueError("LnoFragMixed needs mf to build the fragment hamiltonian.")
             ham = self.recipe.build_ham(
@@ -810,6 +824,7 @@ class LnoAfqmcMixed:
                         **frag.__dict__,
                         "t1": None,
                         "t2": None,
+                        "t2u": None,
                         "lno_coeff": None,
                         "uocc_loc": None,
                         "log": "",

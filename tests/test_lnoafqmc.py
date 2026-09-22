@@ -458,7 +458,9 @@ def test_frag_file_round_trip(o2, tmp_path):
         path = fm.save(tmp_path / "frag1.h5")
         frag2, staged, attrs = lst.load_frag(path)
     assert frag2.frag_name == frag.frag_name and frag2.nact == frag.nact
+    # the pt2ccsd trial stores the full doubles
     assert np.allclose(frag2.t2, frag.t2) and np.allclose(frag2.uocc_loc, frag.uocc_loc)
+    assert frag2.t2u is None and frag2.has_full_amplitudes
     assert staged.ham.norb == 8 and staged.trial.kind == "rhf"
     assert abs(attrs["emf"] - mf.e_tot) < 1e-12
     # the guide staged by the branch in the fragment basis is the identity on the active LNOs
@@ -468,6 +470,50 @@ def test_frag_file_round_trip(o2, tmp_path):
         job = fm2.build_job()
     assert job.sys.norb == 8 and job.mix_trial_data.nocc == 6
     assert job.recipe.trial == "pt2ccsd" and job.mix_trial_meas_ops.has_kernel("energy")
+
+
+def test_frag_file_projected_doubles(o2, tmp_path):
+    """A file written for the fast trial carries t2u = t2 U instead of t2; every pt2CCSD trial
+    re-runs from it, the CISD guide (which needs the full doubles) refuses it."""
+    import h5py
+
+    mf, frag = o2["mf"], o2["frags"][0]
+    with contextlib.redirect_stdout(io.StringIO()):
+        path = LnoFragMixed(mf, frag, trial="pt2ccsd_fast", chol_cut=CHOL_CUT).save(
+            tmp_path / "f.h5"
+        )
+        frag2, _, _ = lst.load_frag(path)
+    with h5py.File(path, "r") as f:
+        assert "t2u" in f["amplitudes"] and "t2" not in f["amplitudes"]
+        assert int(f.attrs["frag_file_version"]) == 2
+    nlo, nocc, nvir = frag2.uocc_loc.shape[1], int(frag.nactocc), int(frag.nactvir)
+    assert frag2.t2 is None and frag2.t2u.shape == (nlo, nvir, nocc, nvir)
+    assert frag2.has_amplitudes and not frag2.has_full_amplitudes
+    np.testing.assert_allclose(frag2.t2u, lst.projected_doubles(frag), atol=1e-14)
+    # the same trial inputs as from the full amplitudes, for both pt2CCSD trials
+    for stager in (lst.stage_pt2ccsd_trial, lst.stage_pt2ccsd_fast_trial):
+        a, b = stager(frag), stager(frag2)
+        for k in a.data:
+            np.testing.assert_allclose(np.asarray(a.data[k]), np.asarray(b.data[k]), atol=1e-12)
+    with contextlib.redirect_stdout(io.StringIO()):
+        for trial in ("pt2ccsd_fast", "pt2ccsd"):
+            job = LnoFragMixed.from_frag_data(path, trial=trial).build_job()
+            assert job.mix_trial_data.nocc == nocc
+    with pytest.raises(ValueError, match="full fragment CCSD amplitudes"):
+        LnoFragMixed.from_frag_data(path, guide="cisd").build_job()
+    # a file written with the CISD guide carries that guide, so it re-runs with it
+    with contextlib.redirect_stdout(io.StringIO()):
+        path2 = LnoFragMixed(mf, frag, trial="pt2ccsd_fast", guide="cisd", chol_cut=CHOL_CUT).save(
+            tmp_path / "f2.h5"
+        )
+        job2 = LnoFragMixed.from_frag_data(path2, trial="pt2ccsd_fast", guide="cisd").build_job()
+    assert job2.staged.trial.kind == "cisd"
+    # amplitudes="full" keeps the full doubles even for the fast trial
+    with contextlib.redirect_stdout(io.StringIO()):
+        path3 = LnoFragMixed(mf, frag, trial="pt2ccsd_fast", chol_cut=CHOL_CUT).save(
+            tmp_path / "f3.h5", amplitudes="full"
+        )
+    assert lst.load_frag(path3)[0].has_full_amplitudes
 
 
 def test_frag_mixed_options(o2):

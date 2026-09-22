@@ -393,6 +393,30 @@ def test_u_frag_file_round_trip(o2t, tmp_path):
     assert frag2.unrestricted and frag2.nact == frag.nact and frag2.frag_name == frag.frag_name
     for x, y in zip(frag2.t2, frag.t2):
         assert np.allclose(x, y)
+    # written for the fast trial, the file carries the four projected blocks instead
+    with contextlib.redirect_stdout(io.StringIO()):
+        path_u = LnoFragMixed(mf, frag, trial="upt2ccsd_fast", chol_cut=CHOL_CUT).save(
+            tmp_path / "frag1_fast.h5"
+        )
+        frag3, _, _ = lst.load_frag(path_u)
+    assert (
+        frag3.t2 is None
+        and len(frag3.t2u) == 4
+        and frag3.t2u[0].shape[0] == frag3.uocc_loc[0].shape[1]
+    )
+    for a, b in zip(frag3.t2u, lst.projected_doubles(frag)):
+        np.testing.assert_allclose(a, b, atol=1e-14)
+    for stager in (lst.stage_upt2ccsd_trial, lst.stage_upt2ccsd_fast_trial):
+        x, y = stager(frag), stager(frag3)
+        for k in x.data:
+            np.testing.assert_allclose(np.asarray(x.data[k]), np.asarray(y.data[k]), atol=1e-12)
+    with contextlib.redirect_stdout(io.StringIO()):
+        for trial in ("upt2ccsd_fast", "upt2ccsd"):
+            assert LnoFragMixed.from_frag_data(
+                path_u, trial=trial
+            ).build_job().mix_trial_data.nocc == (7, 5)
+    with pytest.raises(ValueError, match="full fragment CCSD amplitudes"):
+        LnoFragMixed.from_frag_data(path_u, guide="ucisd").build_job()
     assert staged.ham.basis == "uchol" and staged.ham.norb == (8, 8) and staged.trial.kind == "uhf"
     assert np.array_equal(staged.ham.chol_a, ham.chol_a) and np.array_equal(
         staged.ham.h1_b, ham.h1_b
