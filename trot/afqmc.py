@@ -1491,16 +1491,7 @@ class AfqmcMixed(Afqmc):
             print(f"  {'nchol_chunk_used':<{width}} = {job.mix_meas_ctx().nchol_chunk}")
             print("")
         if job.chunk_plan is not None:
-            plan = job.chunk_plan
-            mb = 1024**2
-            print(" chunk_plan      = ChunkPlan")
-            print(f"  nchol_chunk       = {plan.nchol_chunk}")
-            print(f"  n_chunks          = {plan.n_chunks}")
-            print(f"  walkers_in_flight = {plan.walkers_in_flight}")
-            print(f"  memory_used       = {plan.bytes_used / mb:.1f} MB")
-            print(f"  memory_budget     = {plan.budget_bytes / mb:.1f} MB")
-            print(f"  note              = {plan.note}")
-            print("")
+            self._dump_chunk_plan(job.chunk_plan, int(job.ham_data.nchol or 0))
 
         if self.tau_eql is not None:
             params = cast(QmcParams, job.params)
@@ -1511,6 +1502,37 @@ class AfqmcMixed(Afqmc):
                 f"tau reached = {params.n_eql_blocks * block_time:g})\n"
             )
         self._dump_params(job.params)
+
+    @staticmethod
+    def _dump_chunk_plan(plan: Any, nchol: int) -> None:
+        """
+        The trial's chunk plan: the cholesky vectors scanned per step and how many zero
+        vectors pad the tensor to equal chunks, the walkers in flight per device, and
+        the memory model's split of the cost into what stays resident for the whole pass,
+        what every walker in flight adds (a fixed part and a part per cholesky vector in
+        the chunk), the total, and the budget it was fitted to.
+        """
+        from .cholesky import equal_chunks
+
+        mb = 1024**2
+        model = plan.model
+        n_steps, chunk, n_pad = equal_chunks(nchol, plan.nchol_chunk)
+        per_walker = model.per_walker + chunk * model.per_walker_chol
+        w = plan.walkers_in_flight
+        print(" chunk_plan      = ChunkPlan")
+        print(f"  nchol_chunk       = {chunk}  ({n_steps} steps over {nchol} + {n_pad} padded)")
+        print(f"  n_chunks          = {plan.n_chunks}")
+        print(f"  walkers_in_flight = {w}")
+        print(f"  memory_resident   = {model.resident / mb:.1f} MB")
+        print(
+            f"  memory_per_walker = {per_walker / mb:.2f} MB  "
+            f"({model.per_walker / mb:.2f} MB + {chunk} x {model.per_walker_chol / 1024:.1f} KB)"
+        )
+        print(f"  memory_walkers    = {w * per_walker / mb:.1f} MB  ({w} walkers in flight)")
+        print(f"  memory_used       = {plan.bytes_used / mb:.1f} MB")
+        print(f"  memory_budget     = {plan.budget_bytes / mb:.1f} MB")
+        print(f"  note              = {plan.note}")
+        print("")
 
     def kernel(self, **driver_kwargs: Any) -> tuple[Any, Any]:  # type: ignore[override]
         """Run mixed AFQMC. Returns the trial (e_tot, e_err) and stores the guide result."""
