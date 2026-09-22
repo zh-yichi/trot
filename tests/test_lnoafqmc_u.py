@@ -360,6 +360,44 @@ def test_u_fast_trial_run_reproduces_upt2ccsd_run(o2t, tmp_path):
     assert abs(fm_fast.guide_e_tot - fm_bar.guide_e_tot) < 1e-10
 
 
+def test_u_cpu_gpu_split_and_isolated_files(o2t, tmp_path):
+    """
+    Unrestricted CPU/GPU split: run_qmc=False + save_frag_data writes the files; the
+    AFQMC from the files (here in a child process per fragment, isolate=True) reproduces
+    the one-machine loop with the same seed.
+    """
+    mf, nfrozen = o2t["mf"], o2t["nfrozen"]
+    common: dict[str, Any] = dict(trial="upt2ccsd_fast", seed=5, mixed_precision=False)
+    qmc: dict[str, Any] = dict(n_walkers=20, n_eql_blocks=2, n_blocks=10, dt=0.005, n_prop_steps=10)
+    lno_kw: dict[str, Any] = dict(
+        frag_name=o2t["frag_name"], lno_thresh=1e-12, nfrozen=nfrozen, chol_cut=CHOL_CUT
+    )
+    files = tmp_path / "frag_data"
+    with contextlib.redirect_stdout(io.StringIO()):
+        cpu = LnoAfqmcMixed(
+            mf,
+            o2t["lo_coeff"],
+            o2t["frag_list"],
+            run_qmc=False,
+            save_frag_data=str(files),
+            **lno_kw,
+            **common,
+        )
+        cpu.kernel()
+        gpu = LnoAfqmcMixed(frag_data=files, run_frag=[1], isolate=True, **common, **qmc)
+        e_files, err_files = gpu.kernel()
+        one = LnoAfqmcMixed(
+            mf, o2t["lo_coeff"], o2t["frag_list"], run_frag=[1], **lno_kw, **common, **qmc
+        )
+        e_one, err_one = one.kernel()
+    assert gpu.unrestricted and gpu.nfrag_tot == 2 and gpu.lno_nocc[0] == one.lno_nocc[0]
+    assert (files / "frag2.result.json").exists()
+    assert abs(gpu.e_cc - one.e_cc) < 1e-12 and abs(gpu.e_mp - one.e_mp) < 1e-12
+    assert abs(e_files - e_one) < 1e-8 and abs(err_files - err_one) < 1e-8
+    with pytest.raises(ValueError, match="mean field"):
+        LnoAfqmcMixed(frag_data=files, trial="pt2ccsd")
+
+
 # ----------------------------------------------------------------------------- recipes and files
 
 

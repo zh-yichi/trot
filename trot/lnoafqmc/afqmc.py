@@ -23,7 +23,7 @@ from ..staging import stage as stage_inputs
 from . import io as lno_io
 from .driver import FragQmcResult, run_frag_qmc
 from .mixed import LnoMixedRecipe, get_mixed_recipe
-from .staging import LnoFragData, dump_frag, frag_mf, load_frag
+from .staging import LnoFragData, dump_frag, frag_file_meta, frag_mf, load_frag
 
 print = partial(print, flush=True)
 
@@ -59,6 +59,44 @@ def _device_bytes_in_use() -> int | None:
     except Exception:
         pass
     return None
+
+
+def device_memory_budget_mb() -> tuple[float | None, str]:
+    """
+    The trial's memory budget in MB when no max_memory is given, and where it came from.
+
+    jax reports an allocator limit only for the pool allocator; under the platform
+    allocator (what the fragment loop selects, so device memory is handed back between
+    fragments) device.memory_stats() is empty and setup_mixed would plan nothing. Then
+    the driver is asked for the device's total memory through nvidia-smi, and the same
+    fraction of it (DEVICE_MEMORY_FRACTION) is the budget. None on a CPU backend, where
+    the trial keeps its fixed default chunk.
+    """
+    from ..meas.pt2ccsd_chunking import DEVICE_MEMORY_FRACTION, device_memory_budget_bytes
+
+    budget = device_memory_budget_bytes()
+    if budget is not None:
+        return budget / 1024**2, "jax allocator limit"
+    try:
+        import jax
+
+        if jax.devices()[0].platform != "gpu":
+            return None, "no device memory limit (CPU backend)"
+    except Exception:
+        return None, "no device memory limit"
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+        totals = [int(line.strip()) for line in out.splitlines() if line.strip().isdigit()]
+    except Exception:
+        totals = []
+    if not totals:
+        return None, "no device memory limit (nvidia-smi unavailable)"
+    return DEVICE_MEMORY_FRACTION * min(totals), f"{DEVICE_MEMORY_FRACTION:g} x device memory"
 
 
 def _release_device() -> None:
@@ -101,6 +139,9 @@ class LnoFragMixed(AfqmcMixed):
     max_error : early-stop target of the fragment error; None runs all n_blocks.
     stop_ratio, min_blocks : stop once err < stop_ratio * max_error and at least
         min_blocks sampling blocks are in (0.7, 120 as in afqmc).
+    max_memory (MB) sizes the trial's cholesky chunk; when not given it is
+    DEVICE_MEMORY_FRACTION of the device memory (device_memory_budget_mb), also under the
+    platform allocator where jax itself reports no limit.
     The remaining keywords are AfqmcMixed's (max_memory, nchol_chunk, mixed_precision
     with the per side guide_mixed_precision / trial_mixed_precision, chol_cut,
     n_eql_blocks, n_blocks, seed, dt, n_prop_steps, n_walkers, n_chunks, error_method,
@@ -183,6 +224,9 @@ class LnoFragMixed(AfqmcMixed):
         self.trial_mixed_precision = (
             bool(mixed_precision) if trial_mixed_precision is None else bool(trial_mixed_precision)
         )
+        self.max_memory_source = "max_memory"
+        if max_memory is None:
+            max_memory, self.max_memory_source = device_memory_budget_mb()
         self.max_memory = max_memory
         self.nchol_chunk = nchol_chunk
         self.tau_eql = None if tau_eql is None else float(tau_eql)
@@ -218,7 +262,9 @@ class LnoFragMixed(AfqmcMixed):
             staged = None
         return cls(mf, frag, staged=staged, emf=attrs["emf"], **kwargs)
 
-    def save(self, path: Union[str, Path], *, amplitudes: str | None = None) -> Path:
+    def save(
+        self, path: Union[str, Path], *, amplitudes: str | None = None, nfrag_tot: int | None = None
+    ) -> Path:
         """
         Write the self-contained fragment file (see staging.dump_frag). With the fast
         trials the doubles are stored projected on the fragment (nlo/nocc the size of
@@ -228,7 +274,15 @@ class LnoFragMixed(AfqmcMixed):
         if amplitudes is None:
             amplitudes = "projected" if self.trial.endswith("_fast") else "full"
         staged = self.stage()
-        return dump_frag(path, self.frag, staged, self._scf, emf=self.emf, amplitudes=amplitudes)
+        return dump_frag(
+            path,
+            self.frag,
+            staged,
+            self._scf,
+            emf=self.emf,
+            amplitudes=amplitudes,
+            nfrag_tot=nfrag_tot,
+        )
 
     def _key(self) -> tuple:
         return super()._key() + (id(self.frag), self.trial, self.guide)
@@ -317,6 +371,8 @@ class LnoFragMixed(AfqmcMixed):
         print(f" E(LNO-CCSD)     = {frag.efrag_cc:.8f}")
         print(f" max_error       = {'None' if self.max_error is None else f'{self.max_error:.2e}'}")
         print(f" stop_ratio      = {self.stop_ratio}  min_blocks = {self.min_blocks}")
+        budget = "None" if self.max_memory is None else f"{self.max_memory:.0f} MB"
+        print(f" max_memory      = {budget}  ({self.max_memory_source})")
         super().dump_flags(job)
 
     def kernel(self, **driver_kwargs: Any) -> tuple[float, float]:
@@ -384,14 +440,28 @@ class LnoAfqmcMixed:
 
     filled as each fragment finishes.
 
+    Two machines. The CPU stage and the AFQMC can be run separately: with run_qmc=False
+    and save_frag_data=DIR the loop runs steps 1-3 and writes DIR/frag{i}.h5, the fragment
+    hamiltonian, guide and amplitudes of every fragment, then stops; on the GPU machine
+
+        lno = LnoAfqmcMixed(frag_data=DIR, trial="pt2ccsd_fast", seed=17, ...)
+        e_qmc, e_qmc_err = lno.kernel()
+
+    runs step 4 for every file with no mean field, LNO, CCSD or integral work, and fills
+    the same results (the LNO-MP2/CCSD energies come from the files). With the same seed,
+    trial and QMC settings this reproduces the one-machine loop fragment by fragment.
+
     Parameters (LNO, as run_afqmc)
     ----------
     mf : density fitted pyscf RHF/UHF
     lo_coeff, frag_list, frag_name : from lnoafqmc.fragments.iao_fragment
+    frag_data : instead of mf/lo_coeff/frag_list: a directory of frag{i}.h5 files, one
+        file, or a list of files written by save_frag_data (AFQMC only, see above)
     lno_thresh : float (-> [10 x, x]) or [occ, vir]
     nfrozen : frozen core count, default chemcore
     run_frag : fragment indices to run (0-based), default all
-    run_mp, run_cc, run_qmc : which steps to run; run_cc=None follows the recipe
+    run_mp, run_cc, run_qmc : which steps to run; run_cc=None follows the recipe.
+        run_qmc=False with save_frag_data writes the fragment files and stops
     pipeline, prefetch : run the CPU stage ahead on a thread, and how far ahead
     frag_output, lno_output : optional per-fragment logs / results table (lnoafqmc.io)
     save_frag_data : directory for the self-contained frag{i}.h5 files
@@ -411,10 +481,11 @@ class LnoAfqmcMixed:
 
     def __init__(
         self,
-        mf: Any,
-        lo_coeff: Any,
-        frag_list: Any,
+        mf: Any = None,
+        lo_coeff: Any = None,
+        frag_list: Any = None,
         *,
+        frag_data: Union[str, Path, list, tuple] | None = None,
         frag_name: Any = None,
         lno_thresh: Any = 1e-6,
         nfrozen: int | None = None,
@@ -458,32 +529,54 @@ class LnoAfqmcMixed:
 
         from .las import check_span
 
-        if getattr(mf, "with_df", None) is None:
-            raise NotImplementedError(
-                "LNO-AFQMC builds the fragment integrals from the density fitting tensor; "
-                "use a density fitted mean field (mf.density_fit())."
+        self.frag_files: dict[int, Path] = {}
+        self.frag_meta: dict[int, dict[str, Any]] = {}
+        if frag_data is not None:
+            # AFQMC only, from the fragment files
+            if mf is not None or lo_coeff is not None or frag_list is not None:
+                raise ValueError(
+                    "frag_data replaces mf, lo_coeff and frag_list; pass one or the other."
+                )
+            self._scf = None
+            self.lo_coeff = None
+            self.frag_list = []
+            self._read_frag_files(frag_data)
+            self.unrestricted = bool(next(iter(self.frag_meta.values()))["unrestricted"])
+            self.frag_name_all = [
+                self.frag_meta[i]["frag_name"] if i in self.frag_meta else f"frag{i}"
+                for i in range(self.nfrag_tot)
+            ]
+            self.nfrozen = int(next(iter(self.frag_meta.values()))["nfrozen"])
+            self.lno_thresh_in = list(next(iter(self.frag_meta.values()))["lno_thresh"])
+        else:
+            if getattr(mf, "with_df", None) is None:
+                raise NotImplementedError(
+                    "LNO-AFQMC builds the fragment integrals from the density fitting tensor; "
+                    "use a density fitted mean field (mf.density_fit())."
+                )
+            if lo_coeff is None or frag_list is None:
+                raise ValueError("LnoAfqmcMixed needs mf, lo_coeff and frag_list (or frag_data).")
+            self._scf = mf
+            self.unrestricted = isinstance(mf, scf.uhf.UHF)
+            if not self.unrestricted and not isinstance(mf, scf.rhf.RHF):
+                raise TypeError(f"unsupported mean-field type: {type(mf)}")
+
+            self.lo_coeff = lo_coeff
+            self.frag_list = list(frag_list)
+            self.nfrag_tot = len(self.frag_list)
+            self.frag_name_all = (
+                [str(n) for n in frag_name]
+                if frag_name is not None
+                else [f"frag{i}" for i in range(self.nfrag_tot)]
             )
-        self._scf = mf
-        self.unrestricted = isinstance(mf, scf.uhf.UHF)
-        if not self.unrestricted and not isinstance(mf, scf.rhf.RHF):
-            raise TypeError(f"unsupported mean-field type: {type(mf)}")
+            if len(self.frag_name_all) != self.nfrag_tot:
+                raise ValueError("frag_name and frag_list have different lengths")
 
-        self.lo_coeff = lo_coeff
-        self.frag_list = list(frag_list)
-        self.nfrag_tot = len(self.frag_list)
-        self.frag_name_all = (
-            [str(n) for n in frag_name]
-            if frag_name is not None
-            else [f"frag{i}" for i in range(self.nfrag_tot)]
-        )
-        if len(self.frag_name_all) != self.nfrag_tot:
-            raise ValueError("frag_name and frag_list have different lengths")
-
-        if nfrozen is None:
-            nfrozen = int(elements.chemcore(mf.mol))
-            print("LNO freezes at least the chemcore orbitals for each element.")
-        self.nfrozen = int(nfrozen)
-        self.lno_thresh_in = lno_thresh
+            if nfrozen is None:
+                nfrozen = int(elements.chemcore(mf.mol))
+                print("LNO freezes at least the chemcore orbitals for each element.")
+            self.nfrozen = int(nfrozen)
+            self.lno_thresh_in = lno_thresh
         self.lno_type = ["1h", "1h"]
 
         if trial is None:
@@ -492,9 +585,10 @@ class LnoAfqmcMixed:
         self.trial = self.recipe.trial
         self.guide = self.recipe.guide
         if (self.recipe.ham_basis == "uchol") != self.unrestricted:
+            what = "the fragment files" if self.frag_files else f"a {type(mf).__name__}"
             raise ValueError(
                 f"trial={self.trial!r} needs {'a UHF' if self.recipe.ham_basis == 'uchol' else 'an RHF'} "
-                f"mean field, got {type(mf).__name__}."
+                f"mean field, got {what}."
             )
 
         self.run_mp = bool(run_mp)
@@ -505,14 +599,33 @@ class LnoAfqmcMixed:
                 f"run_qmc=True with guide={self.guide!r} / trial={self.trial!r} requires "
                 "run_cc=True: they need the fragment t1/t2 amplitudes."
             )
+        if (
+            not self.run_qmc
+            and save_frag_data is not None
+            and self.recipe.needs_amplitudes
+            and not self.run_cc
+        ):
+            raise ValueError(
+                f"writing the fragment files for guide={self.guide!r} / trial={self.trial!r} "
+                "requires run_cc=True: they carry the fragment amplitudes."
+            )
 
         self.run_frag = self._resolve_run_frag(run_frag)
+        if self.frag_files:
+            missing = [i for i in self.run_frag if i not in self.frag_files]
+            if missing:
+                raise ValueError(
+                    f"no fragment file for fragments {missing}; files found for "
+                    f"{sorted(self.frag_files)}"
+                )
         self.pipeline = bool(pipeline)
         self.prefetch = int(prefetch)
         self.frag_output = frag_output
         self.lno_output = lno_output
-        self.save_frag_data = save_frag_data
         self.isolate = bool(isolate)
+        if self.isolate and save_frag_data is None and not self.frag_files:
+            save_frag_data = "frag_data"  # the child process reads the fragment from its file
+        self.save_frag_data = save_frag_data
         self.keep_qmc_results = bool(keep_qmc_results)
         self.debug_memory = bool(debug_memory)
         self.memory_tolerance_mb = float(memory_tolerance_mb)
@@ -539,7 +652,8 @@ class LnoAfqmcMixed:
         self.seed = int(np.random.randint(1, 2**31 - 1)) if seed is None else int(seed)
 
         # the LOs must span the occupied MOs outside the core; not the other way round
-        check_span(mf, lo_coeff, self.nfrozen, thresh=1e-6)
+        if not self.frag_files:
+            check_span(mf, lo_coeff, self.nfrozen, thresh=1e-6)
 
         self._reset_results()
 
@@ -553,9 +667,41 @@ class LnoAfqmcMixed:
 
     # ------------------------------------------------------------------ bookkeeping
 
+    def _read_frag_files(self, frag_data: Any) -> None:
+        """Index the fragment files by their frag_idx and take nfrag_tot from them."""
+        if isinstance(frag_data, (str, Path)):
+            base = Path(frag_data)
+            if base.is_dir():
+                paths = sorted(base.glob("frag*.h5"))
+            elif base.is_file():
+                paths = [base]
+            else:
+                raise FileNotFoundError(f"{base} is neither a directory nor a fragment file.")
+        else:
+            paths = [Path(p) for p in frag_data]
+        if not paths:
+            raise FileNotFoundError(f"no fragment files (frag*.h5) under {frag_data}")
+        for path in paths:
+            meta = frag_file_meta(path)
+            idx = int(meta["frag_idx"])
+            if idx in self.frag_files:
+                raise ValueError(
+                    f"fragment {idx + 1} appears twice: {self.frag_files[idx]} and {path}"
+                )
+            self.frag_files[idx] = path
+            self.frag_meta[idx] = meta
+        stored = {m["nfrag_tot"] for m in self.frag_meta.values() if m["nfrag_tot"] is not None}
+        if len(stored) > 1:
+            raise ValueError(f"the fragment files disagree on nfrag_tot: {sorted(stored)}")
+        self.nfrag_tot = int(next(iter(stored))) if stored else max(self.frag_files) + 1
+        bases = {m["basis"] for m in self.frag_meta.values()}
+        spins = {m["unrestricted"] for m in self.frag_meta.values()}
+        if len(bases) > 1 or len(spins) > 1:
+            raise ValueError("the fragment files mix restricted and unrestricted fragments.")
+
     def _resolve_run_frag(self, run_frag: Any) -> list[int]:
         if run_frag is None:
-            return list(range(self.nfrag_tot))
+            return sorted(self.frag_files) if self.frag_files else list(range(self.nfrag_tot))
         run_frag = [int(i) for i in run_frag]
         dup = sorted({i for i in run_frag if run_frag.count(i) > 1})
         if dup:
@@ -614,37 +760,58 @@ class LnoAfqmcMixed:
             return None
         return Path(base) / f"{stem}{frag_idx + 1}.h5"
 
+    def _frag_kwargs(self, frag_idx: int) -> dict[str, Any]:
+        return dict(
+            trial=self.trial,
+            guide=self.guide,
+            max_error=self.max_error,
+            stop_ratio=self.stop_ratio,
+            min_blocks=self.min_blocks,
+            seed=self._frag_seed(frag_idx),
+            **self.qmc_kwargs,
+        )
+
+    def save_frag_file(self, frag: LnoFragData) -> Path:
+        """Write the fragment file of frag under save_frag_data (its hamiltonian, guide and amplitudes)."""
+        path = self._frag_path(self.save_frag_data, frag.frag_idx, "frag")
+        assert path is not None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fm = LnoFragMixed(self._scf, frag, trial=self.trial, guide=self.guide, **self.qmc_kwargs)
+        fm.save(path, nfrag_tot=self.nfrag_tot)
+        del fm
+        print(f"fragment data written to {path}")
+        return path
+
     def lnoafqmc_kernel(
-        self, frag: LnoFragData
+        self, frag: LnoFragData | None = None, *, path: Union[str, Path] | None = None
     ) -> tuple[float, float, float, FragQmcResult | None]:
         """
-        The device stage of one fragment: build the fragment hamiltonian, run the AFQMC,
-        and release everything it put on the device before returning host floats.
+        The device stage of one fragment, from its LNO data (frag: the fragment
+        hamiltonian is built here and the file written if save_frag_data is set) or from
+        its file (path): run the AFQMC and release everything it put on the device before
+        returning host floats.
         """
-        frag_idx = frag.frag_idx
+        if (frag is None) == (path is None):
+            raise ValueError("give either the fragment data or its file.")
+        frag_idx = (
+            int(frag.frag_idx)
+            if frag is not None
+            else int(frag_file_meta(cast(Any, path))["frag_idx"])
+        )
         t0 = time.perf_counter()
         baseline = _device_bytes_in_use()
         result: FragQmcResult | None = None
         try:
+            if frag is not None and (self.isolate or self.save_frag_data is not None):
+                path = self.save_frag_file(frag)
             if self.isolate:
-                e, err, result = self._run_isolated(frag)
+                assert path is not None
+                e, err = self._run_isolated_path(Path(path), frag_idx)
             else:
-                fm = LnoFragMixed(
-                    self._scf,
-                    frag,
-                    trial=self.trial,
-                    guide=self.guide,
-                    max_error=self.max_error,
-                    stop_ratio=self.stop_ratio,
-                    min_blocks=self.min_blocks,
-                    seed=self._frag_seed(frag_idx),
-                    **self.qmc_kwargs,
-                )
-                path = self._frag_path(self.save_frag_data, frag_idx, "frag")
-                if path is not None:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    fm.save(path)
-                    print(f"fragment data written to {path}")
+                if frag is not None:
+                    fm = LnoFragMixed(self._scf, frag, **self._frag_kwargs(frag_idx))
+                else:
+                    fm = LnoFragMixed.from_frag_data(cast(Any, path), **self._frag_kwargs(frag_idx))
                 e, err = fm.kernel()
                 result = fm.qmc_result
                 del fm
@@ -663,27 +830,12 @@ class LnoAfqmcMixed:
                     )
         return float(e), float(err), time.perf_counter() - t0, result
 
-    def _run_isolated(self, frag: LnoFragData) -> tuple[float, float, FragQmcResult | None]:
+    def _run_isolated_path(self, path: Path, frag_idx: int) -> tuple[float, float]:
         """Run the fragment in a child process from its self-contained file."""
-        base = Path(self.save_frag_data) if self.save_frag_data is not None else Path("frag_data")
-        base.mkdir(parents=True, exist_ok=True)
-        path = base / f"frag{frag.frag_idx + 1}.h5"
-        fm = LnoFragMixed(self._scf, frag, trial=self.trial, guide=self.guide, **self.qmc_kwargs)
-        fm.save(path)
-        del fm
         _release_device()
-
-        opts = dict(self.qmc_kwargs)
-        opts.update(
-            trial=self.trial,
-            guide=self.guide,
-            max_error=self.max_error,
-            stop_ratio=self.stop_ratio,
-            min_blocks=self.min_blocks,
-            seed=self._frag_seed(frag.frag_idx),
-        )
-        opts_path = base / f"frag{frag.frag_idx + 1}.opts.json"
-        out_path = base / f"frag{frag.frag_idx + 1}.result.json"
+        opts = self._frag_kwargs(frag_idx)
+        opts_path = path.with_name(f"frag{frag_idx + 1}.opts.json")
+        out_path = path.with_name(f"frag{frag_idx + 1}.result.json")
         opts_path.write_text(json.dumps(opts))
         cmd = [
             sys.executable,
@@ -695,20 +847,23 @@ class LnoAfqmcMixed:
             "--out",
             str(out_path),
         ]
-        print(f"running fragment {frag.frag_idx + 1} in a child process: {' '.join(cmd)}")
+        print(f"running fragment {frag_idx + 1} in a child process: {' '.join(cmd)}")
         env = dict(os.environ)
         env.setdefault(_ALLOCATOR, "platform")
         proc = subprocess.run(cmd, env=env)
         if proc.returncode != 0:
             raise RuntimeError(
-                f"fragment {frag.frag_idx + 1} failed in the child process (exit {proc.returncode})"
+                f"fragment {frag_idx + 1} failed in the child process (exit {proc.returncode})"
             )
         res = json.loads(out_path.read_text())
-        return float(res["e_frag"]), float(res["e_frag_err"]), None
+        return float(res["e_frag"]), float(res["e_frag_err"])
 
     # ------------------------------------------------------------------ kernel
 
     def kernel(self) -> tuple[float, float]:
+        if self.frag_files:
+            return self._kernel_from_files()
+
         from pyscf import lib
 
         from . import solvers
@@ -720,6 +875,8 @@ class LnoAfqmcMixed:
         print("\n ******* LNO-AFQMC (lnoafqmc) ******* \n")
         print(f"LNO THRESHOLD = {self.lno_thresh_in}")
         print(f"trial = {self.trial}  guide = {self.guide}")
+        if not self.run_qmc and self.save_frag_data is not None:
+            print(f"run_qmc=False: the fragment files are written to {self.save_frag_data}")
 
         mlno = solvers.get_lnoccsd(
             mf, self.lo_coeff, self.frag_list, self.nfrozen, self.lno_thresh_in
@@ -807,6 +964,11 @@ class LnoAfqmcMixed:
                     print(f"LNO-AFQMC time (s):       {t_qmc:.2f}")
                 else:
                     efrag_qmc, efrag_qmc_err, t_qmc, result = 0.0, 0.0, 0.0, None
+                    if self.save_frag_data is not None:
+                        t_save = time.perf_counter()
+                        self.save_frag_file(frag)
+                        _release_device()
+                        print(f"LNO-integral time (s):    {time.perf_counter() - t_save:.2f}")
 
                 self.lno_size[ifrag] = frag.nact
                 self.lno_nocc[ifrag] = frag.nactocc
@@ -874,6 +1036,91 @@ class LnoAfqmcMixed:
         return self.e_qmc, self.e_qmc_err
 
     run = kernel
+
+    def _kernel_from_files(self) -> tuple[float, float]:
+        """The device stage of every fragment in run_frag, from the fragment files."""
+        print(banner_afqmc())
+        print_runtime_provenance()
+        print("\n ******* LNO-AFQMC (lnoafqmc), from the fragment files ******* \n")
+        print(f"LNO THRESHOLD = {self.lno_thresh_in}")
+        print(f"trial = {self.trial}  guide = {self.guide}")
+        run_frag = self.run_frag
+        nfrag_run = len(run_frag)
+        print(f"Run fragments {run_frag} ({nfrag_run} of {self.nfrag_tot})")
+        self._reset_results()
+        self._seeds = np.random.default_rng(self.seed).integers(1, 2**31 - 1, size=self.nfrag_tot)
+        if self.max_error is not None:
+            print(
+                f"target_error = {self.target_error:.2e}  ->  per fragment max_error = {self.max_error:.2e}"
+            )
+        lno_thresh = list(self.lno_thresh_in)
+        loop_time0 = time.perf_counter()
+        for ifrag, frag_idx in enumerate(run_frag):
+            meta = self.frag_meta[frag_idx]
+            path = self.frag_files[frag_idx]
+            width = 80
+            msg = f" LNO-FRAGMENT [{meta['frag_name']}] {ifrag + 1}/({nfrag_run},{self.nfrag_tot}) "
+            print("\n" + msg.center(width, "="))
+            print(f"Fragment Num.  {ifrag + 1}")
+            print(f"Fragment Idx.  {frag_idx + 1}")
+            print(f"Fragment Name  {meta['frag_name']}")
+            print(f"Fragment File  {path}")
+            print(
+                f"LNO THRESHOLD  [{', '.join('None' if x is None else f'{x:.2e}' for x in lno_thresh)}]"
+            )
+            print(f"LNO-MP2 Fragment Energy:  {meta['efrag_mp']:.8f}")
+            print(f"LNO-CCSD Fragment Energy: {meta['efrag_cc']:.8f}")
+            print(f"LNO-CPU time (s):         {meta['t_cpu']:.2f} (from the file)")
+
+            out_path = (
+                lno_io.frag_output_path(self.frag_output, frag_idx) if self.frag_output else None
+            )
+            with lno_io.tee_to_file(out_path, mode="w"):
+                efrag_qmc, efrag_qmc_err, t_qmc, result = self.lnoafqmc_kernel(path=path)
+            print(f"LNO-AFQMC time (s):       {t_qmc:.2f}")
+
+            self.lno_size[ifrag] = meta["nact"]
+            self.lno_nocc[ifrag] = meta["nactocc"]
+            self.lno_emp[ifrag] = meta["efrag_mp"]
+            self.lno_ecc[ifrag] = meta["efrag_cc"]
+            self.lno_eqmc[ifrag] = efrag_qmc
+            self.lno_eqmc_err[ifrag] = efrag_qmc_err
+            self.lno_cc_time[ifrag] = meta["t_cpu"]
+            self.lno_wait_time[ifrag] = 0.0
+            self.lno_qmc_time[ifrag] = t_qmc
+            if self.keep_qmc_results:
+                self.frag_qmc_results[ifrag] = result
+            self.n_done = ifrag + 1
+            self._update_totals()
+            self.loop_time = time.perf_counter() - loop_time0
+
+            if out_path is not None:
+                lno_io.write_frag_summary(
+                    out_path,
+                    frag_idx=frag_idx,
+                    frag_name=meta["frag_name"],
+                    nactocc=meta["nactocc"],
+                    norb=meta["nact"],
+                    efrag_mp=meta["efrag_mp"],
+                    efrag_cc=meta["efrag_cc"],
+                    efrag_qmc=efrag_qmc,
+                    efrag_qmc_err=efrag_qmc_err,
+                    t_cc=meta["t_cpu"],
+                    t_wait=0.0,
+                    t_qmc=t_qmc,
+                )
+            if self.lno_output is not None:
+                self._write_lno_output(lno_thresh, 0)
+            del result
+
+        self.loop_time = time.perf_counter() - loop_time0
+        print("\n" + "=" * 80)
+        print(f"E(LNO-MP2)   = {self.e_mp:.8f}")
+        print(f"E(LNO-CCSD)  = {self.e_cc:.8f}")
+        print(f"E(LNO-AFQMC) = {self.e_qmc:.6f} +/- {self.e_qmc_err:.6f}")
+        print(f"Loop wall time:              {self.loop_time:.2f} s")
+        print("=" * 80)
+        return self.e_qmc, self.e_qmc_err
 
     def _write_lno_output(self, lno_thresh: Any, depth: int) -> None:
         assert self.lno_output is not None

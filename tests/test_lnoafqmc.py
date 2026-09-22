@@ -606,6 +606,120 @@ def test_lno_afqmc_o2_end_to_end(o2, tmp_path, request):
     assert abs(e1 - lno.lno_eqmc[0]) < 1e-10 and abs(err1 - lno.lno_eqmc_err[0]) < 1e-10
 
 
+def test_frag_memory_budget_and_chunk_plan(o2, tmp_path):
+    """
+    Without max_memory the fragment takes its budget from the device (also under the
+    platform allocator, where jax reports none), so the trial gets a chunk plan; the plan
+    and its memory lines are in the banner; an explicit max_memory sizes the chunk.
+    """
+    import jax
+
+    from trot.lnoafqmc.afqmc import device_memory_budget_mb
+
+    mf, frag = o2["mf"], o2["frags"][0]
+    budget, source = device_memory_budget_mb()
+    on_gpu = jax.devices()[0].platform == "gpu"
+    assert (budget is not None) == on_gpu
+    fm = LnoFragMixed(mf, frag, chol_cut=CHOL_CUT, trial="pt2ccsd_fast", n_walkers=8)
+    assert fm.max_memory == budget and fm.max_memory_source == source
+    small = LnoFragMixed(
+        mf, frag, chol_cut=CHOL_CUT, trial="pt2ccsd_fast", n_walkers=8, max_memory=2
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        job = small.build_job()
+        small.dump_flags(job)
+    text = buf.getvalue()
+    assert small.max_memory_source == "max_memory" and job.chunk_plan is not None
+    nchol = int(job.ham_data.nchol)
+    assert 1 <= job.chunk_plan.nchol_chunk <= nchol and job.chunk_plan.budget_bytes == 2 * 1024**2
+    assert " max_memory      = 2 MB  (max_memory)" in text
+    for key in (
+        "chunk_plan",
+        "nchol_chunk",
+        "padded",
+        "walkers_in_flight",
+        "memory_resident",
+        "memory_per_walker",
+        "memory_walkers",
+        "memory_used",
+        "memory_budget",
+    ):
+        assert key in text, key
+    if on_gpu:
+        with contextlib.redirect_stdout(io.StringIO()):
+            assert fm.build_job().chunk_plan is not None
+
+
+def test_cpu_gpu_split_reproduces_one_machine_loop(o2, tmp_path):
+    """
+    run_qmc=False + save_frag_data writes the fragment files and runs no AFQMC; a second
+    LnoAfqmcMixed(frag_data=...) runs the AFQMC from the files only and, with the same
+    seed and settings, reproduces the one-machine loop fragment by fragment.
+    """
+    mf, nfrozen = o2["mf"], o2["nfrozen"]
+    common: dict[str, Any] = dict(trial="pt2ccsd_fast", seed=17, mixed_precision=False)
+    qmc: dict[str, Any] = dict(n_walkers=20, n_eql_blocks=2, n_blocks=20, dt=0.005, n_prop_steps=10)
+    lno_args = (mf, o2["lo_coeff"], o2["frag_list"])
+    lno_kw: dict[str, Any] = dict(
+        frag_name=o2["frag_name"], lno_thresh=1e-12, nfrozen=nfrozen, chol_cut=CHOL_CUT
+    )
+    files = tmp_path / "frag_data"
+    with contextlib.redirect_stdout(io.StringIO()):
+        # CPU machine: LNO + MP2 + CCSD + the fragment integrals, no QMC
+        cpu = LnoAfqmcMixed(*lno_args, run_qmc=False, save_frag_data=str(files), **lno_kw, **common)
+        e0, err0 = cpu.kernel()
+        # GPU machine: AFQMC from the files only
+        gpu = LnoAfqmcMixed(
+            frag_data=files,
+            frag_output=str(tmp_path / "fragment.out"),
+            lno_output=str(tmp_path / "lno_result.out"),
+            keep_qmc_results=True,
+            **common,
+            **qmc,
+        )
+        e_files, err_files = gpu.kernel()
+        # one machine
+        one = LnoAfqmcMixed(*lno_args, keep_qmc_results=True, **lno_kw, **common, **qmc)
+        e_one, err_one = one.kernel()
+    assert (e0, err0) == (0.0, 0.0) and not np.any(cpu.lno_eqmc)
+    assert sorted(p.name for p in files.glob("*.h5")) == ["frag1.h5", "frag2.h5"]
+    meta = lst.frag_file_meta(files / "frag2.h5")
+    assert meta["frag_idx"] == 1 and meta["nfrag_tot"] == 2 and not meta["unrestricted"]
+    assert gpu._scf is None and gpu.nfrag_tot == 2 and gpu.run_frag == [0, 1]
+    assert gpu.frag_name_all == one.frag_name_all and gpu.nfrozen == one.nfrozen
+    assert gpu.lno_size == one.lno_size and gpu.lno_nocc == one.lno_nocc
+    assert np.allclose(gpu.lno_emp, one.lno_emp) and np.allclose(gpu.lno_ecc, one.lno_ecc)
+    assert np.allclose(gpu.lno_emp, cpu.lno_emp) and np.allclose(gpu.lno_ecc, cpu.lno_ecc)
+    assert abs(gpu.e_cc - one.e_cc) < 1e-12
+    for r_files, r_one in zip(gpu.frag_qmc_results, one.frag_qmc_results):
+        assert abs(r_files.frag_init_energy - r_one.frag_init_energy) < 1e-10
+    assert np.allclose(gpu.lno_eqmc, one.lno_eqmc, atol=1e-10)
+    assert np.allclose(gpu.lno_eqmc_err, one.lno_eqmc_err, atol=1e-10)
+    assert abs(e_files - e_one) < 1e-10 and abs(err_files - err_one) < 1e-10
+    assert (tmp_path / "fragment.out2").exists() and (tmp_path / "lno_result.out").exists()
+
+    # a subset of the fragments, and one file instead of the directory
+    with contextlib.redirect_stdout(io.StringIO()):
+        sub = LnoAfqmcMixed(frag_data=files, run_frag=[1], **common, **qmc)
+        e_sub, _ = sub.kernel()
+        one_file = LnoAfqmcMixed(frag_data=files / "frag2.h5", **common, **qmc)
+        e_one_file, _ = one_file.kernel()
+    assert sub.nfrag_tot == 2 and sub.run_frag == [1]
+    assert abs(e_sub - gpu.lno_eqmc[1]) < 1e-10 and abs(e_one_file - gpu.lno_eqmc[1]) < 1e-10
+    assert one_file.nfrag_tot == 2  # from the file, so the seeds are those of the loop
+
+    # errors: both inputs, a missing fragment, the wrong trial for the files
+    with pytest.raises(ValueError, match="replaces"):
+        LnoAfqmcMixed(mf, o2["lo_coeff"], o2["frag_list"], frag_data=files, **lno_kw)
+    with pytest.raises(ValueError, match="no fragment file"):
+        LnoAfqmcMixed(frag_data=files / "frag2.h5", run_frag=[0], **common)
+    with pytest.raises(ValueError, match="mean field"):
+        LnoAfqmcMixed(frag_data=files, trial="upt2ccsd")
+    with pytest.raises(ValueError, match="requires run_cc=True"):
+        LnoAfqmcMixed(*lno_args, run_qmc=False, run_cc=False, save_frag_data=str(files), **lno_kw)
+
+
 # ----------------------------------------------------------------------------- CISD guide
 
 

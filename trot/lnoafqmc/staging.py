@@ -438,6 +438,7 @@ def dump_frag(
     *,
     emf: float | None = None,
     amplitudes: str = "full",
+    nfrag_tot: int | None = None,
 ) -> Path:
     """
     Write the self-contained fragment file: the LNO data and amplitudes, the fragment
@@ -448,6 +449,9 @@ def dump_frag(
     amplitudes="full" stores t2 as the CCSD produced it; "projected" stores the doubles
     contracted with U on their first occupied index instead (projected_doubles), nlo/nocc
     the size, which is all the pt2CCSD trials need (the CISD guides need the full ones).
+    nfrag_tot, the number of fragments of the whole fragmentation, is stored when given so
+    that LnoAfqmcMixed(frag_data=...) draws the same per fragment seeds as the loop that
+    wrote the files.
     """
     if amplitudes not in ("full", "projected"):
         raise ValueError(f"amplitudes must be 'full' or 'projected', got {amplitudes!r}")
@@ -467,6 +471,8 @@ def dump_frag(
         g.attrs["frag_name"] = str(frag.frag_name)
         g.attrs["unrestricted"] = bool(frag.unrestricted)
         g.attrs["nfrozen"] = int(frag.nfrozen)
+        if nfrag_tot is not None:
+            g.attrs["nfrag_tot"] = int(nfrag_tot)
         g.attrs["lno_thresh_json"] = json.dumps(
             [None if x is None else float(x) for x in frag.lno_thresh]
         )
@@ -553,6 +559,47 @@ def load_frag(path: Union[str, Path]) -> tuple[LnoFragData, StagedInputs, dict[s
             else:
                 kw["t2"] = np.array(ga["t2"])
     return LnoFragData(**kw), staged, attrs
+
+
+def frag_file_meta(path: Union[str, Path]) -> dict[str, Any]:
+    """
+    The metadata of a fragment file without its arrays: frag_idx, frag_name,
+    unrestricted, nactocc, nactvir, nact, efrag_mp, efrag_cc, lno_thresh, nfrozen, emf,
+    the fragment hamiltonian's basis and nfrag_tot when the loop that wrote the file
+    stored it (else None).
+    """
+    path = Path(path)
+    with h5py.File(path, "r") as h5file:
+        f: Any = h5file
+        version = int(f.attrs.get("frag_file_version", -1))
+        if version not in _FRAG_FILE_VERSIONS:
+            raise ValueError(
+                f"{path}: fragment file version {version}, expected one of {_FRAG_FILE_VERSIONS}"
+            )
+        g = f["frag"]
+        unrestricted = bool(g.attrs["unrestricted"])
+        occ = np.atleast_1d(np.array(g["nactocc"])).astype(int)
+        vir = np.atleast_1d(np.array(g["nactvir"])).astype(int)
+        nactocc: Any = tuple(int(x) for x in occ) if unrestricted else int(occ[0])
+        nactvir: Any = tuple(int(x) for x in vir) if unrestricted else int(vir[0])
+        nact: Any = tuple(int(x) for x in occ + vir) if unrestricted else int(occ[0] + vir[0])
+        return dict(
+            path=path,
+            frag_idx=int(g.attrs["frag_idx"]),
+            frag_name=str(g.attrs["frag_name"]),
+            unrestricted=unrestricted,
+            nactocc=nactocc,
+            nactvir=nactvir,
+            nact=nact,
+            efrag_mp=float(g.attrs["efrag_mp"]),
+            efrag_cc=float(g.attrs["efrag_cc"]),
+            lno_thresh=tuple(json.loads(str(g.attrs["lno_thresh_json"]))),
+            nfrozen=int(g.attrs["nfrozen"]),
+            nfrag_tot=int(g.attrs["nfrag_tot"]) if "nfrag_tot" in g.attrs else None,
+            t_cpu=float(g.attrs["t_cpu"]),
+            emf=float(f.attrs["emf"]),
+            basis=str(f["ham"].attrs.get("basis", "restricted")),
+        )
 
 
 def frag_data_fields() -> tuple[str, ...]:
