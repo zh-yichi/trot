@@ -30,6 +30,7 @@ from typing import Any, Tuple
 import jax
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
+from pyscf import lib
 
 from .staging import _rotate_chol_to_mo, chunked_cholesky
 
@@ -379,16 +380,13 @@ def freeze_core_from_mo_cholesky_uh(
 
     def _one_spin(h1, chol, core, act, chol_core):
         chol_act = np.asarray(chol[:, act, act])
-        vj = np.einsum("x,xpq->pq", core_trace, chol_act, optimize=True)
-        vk = np.einsum(
-            "xpi,xiq->pq",
-            np.asarray(chol[:, act, core]),
-            np.asarray(chol[:, core, act]),
-            optimize=True,
+        vj = lib.einsum("x,xpq->pq", core_trace, chol_act)
+        vk = lib.einsum(
+            "xpi,xiq->pq", np.asarray(chol[:, act, core]), np.asarray(chol[:, core, act])
         )
         h1_eff = np.asarray(h1[act, act]) + vj - vk
         e1_core = np.trace(np.asarray(h1[core, core]))
-        ek_core = np.einsum("xij,xji->", chol_core, chol_core, optimize=True)
+        ek_core = lib.einsum("xij,xji->", chol_core, chol_core)
         return h1_eff, chol_act, e1_core, ek_core
 
     h1_eff_a, chol_act_a, e1_a, ek_a = _one_spin(h1_a, chol_a, core_a, act_a, chol_core_a)

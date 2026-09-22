@@ -20,7 +20,7 @@ print = partial(print, flush=True)
 # (get_lno_integral_joint, called from prep_lno_integral):
 #
 #   1. the effective core energy and one-electron integrals come from the frozen
-#      occupied LNOs, with J and K built from the DF tensor on the device
+#      occupied LNOs, with J and K built from the DF tensor on the host (lib.einsum)
 #      (afqmc h1e_ras / h1e_uas, here lno_effective_core_r / lno_effective_core_u);
 #   2. the cholesky vectors of the local active space are compressed straight from the
 #      whole system's DF 3-index tensor mf.with_df, rotated into the active space one aux
@@ -70,12 +70,17 @@ def get_las_idx(mf: Any, lno_frozen: Any) -> Any:
 # --------------------------------------------------------------------------- core
 
 
-def _require_df_x64(mf: Any) -> None:
+def _require_df(mf: Any) -> None:
     if getattr(mf, "with_df", None) is None:
         raise NotImplementedError(
             "LNO-AFQMC builds the fragment integrals from the density fitting tensor; "
             "use a density fitted mean field (mf.density_fit())."
         )
+
+
+def _require_df_x64(mf: Any) -> None:
+    """The compiled cholesky (df2chol_gpu) also needs jax in double precision."""
+    _require_df(mf)
     if not jax.config.read("jax_enable_x64"):
         raise RuntimeError(
             "jax_enable_x64 is off: the fragment integrals would be built in single precision. "
@@ -83,12 +88,11 @@ def _require_df_x64(mf: Any) -> None:
         )
 
 
-@jax.jit
-def _rjk_from_cderi(cderi: jax.Array, dm: jax.Array):
-    """J[D], K[D] from one (naux, nao, nao) block of DF vectors, restricted."""
-    cderi_dm = jnp.einsum("gik,kj->gij", cderi, dm)
-    vj = jnp.einsum("gkk,gij->ij", cderi_dm, cderi)
-    vk = jnp.einsum("gik,gkj->ij", cderi_dm, cderi)
+def _rjk_from_cderi(cderi: NDArray, dm: NDArray) -> tuple[NDArray, NDArray]:
+    """J[D], K[D] from one (naux, nao, nao) block of DF vectors, restricted (BLAS)."""
+    cderi_dm = lib.einsum("gik,kj->gij", cderi, dm)
+    vj = lib.einsum("g,gij->ij", lib.einsum("gkk->g", cderi_dm), cderi)
+    vk = lib.einsum("gik,gkj->ij", cderi_dm, cderi)
     return vj, vk
 
 
@@ -97,36 +101,33 @@ def core_rveff(mf: Any, dm: NDArray) -> NDArray:
     V = 2 J[D] - K[D] for a restricted core density, in the AO basis (afqmc's
     get_rveff_df / get_rveff).
 
-    A density fitted mf is contracted block by block on the device, which is much faster
-    than pyscf's DF get_jk; otherwise this is mf.get_jk with the exact ERIs. Without
-    jax_enable_x64 the device path would be single precision, so it falls back to
-    mf.get_jk (still density fitted) there too.
+    A density fitted mf is contracted block by block with pyscf's BLAS einsum, on the
+    host (the CPU stage needs no device); otherwise this is mf.get_jk with the exact ERIs.
     """
     with_df = getattr(mf, "with_df", None)
-    if with_df is None or not jax.config.read("jax_enable_x64"):
+    if with_df is None:
         vj, vk = mf.get_jk(mf.mol, np.asarray(dm), hermi=1)
         return 2.0 * vj - vk
 
-    from pyscf import lib
-
-    dm_j = jnp.asarray(dm)
-    vj = jnp.zeros_like(dm_j)
-    vk = jnp.zeros_like(dm_j)
+    dm = np.asarray(dm)
+    vj = np.zeros_like(dm)
+    vk = np.zeros_like(dm)
     for cderi in with_df.loop():
-        cderi = jnp.asarray(lib.unpack_tril(cderi, axis=-1))
-        dvj, dvk = _rjk_from_cderi(cderi, dm_j)
+        cderi = lib.unpack_tril(np.asarray(cderi), axis=-1)
+        dvj, dvk = _rjk_from_cderi(cderi, dm)
         vj += dvj
         vk += dvk
-    return np.asarray(2.0 * vj - vk)
+    return 2.0 * vj - vk
 
 
-@jax.jit
-def _ujk_from_cderi(cderi: jax.Array, dm_a: jax.Array, dm_b: jax.Array):
-    """J[D^a + D^b], K[D^a], K[D^b] from one (naux, nao, nao) block of DF vectors."""
+def _ujk_from_cderi(
+    cderi: NDArray, dm_a: NDArray, dm_b: NDArray
+) -> tuple[NDArray, NDArray, NDArray]:
+    """J[D^a + D^b], K[D^a], K[D^b] from one (naux, nao, nao) block of DF vectors (BLAS)."""
     dm_tot = dm_a + dm_b
-    vj = jnp.einsum("g,gij->ij", jnp.einsum("gkl,lk->g", cderi, dm_tot), cderi)
-    vk_a = jnp.einsum("gik,kl,glj->ij", cderi, dm_a, cderi, optimize=True)
-    vk_b = jnp.einsum("gik,kl,glj->ij", cderi, dm_b, cderi, optimize=True)
+    vj = lib.einsum("g,gij->ij", lib.einsum("gkl,lk->g", cderi, dm_tot), cderi)
+    vk_a = lib.einsum("gil,glj->ij", lib.einsum("gik,kl->gil", cderi, dm_a), cderi)
+    vk_b = lib.einsum("gil,glj->ij", lib.einsum("gik,kl->gil", cderi, dm_b), cderi)
     return vj, vk_a, vk_b
 
 
@@ -134,30 +135,26 @@ def core_uveff(mf: Any, dm_a: NDArray, dm_b: NDArray) -> tuple[NDArray, NDArray]
     """
     V^s = J[D^a + D^b] - K[D^s] for the core densities, in the AO basis.
 
-    A density fitted mf is contracted block by block on the device, which is much faster
-    than pyscf's DF get_jk; otherwise this is mf.get_jk with the exact ERIs. Without
-    jax_enable_x64 the device path would be single precision, so it falls back to
-    mf.get_jk (still density fitted) there too.
+    A density fitted mf is contracted block by block with pyscf's BLAS einsum, on the
+    host (the CPU stage needs no device); otherwise this is mf.get_jk with the exact ERIs.
     """
     with_df = getattr(mf, "with_df", None)
-    if with_df is None or not jax.config.read("jax_enable_x64"):
+    if with_df is None:
         vj, vk = mf.get_jk(mf.mol, np.asarray([dm_a, dm_b]), hermi=1)
         return vj[0] + vj[1] - vk[0], vj[0] + vj[1] - vk[1]
 
-    from pyscf import lib
-
-    dma = jnp.asarray(dm_a)
-    dmb = jnp.asarray(dm_b)
-    vj = jnp.zeros_like(dma)
-    vk_a = jnp.zeros_like(dma)
-    vk_b = jnp.zeros_like(dmb)
+    dm_a = np.asarray(dm_a)
+    dm_b = np.asarray(dm_b)
+    vj = np.zeros_like(dm_a)
+    vk_a = np.zeros_like(dm_a)
+    vk_b = np.zeros_like(dm_b)
     for cderi in with_df.loop():
-        cderi = jnp.asarray(lib.unpack_tril(cderi, axis=-1))
-        dvj, dvk_a, dvk_b = _ujk_from_cderi(cderi, dma, dmb)
+        cderi = lib.unpack_tril(np.asarray(cderi), axis=-1)
+        dvj, dvk_a, dvk_b = _ujk_from_cderi(cderi, dm_a, dm_b)
         vj += dvj
         vk_a += dvk_a
         vk_b += dvk_b
-    return np.asarray(vj - vk_a), np.asarray(vj - vk_b)
+    return vj - vk_a, vj - vk_b
 
 
 def lno_effective_core_r(mf: Any, core: Any, act: Any) -> tuple[float, NDArray]:
@@ -169,7 +166,7 @@ def lno_effective_core_r(mf: Any, core: Any, act: Any) -> tuple[float, NDArray]:
         E_core = E_nuc + 2 tr(D h) + tr(D V)
         h1eff  = C_a^T (h + V) C_a
     """
-    _require_df_x64(mf)
+    _require_df(mf)
     hcore = np.asarray(mf.get_hcore())
     e_core = float(mf.energy_nuc())
     core = np.asarray(core)
@@ -180,8 +177,8 @@ def lno_effective_core_r(mf: Any, core: Any, act: Any) -> tuple[float, NDArray]:
     else:
         dm = core @ core.conj().T
         veff = core_rveff(mf, dm)
-        e_core += 2.0 * float(np.einsum("ij,ji->", dm, hcore).real)
-        e_core += float(np.einsum("ij,ji->", dm, veff).real)
+        e_core += 2.0 * float(lib.einsum("ij,ji->", dm, hcore).real)
+        e_core += float(lib.einsum("ij,ji->", dm, veff).real)
     h1eff = act.conj().T @ (hcore + veff) @ act
     return e_core, np.asarray(h1eff)
 
@@ -195,7 +192,7 @@ def lno_effective_core_u(mf: Any, core: Any, act: Any) -> tuple[float, tuple[NDA
         E_core  = E_nuc + sum_s tr(D^s h) + 1/2 sum_s tr(D^s V^s)
         h1eff^s = C_a^s^T (h + V^s) C_a^s
     """
-    _require_df_x64(mf)
+    _require_df(mf)
     hcore = np.asarray(mf.get_hcore())
     e_core = float(mf.energy_nuc())
     cores = [np.asarray(c) for c in core]
@@ -207,8 +204,8 @@ def lno_effective_core_u(mf: Any, core: Any, act: Any) -> tuple[float, tuple[NDA
         dms = [c @ c.conj().T for c in cores]
         veff = core_uveff(mf, dms[0], dms[1])
         for s in range(2):
-            e_core += float(np.einsum("ij,ji->", dms[s], hcore).real)
-            e_core += 0.5 * float(np.einsum("ij,ji->", dms[s], veff[s]).real)
+            e_core += float(lib.einsum("ij,ji->", dms[s], hcore).real)
+            e_core += 0.5 * float(lib.einsum("ij,ji->", dms[s], veff[s]).real)
     h1eff = tuple(np.asarray(acts[s].conj().T @ (hcore + veff[s]) @ acts[s]) for s in range(2))
     return e_core, (h1eff[0], h1eff[1])
 
@@ -225,13 +222,16 @@ def lno_effective_core(mf: Any, core: Any, act: Any) -> tuple[float, Any]:
 # --------------------------------------------------------------------------- cholesky
 
 
-@jax.jit
-def cderi2mo(cderi: jax.Array, coeff: jax.Array) -> jax.Array:
-    """One (blk, nao, nao) DF block rotated into an orbital set and packed, (blk, npair)."""
-    cderi_mo = jnp.einsum("pr,grs,sq->gpq", coeff.T, cderi, coeff, optimize="optimal")
+def cderi2mo(cderi: NDArray, coeff: NDArray) -> NDArray:
+    """
+    One (blk, nao, nao) DF block rotated into an orbital set and packed, (blk, npair),
+    lower triangle in row major order (the order df2chol_gpu unpacks with tril_indices).
+    """
+    half = lib.einsum("grs,sq->grq", cderi, coeff)
+    cderi_mo = lib.einsum("pr,grq->gpq", coeff.T, half)
     n = coeff.shape[1]
-    rows, cols = jnp.tril_indices(n)
-    return cderi_mo[:, rows, cols]
+    rows, cols = np.tril_indices(n)
+    return np.ascontiguousarray(cderi_mo[:, rows, cols])
 
 
 @jax.jit
@@ -279,17 +279,17 @@ def df2chol_gpu(dferi: jax.Array, max_error: float = 1e-6) -> tuple[jax.Array, A
 def active_df(mf: Any, coeffs: list[NDArray]) -> list[NDArray]:
     """
     The DF tensor of mf rotated and packed into each orbital set of coeffs, one aux
-    block at a time on the device: a (naux, n(n+1)/2) array per set.
+    block at a time on the host: a (naux, n(n+1)/2) array per set.
     """
     naux = int(mf.with_df.get_naoaux())
-    coeffs_j = [jnp.asarray(c) for c in coeffs]
+    coeffs_n = [np.asarray(c) for c in coeffs]
     outs = [np.zeros((naux, c.shape[1] * (c.shape[1] + 1) // 2)) for c in coeffs]
     p1 = 0
     for cderi in mf.with_df.loop():
-        cderi = jnp.asarray(lib.unpack_tril(cderi, axis=-1))
+        cderi = lib.unpack_tril(np.asarray(cderi), axis=-1)
         p0, p1 = p1, p1 + cderi.shape[0]
-        for out, c in zip(outs, coeffs_j):
-            out[p0:p1] = np.asarray(cderi2mo(cderi, c))
+        for out, c in zip(outs, coeffs_n):
+            out[p0:p1] = cderi2mo(cderi, c)
     if p1 != naux:
         raise RuntimeError(f"DF iterator yielded {p1} auxiliaries; expected {naux}.")
     return outs
@@ -343,7 +343,7 @@ def build_ham_ulno_df(mf: Any, lno_coeff: Any, lno_frozen: Any, *, chol_cut: flo
     The unrestricted fragment hamiltonian (afqmc get_lno_integral_joint, UHF branch):
     each spin's active DF tensor, factored jointly so both share the auxiliary index.
     """
-    _require_df_x64(mf)
+    _require_df(mf)
     coeffs = [np.asarray(c) for c in lno_coeff]
     ncore, nocc, ncas, _ = get_las_idx(mf, lno_frozen)
     print(f"[lnoafqmc] fragment space: nocc={nocc} ncas={ncas} ncore={ncore}")

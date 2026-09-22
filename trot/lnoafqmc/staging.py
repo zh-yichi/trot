@@ -10,6 +10,7 @@ from typing import Any, Union
 import h5py
 import numpy as np
 from numpy.typing import NDArray
+from pyscf import lib
 
 from ..staging import StagedInputs, TrialInput
 from ..staging import _load_h5 as _load_staged_h5
@@ -164,7 +165,7 @@ def projected_doubles(frag: LnoFragData) -> Any:
     if not frag.unrestricted:
         t2 = np.asarray(frag.t2, dtype=np.float64).transpose(0, 2, 1, 3)  # (i,j,a,b) -> (i,a,j,b)
         u = np.asarray(frag.uocc_loc)
-        return np.einsum("iajb,iI->Iajb", t2, u, optimize="optimal")
+        return lib.einsum("iajb,iI->Iajb", t2, u, optimize="optimal")
     t2aa, t2ab, t2bb = (np.asarray(t, dtype=np.float64) for t in frag.t2)
     t2aa = 0.5 * (t2aa - t2aa.transpose(0, 1, 3, 2))
     t2bb = 0.5 * (t2bb - t2bb.transpose(0, 1, 3, 2))
@@ -173,10 +174,10 @@ def projected_doubles(frag: LnoFragData) -> Any:
     t2bb = t2bb.transpose(0, 2, 1, 3)
     ua, ub = (np.asarray(u) for u in frag.uocc_loc)
     return (
-        np.einsum("iajb,iI->Iajb", t2aa, ua, optimize="optimal"),
-        np.einsum("iajb,iI->Iajb", t2ab, ua, optimize="optimal"),
-        np.einsum("jbia,iI->Iajb", t2ab, ub, optimize="optimal"),
-        np.einsum("iajb,iI->Iajb", t2bb, ub, optimize="optimal"),
+        lib.einsum("iajb,iI->Iajb", t2aa, ua, optimize="optimal"),
+        lib.einsum("iajb,iI->Iajb", t2ab, ua, optimize="optimal"),
+        lib.einsum("jbia,iI->Iajb", t2ab, ub, optimize="optimal"),
+        lib.einsum("iajb,iI->Iajb", t2bb, ub, optimize="optimal"),
     )
 
 
@@ -200,7 +201,7 @@ def stage_pt2ccsd_trial(frag: LnoFragData) -> TrialInput:
     uocc = np.asarray(frag.uocc_loc)
     prjlo = uocc @ uocc.T.conj()
     # t2_kajb = sum_i t2_iajb prjlo_ik = sum_I t2u_Iajb U*_kI
-    t2 = np.einsum("Iajb,kI->kajb", projected_doubles(frag), uocc.conj(), optimize="optimal")
+    t2 = lib.einsum("Iajb,kI->kajb", projected_doubles(frag), uocc.conj(), optimize="optimal")
 
     data = {"mo_t": _thouless(t1), "t2": t2, "prjlo": prjlo, "t1": t1}
     return TrialInput(
@@ -249,7 +250,7 @@ def stage_cisd_guide(frag: LnoFragData) -> TrialInput:
         )
     t1 = np.asarray(frag.t1, dtype=np.float64)
     t2 = np.asarray(frag.t2, dtype=np.float64)
-    ci2 = (t2 + np.einsum("ia,jb->ijab", t1, t1)).transpose(0, 2, 1, 3)
+    ci2 = (t2 + lib.einsum("ia,jb->ijab", t1, t1)).transpose(0, 2, 1, 3)
     data = {
         "ci1": t1,
         "ci2": ci2,
@@ -299,11 +300,11 @@ def stage_ucisd_guide(frag: LnoFragData) -> TrialInput:
     t1a, t1b = (np.asarray(t, dtype=np.float64) for t in frag.t1)
     t2aa, t2ab, t2bb = (np.asarray(t, dtype=np.float64) for t in frag.t2)
 
-    ci2aa = t2aa + 2.0 * np.einsum("ia,jb->ijab", t1a, t1a)
+    ci2aa = t2aa + 2.0 * lib.einsum("ia,jb->ijab", t1a, t1a)
     ci2aa = 0.5 * (ci2aa - ci2aa.transpose(0, 1, 3, 2))
-    ci2bb = t2bb + 2.0 * np.einsum("ia,jb->ijab", t1b, t1b)
+    ci2bb = t2bb + 2.0 * lib.einsum("ia,jb->ijab", t1b, t1b)
     ci2bb = 0.5 * (ci2bb - ci2bb.transpose(0, 1, 3, 2))
-    ci2ab = t2ab + np.einsum("ia,jb->ijab", t1a, t1b)
+    ci2ab = t2ab + lib.einsum("ia,jb->ijab", t1a, t1b)
 
     nocc_a, nvir_a = t1a.shape
     nocc_b, nvir_b = t1b.shape
@@ -344,10 +345,10 @@ def stage_upt2ccsd_trial(frag: LnoFragData) -> TrialInput:
     data = {
         "mo_t_a": _thouless(t1a),
         "mo_t_b": _thouless(t1b),
-        "t2aa": np.einsum("Iajb,kI->kajb", t2aa_u, ua.conj(), optimize="optimal"),
-        "t2ab": np.einsum("Iajb,kI->kajb", t2ab_u, ua.conj(), optimize="optimal"),
-        "t2ba": np.einsum("Iajb,kI->kajb", t2ba_u, ub.conj(), optimize="optimal"),
-        "t2bb": np.einsum("Iajb,kI->kajb", t2bb_u, ub.conj(), optimize="optimal"),
+        "t2aa": lib.einsum("Iajb,kI->kajb", t2aa_u, ua.conj(), optimize="optimal"),
+        "t2ab": lib.einsum("Iajb,kI->kajb", t2ab_u, ua.conj(), optimize="optimal"),
+        "t2ba": lib.einsum("Iajb,kI->kajb", t2ba_u, ub.conj(), optimize="optimal"),
+        "t2bb": lib.einsum("Iajb,kI->kajb", t2bb_u, ub.conj(), optimize="optimal"),
         "prjlo_a": prjlo_a,
         "prjlo_b": prjlo_b,
         "t1a": t1a,
