@@ -1153,7 +1153,12 @@ class AfqmcMixed(Afqmc):
     mixed_precision : bool, optional
         Single precision for the T2 contractions of the trial estimator and the
         propagator's cholesky products, by default True; partial sums are always
-        accumulated in double.
+        accumulated in double. It sets both sides unless one of the two knobs below
+        overrides it.
+    guide_mixed_precision, trial_mixed_precision : bool, optional
+        The precision of the guide (its propagator and kernels) and of the trial
+        estimator separately; each defaults to ``mixed_precision``. Setting them apart
+        shows where a change of speed or accuracy comes from.
     basis_a, basis_b : NDArray, optional
         Unrestricted hamiltonian only: the alpha and beta orbital bases, as in AfqmcUh.
         They default to the UCCSD object's own MOs, which is where its amplitudes live.
@@ -1182,6 +1187,8 @@ class AfqmcMixed(Afqmc):
         nchol_chunk: int | None = None,
         max_memory: float | None = None,
         mixed_precision: bool = True,
+        guide_mixed_precision: bool | None = None,
+        trial_mixed_precision: bool | None = None,
         basis_a: NDArray | None = None,
         basis_b: NDArray | None = None,
         norb_frozen_core: int | None = None,
@@ -1262,6 +1269,12 @@ class AfqmcMixed(Afqmc):
         self.basis_b = None if basis_b is None else np.asarray(basis_b)
         self.walker_kind = cast(WalkerKind, self.recipe.walker_kind)
         self.mixed_precision = mixed_precision
+        self.guide_mixed_precision = (
+            bool(mixed_precision) if guide_mixed_precision is None else bool(guide_mixed_precision)
+        )
+        self.trial_mixed_precision = (
+            bool(mixed_precision) if trial_mixed_precision is None else bool(trial_mixed_precision)
+        )
         self.nchol_chunk = nchol_chunk
         self.max_memory = max_memory
         self.tau_eql = None if tau_eql is None else float(tau_eql)
@@ -1403,7 +1416,8 @@ class AfqmcMixed(Afqmc):
                 max_memory=self.max_memory,
                 walker_kind=self.walker_kind,
                 mesh=mesh,
-                mixed_precision=self.mixed_precision,
+                mixed_precision=self.guide_mixed_precision,
+                trial_mixed_precision=self.trial_mixed_precision,
                 params=cast(Any, qmc_params),
                 **kwargs,
             ),
@@ -1444,7 +1458,9 @@ class AfqmcMixed(Afqmc):
         print(f" source_kind     = {meta['source_kind']}")
         print(f" chol_cut        = {meta['chol_cut']:g}")
         print(f" cache           = {str(self.cache) if self.cache else None}")
-        print(f" mixed_precision = {self.mixed_precision}\n")
+        print(f" mixed_precision = {self.mixed_precision}")
+        print(f"   guide           = {self.guide_mixed_precision}")
+        print(f"   trial           = {self.trial_mixed_precision}\n")
 
         # the guide propagates the walkers, so it carries a force bias; the trial only
         # measures, so it has none

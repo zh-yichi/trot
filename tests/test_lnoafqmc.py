@@ -39,8 +39,10 @@ from trot.lnoafqmc import integral as li
 from trot.lnoafqmc import las, pipeline, solvers
 from trot.lnoafqmc import staging as lst
 from trot.lnoafqmc.meas import pt2ccsd_bar as lm
+from trot.lnoafqmc.meas import pt2ccsd_fast as lf
 from trot.lnoafqmc.mixed import available_mixed_recipes, get_mixed_recipe
 from trot.lnoafqmc.trial.pt2ccsd import make_pt2ccsd_trial_data, overlap_r
+from trot.lnoafqmc.trial.pt2ccsd_fast import make_pt2ccsd_fast_trial_data
 from trot.meas.pt2ccsd_bar import build_meas_ctx as trot_build_ctx
 from trot.meas.pt2ccsd_bar import energy_kernel_rw_rh_bar as trot_bar_kernel
 from trot.meas.pt2ccsd_chunking import make_chunk_meas_cfg
@@ -313,6 +315,88 @@ def test_chunk_plan_sizes_the_fragment_kernel(frag0):
     assert fixed.nchol_chunk == 4
 
 
+# ----------------------------------------------------------------------------- pt2ccsd_fast
+
+
+def test_fast_trial_staging(o2):
+    """t2u = t2 U on the first index, U = <act_occ|lo> with nlo < nocc; prjlo = U U^T."""
+    frag = o2["frags"][0]
+    tin = lst.stage_pt2ccsd_fast_trial(frag)
+    assert tin.kind == "pt2ccsd_fast"
+    u = np.asarray(tin.data["u"])
+    nocc, nlo = u.shape
+    assert nlo < nocc and np.array_equal(u, np.asarray(frag.uocc_loc))
+    t2 = np.asarray(frag.t2).transpose(0, 2, 1, 3)
+    t2u = np.einsum("iajb,iI->Iajb", t2, u)
+    assert tin.data["t2x"].shape == (nlo, t2.shape[1], nocc, t2.shape[3])
+    np.testing.assert_allclose(tin.data["t2x"], 2 * t2u - t2u.transpose(0, 3, 2, 1), atol=1e-14)
+    # the projected doubles of the pt2ccsd trial are t2u closed with the second factor
+    tin_bar = lst.stage_pt2ccsd_trial(frag)
+    np.testing.assert_allclose(np.einsum("Iajb,kI->kajb", t2u, u), tin_bar.data["t2"], atol=1e-12)
+    np.testing.assert_allclose(u @ u.T, tin_bar.data["prjlo"], atol=1e-12)
+
+
+def test_fast_kernel_matches_bar_kernel(frag0, o2):
+    """The factored projector gives the same four components as the bar kernel, to roundoff."""
+    sys_, ham_data, td, ctx = frag0["sys"], frag0["ham_data"], frag0["trial_data"], frag0["ctx"]
+    frag = o2["frags"][0]
+    tin = lst.stage_pt2ccsd_fast_trial(frag)
+    tdf = make_pt2ccsd_fast_trial_data(tin.data, sys_)
+    assert tdf.nocc == td.nocc and tdf.nvir == td.nvir and tdf.nlo < tdf.nocc
+    ctxs = [
+        lf.make_pt2ccsd_fast_meas_ops(
+            sys_, mixed_precision=False, testing=True, nchol_chunk=k
+        ).build_meas_ctx(ham_data, tdf)
+        for k in (1, 3, None)
+    ]
+    assert ctxs[0].chol_ov_u.shape == (ham_data.chol.shape[0], tdf.nlo, tdf.nvir)
+    for w in _random_walkers(sys_.norb, sys_.nup, 4, seed=13):
+        ref = np.asarray(lm.energy_kernel_rw_rh_bar(w, ham_data, ctx, td))
+        for c in ctxs:
+            out = np.asarray(lf.energy_kernel_rw_rh_fast(w, ham_data, c, tdf))
+            assert np.abs(out - ref).max() < 1e-9
+    # mixed precision: the T2 contractions in single precision
+    ops_mp = lf.make_pt2ccsd_fast_meas_ops(sys_, mixed_precision=True, nchol_chunk=4)
+    ctx_mp = ops_mp.build_meas_ctx(ham_data, tdf)
+    assert lf.get_pt2ccsd_fast_meas_cfg(ops_mp).mixed_real_dtype == jnp.float32
+    w = next(_random_walkers(sys_.norb, sys_.nup, 1, seed=4))
+    ref = np.asarray(lm.energy_kernel_rw_rh_bar(w, ham_data, ctx, td))
+    assert (
+        np.abs(np.asarray(lf.energy_kernel_rw_rh_fast(w, ham_data, ctx_mp, tdf)) - ref).max() < 1e-4
+    )
+
+
+def test_fast_recipes():
+    assert ("rhf", "pt2ccsd_fast") in available_mixed_recipes()
+    assert ("cisd", "pt2ccsd_fast") in available_mixed_recipes()
+    rec = get_mixed_recipe("pt2ccsd_fast")
+    assert rec.guide == "rhf" and rec.components == lm.TRIAL_COMPONENTS
+    assert rec.energy_fn is lm.frag_pt2ccsd_energy_fn and rec.needs_amplitudes
+    with pytest.raises(ValueError):
+        get_mixed_recipe("pt2ccsd_fast", guide="uhf")
+
+
+def test_fast_trial_run_reproduces_pt2ccsd_run(o2, tmp_path):
+    """From one fragment file and seed, trial="pt2ccsd_fast" is the trial="pt2ccsd" run."""
+    mf, frag = o2["mf"], o2["frags"][0]
+    qmc: dict[str, Any] = dict(
+        n_walkers=20, n_eql_blocks=2, n_blocks=20, dt=0.005, n_prop_steps=10, seed=3
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        path = LnoFragMixed(mf, frag, chol_cut=CHOL_CUT).save(tmp_path / "frag1.h5")
+        fm_bar = LnoFragMixed.from_frag_data(path, trial="pt2ccsd", mixed_precision=False, **qmc)
+        e_bar, err_bar = fm_bar.kernel()
+        fm_fast = LnoFragMixed.from_frag_data(
+            path, trial="pt2ccsd_fast", mixed_precision=False, **qmc
+        )
+        e_fast, err_fast = fm_fast.kernel()
+    assert fm_fast.trial == "pt2ccsd_fast" and fm_fast.build_job().mix_trial_data.nlo < 6
+    r_bar, r_fast = fm_bar.qmc_result, fm_fast.qmc_result
+    assert abs(r_fast.frag_init_energy - r_bar.frag_init_energy) < 1e-10
+    assert abs(e_fast - e_bar) < 1e-8 and abs(err_fast - err_bar) < 1e-8
+    assert abs(fm_fast.guide_e_tot - fm_bar.guide_e_tot) < 1e-10
+
+
 # ----------------------------------------------------------------------------- statistics
 
 
@@ -397,6 +481,22 @@ def test_frag_mixed_options(o2):
     stripped = lst.LnoFragData(**{**frag.__dict__, "t1": None, "t2": None})
     with pytest.raises(ValueError, match="amplitudes"):
         LnoFragMixed(mf, stripped)
+    # the guide and the trial precision can be set apart; mixed_precision sets both
+    with contextlib.redirect_stdout(io.StringIO()):
+        fm = LnoFragMixed(
+            mf, frag, chol_cut=CHOL_CUT, mixed_precision=False, trial_mixed_precision=True
+        )
+        job = fm.build_job()
+    assert not fm.guide_mixed_precision and fm.trial_mixed_precision
+    assert lm.get_pt2ccsd_meas_cfg(job.mix_trial_meas_ops).mixed_real_dtype == jnp.float32
+    ctx = job.prop_ops.build_prop_ctx(
+        job.ham_data, job.trial_ops.get_rdm1(job.trial_data), job.params
+    )
+    assert ctx.chol_flat.dtype == jnp.float64
+    lno = LnoAfqmcMixed(
+        mf, o2["lo_coeff"], o2["frag_list"], nfrozen=o2["nfrozen"], guide_mixed_precision=False
+    )
+    assert lno.qmc_kwargs["guide_mixed_precision"] is False and lno.qmc_kwargs["mixed_precision"]
 
 
 # ----------------------------------------------------------------------------- end to end

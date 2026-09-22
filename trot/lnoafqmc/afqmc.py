@@ -101,9 +101,10 @@ class LnoFragMixed(AfqmcMixed):
     max_error : early-stop target of the fragment error; None runs all n_blocks.
     stop_ratio, min_blocks : stop once err < stop_ratio * max_error and at least
         min_blocks sampling blocks are in (0.7, 120 as in afqmc).
-    The remaining keywords are AfqmcMixed's (max_memory, nchol_chunk, mixed_precision,
-    chol_cut, n_eql_blocks, n_blocks, seed, dt, n_prop_steps, n_walkers, n_chunks,
-    error_method, tau_eql). n_blocks defaults to 300.
+    The remaining keywords are AfqmcMixed's (max_memory, nchol_chunk, mixed_precision
+    with the per side guide_mixed_precision / trial_mixed_precision, chol_cut,
+    n_eql_blocks, n_blocks, seed, dt, n_prop_steps, n_walkers, n_chunks, error_method,
+    tau_eql). n_blocks defaults to 300.
     """
 
     def __init__(
@@ -122,6 +123,8 @@ class LnoFragMixed(AfqmcMixed):
         max_memory: float | None = None,
         nchol_chunk: int | None = None,
         mixed_precision: bool = True,
+        guide_mixed_precision: bool | None = None,
+        trial_mixed_precision: bool | None = None,
         chol_cut: float = 1e-5,
         n_eql_blocks: int | None = None,
         n_blocks: int | None = None,
@@ -174,6 +177,12 @@ class LnoFragMixed(AfqmcMixed):
         self.basis_b = None
         self.walker_kind = cast(WalkerKind, self.recipe.walker_kind)
         self.mixed_precision = mixed_precision
+        self.guide_mixed_precision = (
+            bool(mixed_precision) if guide_mixed_precision is None else bool(guide_mixed_precision)
+        )
+        self.trial_mixed_precision = (
+            bool(mixed_precision) if trial_mixed_precision is None else bool(trial_mixed_precision)
+        )
         self.max_memory = max_memory
         self.nchol_chunk = nchol_chunk
         self.tau_eql = None if tau_eql is None else float(tau_eql)
@@ -381,7 +390,8 @@ class LnoAfqmcMixed:
     trial, guide : the recipe; default "pt2ccsd" / "upt2ccsd" from mf with the HF guide
     target_error : the target error of the total; each fragment stops early once its
         error is below stop_ratio * target_error / sqrt(nfrag)
-    chol_cut, max_memory, nchol_chunk, mixed_precision, n_eql_blocks, n_blocks (default
+    chol_cut, max_memory, nchol_chunk, mixed_precision (with guide_mixed_precision /
+    trial_mixed_precision to set the two sides apart), n_eql_blocks, n_blocks (default
     300), seed, dt, n_prop_steps, n_walkers, n_chunks, error_method, tau_eql
     """
 
@@ -417,6 +427,8 @@ class LnoAfqmcMixed:
         max_memory: float | None = None,
         nchol_chunk: int | None = None,
         mixed_precision: bool = True,
+        guide_mixed_precision: bool | None = None,
+        trial_mixed_precision: bool | None = None,
         n_eql_blocks: int | None = None,
         n_blocks: int | None = None,
         seed: int | None = None,
@@ -499,6 +511,8 @@ class LnoAfqmcMixed:
             max_memory=max_memory,
             nchol_chunk=nchol_chunk,
             mixed_precision=mixed_precision,
+            guide_mixed_precision=guide_mixed_precision,
+            trial_mixed_precision=trial_mixed_precision,
             n_eql_blocks=n_eql_blocks,
             n_blocks=n_blocks,
             dt=dt,

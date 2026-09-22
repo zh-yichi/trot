@@ -34,8 +34,10 @@ from trot.lnoafqmc import integral as li
 from trot.lnoafqmc import pipeline, solvers
 from trot.lnoafqmc import staging as lst
 from trot.lnoafqmc.meas import upt2ccsd_bar as lmu
+from trot.lnoafqmc.meas import upt2ccsd_fast as lfu
 from trot.lnoafqmc.mixed import available_mixed_recipes, get_mixed_recipe
 from trot.lnoafqmc.trial.upt2ccsd import make_upt2ccsd_trial_data, overlap_u
+from trot.lnoafqmc.trial.upt2ccsd_fast import make_upt2ccsd_fast_trial_data
 from trot.meas.pt2ccsd_chunking import make_chunk_meas_cfg
 from trot.meas.upt2ccsd_bar_uh import build_meas_ctx as trot_build_ctx
 from trot.meas.upt2ccsd_bar_uh import energy_kernel_uw_uh_bar as trot_bar_kernel
@@ -272,6 +274,90 @@ def test_u_overlap_is_exp_t1_reference(ufrag0):
             (ctx.exp_t1_b @ w[1])[:nb, :]
         )
         assert abs(complex(overlap_u(w, td)) - complex(obar)) < 1e-10
+
+
+# ----------------------------------------------------------------------------- upt2ccsd_fast
+
+
+def test_u_fast_trial_staging(o2t):
+    """The factored doubles closed with the projector's second factor are the projected ones."""
+    frag = o2t["frags"][0]
+    tin = lst.stage_upt2ccsd_fast_trial(frag)
+    tin_bar = lst.stage_upt2ccsd_trial(frag)
+    assert tin.kind == "upt2ccsd_fast"
+    ua, ub = np.asarray(tin.data["u_a"]), np.asarray(tin.data["u_b"])
+    assert ua.shape[1] == ub.shape[1] and ua.shape[1] < ua.shape[0]
+    for name, u in (("t2aa", ua), ("t2ab", ua), ("t2ba", ub), ("t2bb", ub)):
+        t2u = np.asarray(tin.data[name + "_u"])
+        assert t2u.shape[0] == u.shape[1]
+        np.testing.assert_allclose(
+            np.einsum("Iajb,kI->kajb", t2u, u), np.asarray(tin_bar.data[name]), atol=1e-12
+        )
+    # same-spin blocks stay antisymmetric in (a, b) after the projection on i
+    for name in ("t2aa_u", "t2bb_u"):
+        t = np.asarray(tin.data[name])
+        assert np.abs(t + t.transpose(0, 3, 2, 1)).max() < 1e-12
+    np.testing.assert_allclose(ua @ ua.T, tin_bar.data["prjlo_a"], atol=1e-12)
+
+
+def test_u_fast_kernel_matches_bar_kernel(ufrag0, o2t):
+    """The factored projectors give the same four components as the bar kernel, to roundoff."""
+    ham, sys_, ham_data = ufrag0["ham"], ufrag0["sys"], ufrag0["ham_data"]
+    frag = o2t["frags"][0]
+    td = make_upt2ccsd_trial_data(ufrag0["tin"].data, sys_)
+    ctx = ufrag0["ops"].build_meas_ctx(ham_data, td)
+    tdf = make_upt2ccsd_fast_trial_data(lst.stage_upt2ccsd_fast_trial(frag).data, sys_)
+    assert tdf.nocc == td.nocc and tdf.nvir == td.nvir and tdf.nlo <= min(tdf.nocc)
+    ctxs = [
+        lfu.make_upt2ccsd_fast_meas_ops(
+            sys_, mixed_precision=False, testing=True, nchol_chunk=k
+        ).build_meas_ctx(ham_data, tdf)
+        for k in (1, 3, None)
+    ]
+    for w in _random_walkers(ham.norb, ham.nelec, 4, seed=13):
+        ref = np.asarray(lmu.energy_kernel_uw_uh_bar(w, ham_data, ctx, td))
+        for c in ctxs:
+            out = np.asarray(lfu.energy_kernel_uw_uh_fast(w, ham_data, c, tdf))
+            assert np.abs(out - ref).max() < 1e-8  # e0 is ~150 Ha here
+    ops_mp = lfu.make_upt2ccsd_fast_meas_ops(sys_, mixed_precision=True, nchol_chunk=4)
+    ctx_mp = ops_mp.build_meas_ctx(ham_data, tdf)
+    assert lfu.get_upt2ccsd_fast_meas_cfg(ops_mp).mixed_real_dtype == jnp.float32
+    w = next(_random_walkers(ham.norb, ham.nelec, 1, seed=4))
+    ref = np.asarray(lmu.energy_kernel_uw_uh_bar(w, ham_data, ctx, td))
+    assert (
+        np.abs(np.asarray(lfu.energy_kernel_uw_uh_fast(w, ham_data, ctx_mp, tdf)) - ref).max()
+        < 1e-4
+    )
+
+
+def test_u_fast_recipes():
+    assert ("uhf", "upt2ccsd_fast") in available_mixed_recipes()
+    assert ("ucisd", "upt2ccsd_fast") in available_mixed_recipes()
+    rec = get_mixed_recipe("upt2ccsd_fast")
+    assert rec.guide == "uhf" and rec.ham_basis == "uchol" and rec.needs_amplitudes
+    with pytest.raises(ValueError):
+        get_mixed_recipe("upt2ccsd_fast", guide="rhf")
+
+
+def test_u_fast_trial_run_reproduces_upt2ccsd_run(o2t, tmp_path):
+    """From one fragment file and seed, trial="upt2ccsd_fast" is the trial="upt2ccsd" run."""
+    mf, frag = o2t["mf"], o2t["frags"][0]
+    qmc: dict[str, Any] = dict(
+        n_walkers=20, n_eql_blocks=2, n_blocks=20, dt=0.005, n_prop_steps=10, seed=3
+    )
+    with contextlib.redirect_stdout(io.StringIO()):
+        path = LnoFragMixed(mf, frag, chol_cut=CHOL_CUT).save(tmp_path / "frag1.h5")
+        fm_bar = LnoFragMixed.from_frag_data(path, trial="upt2ccsd", mixed_precision=False, **qmc)
+        e_bar, err_bar = fm_bar.kernel()
+        fm_fast = LnoFragMixed.from_frag_data(
+            path, trial="upt2ccsd_fast", mixed_precision=False, **qmc
+        )
+        e_fast, err_fast = fm_fast.kernel()
+    assert fm_fast.trial == "upt2ccsd_fast"
+    r_bar, r_fast = fm_bar.qmc_result, fm_fast.qmc_result
+    assert abs(r_fast.frag_init_energy - r_bar.frag_init_energy) < 1e-9
+    assert abs(e_fast - e_bar) < 1e-8 and abs(err_fast - err_bar) < 1e-8
+    assert abs(fm_fast.guide_e_tot - fm_bar.guide_e_tot) < 1e-10
 
 
 # ----------------------------------------------------------------------------- recipes and files

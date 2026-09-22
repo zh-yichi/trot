@@ -324,6 +324,44 @@ def test_chunk_plan_is_attached_and_mixed_precision_default(h4):
         _quiet(AfqmcMixed(h4, trial="pt2ccsd", max_memory=2000, **_PARAMS).build_job)
 
 
+def _guide_chol_dtype(job):
+    """The dtype the guide propagator casts the cholesky vectors to."""
+    ctx = job.prop_ops.build_prop_ctx(
+        job.ham_data, job.trial_ops.get_rdm1(job.trial_data), job.params
+    )
+    return ctx.chol_flat.dtype
+
+
+def test_guide_and_trial_precision_knobs(h4):
+    """mixed_precision sets both sides; guide_mixed_precision / trial_mixed_precision override one."""
+    from trot.meas.pt2ccsd_bar import get_pt2ccsd_bar_meas_cfg
+
+    def dtypes(**kw):
+        af = AfqmcMixed(h4, trial="pt2ccsd_bar", **kw, **_PARAMS)
+        job = _quiet(af.build_job)
+        trial = get_pt2ccsd_bar_meas_cfg(job.mix_trial_meas_ops).mixed_real_dtype
+        return af, _guide_chol_dtype(job), trial
+
+    af, g, t = dtypes(mixed_precision=True)
+    assert af.guide_mixed_precision and af.trial_mixed_precision
+    assert g == jnp.float32 and t == jnp.float32
+    af, g, t = dtypes(mixed_precision=False)
+    assert not af.guide_mixed_precision and not af.trial_mixed_precision
+    assert g == jnp.float64 and t == jnp.float64
+    af, g, t = dtypes(mixed_precision=True, guide_mixed_precision=False)
+    assert not af.guide_mixed_precision and af.trial_mixed_precision
+    assert g == jnp.float64 and t == jnp.float32
+    af, g, t = dtypes(mixed_precision=False, trial_mixed_precision=True)
+    assert not af.guide_mixed_precision and af.trial_mixed_precision
+    assert g == jnp.float64 and t == jnp.float32
+    # the chunk plan is sized with the trial's precision
+    af, _, _ = dtypes(mixed_precision=True, trial_mixed_precision=False, max_memory=2000)
+    job = _quiet(af.build_job)
+    assert job.chunk_plan.model.per_walker_chol == job.chunk_plan.model.per_walker_chol  # exists
+    cfg = get_pt2ccsd_bar_meas_cfg(job.mix_trial_meas_ops)
+    assert cfg.mixed_real_dtype == jnp.float64
+
+
 # ---------------------------------------------------------------------------
 # the branch's own regression run, through the mixed API
 # ---------------------------------------------------------------------------

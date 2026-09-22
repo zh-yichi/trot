@@ -116,6 +116,7 @@ def setup_mixed(
     walker_kind: WalkerKind | None = None,
     mesh: Mesh | None = None,
     mixed_precision: bool = True,
+    trial_mixed_precision: bool | None = None,
     # params options
     params: QmcParams | None = None,
     # overrides for customized runs
@@ -136,7 +137,9 @@ def setup_mixed(
     staged already (the recipe's stage_trial), since the trial comes from the CC object
     while the guide may come from the mean field under it.
 
-    mixed_precision applies to the guide propagator and to the trial estimator.
+    mixed_precision applies to the guide (its propagator and kernels) and, unless
+    trial_mixed_precision is given, to the trial estimator; trial_mixed_precision sets the
+    trial's precision on its own, so the two sides can be studied separately.
 
     The cholesky chunk of a chunked trial (pt2ccsd_bar, upt2ccsd, upt2ccsd_bar) is sized by
     the recipe's memory model against a byte budget: max_memory (MB) when given, else a
@@ -148,6 +151,7 @@ def setup_mixed(
     Basic usage is through AfqmcMixed rather than this function directly.
     """
     rec = get_mixed_recipe(recipe) if isinstance(recipe, str) else recipe
+    trial_mp = mixed_precision if trial_mixed_precision is None else bool(trial_mixed_precision)
     if trial_input is None:
         raise ValueError(
             "setup_mixed needs a staged trial_input; the measurement trial comes from the "
@@ -229,7 +233,7 @@ def setup_mixed(
                 budget_bytes=budget,
                 n_chunks=job.params.n_chunks,
                 nchol_chunk=nchol_chunk,
-                mixed_precision=mixed_precision,
+                mixed_precision=trial_mp,
                 n_devices=_walker_devices(mesh),
             )
             nchol_chunk = plan.nchol_chunk
@@ -245,6 +249,6 @@ def setup_mixed(
         )
 
     job.mix_trial_meas_ops = rec.make_trial_meas_ops(
-        job.sys, mixed_precision=mixed_precision, nchol_chunk=nchol_chunk
+        job.sys, mixed_precision=trial_mp, nchol_chunk=nchol_chunk
     )
     return job

@@ -25,11 +25,10 @@ from typing import Any
 os.environ["OMP_NUM_THREADS"] = "1"  # LNO orbitals are thread sensitive; keeps runs reproducible
 
 import trot.lnoafqmc  # noqa: F401  before jax: chooses the allocator that frees memory between fragments
-from pyscf import cc, gto, mp, scf
+from pyscf import gto, scf
 from pyscf.data.elements import chemcore
 
-from trot.afqmc import AfqmcMixed
-from trot.lnoafqmc import LnoAfqmcMixed, LnoFragMixed, iao_fragment
+from trot.lnoafqmc import LnoAfqmcMixed, iao_fragment
 
 # cyclic (H2O)4: the oxygens on a square with O-O 2.74 A, each water donating one
 # hydrogen bond along the ring (O-H 0.97 A, H-O-H 104.5 deg), the free hydrogens
@@ -57,7 +56,7 @@ nfrozen = int(chemcore(mol))
 # IAO local orbitals grouped per water ("h2heavy" attaches hydrogens to their heavy atom;
 # "atom" would make one fragment per atom), optionally localized further ("pm" / "boys").
 # The LOs must span the occupied orbitals outside the frozen core; LnoAfqmcMixed checks.
-lo_coeff, frag_list, frag_name = iao_fragment(mf, nfrozen, frag_type="h2heavy", more_loc="pm")
+lo_coeff, frag_list, frag_name = iao_fragment(mf, nfrozen, frag_type="h2heavy")
 
 lno = LnoAfqmcMixed(
     mf,
@@ -67,7 +66,9 @@ lno = LnoAfqmcMixed(
     lno_thresh=1e-5,  # float -> [10 x, x] for occ / vir; or give [thresh_occ, thresh_vir]
     nfrozen=nfrozen,
     run_frag=None,  # e.g. [0] to run one fragment
-    trial="pt2ccsd",  # guide=None -> the HF guide; guide="cisd" propagates with the fragment CISD
+    trial="pt2ccsd",  # guide=None -> the HF guide; guide="cisd" propagates with the fragment CISD.
+    #                   "pt2ccsd_fast" is the same estimator with the fragment projector
+    #                   factored, cheaper for fragments with many more occupied than local orbitals
     target_error=1e-5,  # each fragment stops once its error < 0.7 * target / sqrt(nfrag),
     #                     after at least min_blocks=120 sampling blocks; None runs all n_blocks
     n_walkers=300,
@@ -75,37 +76,38 @@ lno = LnoAfqmcMixed(
     n_blocks=400,
     dt=0.005,
     seed=27,
-    mixed_precision=False,  # True by default (single precision T2 contractions, double sums)
+    mixed_precision=False,  # True by default (single precision T2 contractions, double sums);
+    # guide_mixed_precision / trial_mixed_precision set the guide and the trial apart
     # max_memory=4000,  # MB budget of the trial measurement; by default a share of the device
-    frag_output="./fragment.out",  # -> ./fragment.out1, ./fragment.out2, ... (optional)
-    lno_output="./lno_result.out",  # the results table (optional)
+    # frag_output="./fragment_fast.out",  # -> ./fragment.out1, ./fragment.out2, ... (optional)
+    # lno_output="./lno_result.out",  # the results table (optional)
     # save_frag_data="./frag_data",  # -> ./frag_data/frag{i}.h5, re-runnable without mf (optional)
 )
 e_qmc, e_qmc_err = lno.kernel()
 
 # the canonical references
-mymp = mp.MP2(mf, frozen=nfrozen)
-mymp.kernel()
-mycc = cc.CCSD(mf, frozen=nfrozen)
-mycc.kernel()
+# mymp = mp.MP2(mf, frozen=nfrozen)
+# mymp.kernel()
+# mycc = cc.CCSD(mf, frozen=nfrozen)
+# mycc.kernel()
 
-# the full-space AFQMC with the same trial (bar estimator), for comparison
-af = AfqmcMixed(
-    mycc,
-    trial="pt2ccsd_bar",
-    n_walkers=300,
-    n_eql_blocks=80,
-    n_blocks=400,
-    seed=27,
-    mixed_precision=False,
-)
-e_ref, err_ref = af.kernel()
+# # the full-space AFQMC with the same trial (bar estimator), for comparison
+# af = AfqmcMixed(
+#     mycc,
+#     trial="pt2ccsd_bar",
+#     n_walkers=300,
+#     n_eql_blocks=80,
+#     n_blocks=400,
+#     seed=27,
+#     mixed_precision=False,
+# )
+# e_ref, err_ref = af.kernel()
 
-print(f"\nLNO-MP2   E_corr = {lno.e_mp:.8f}     MP2  E_corr = {mymp.e_corr:.8f}")
-print(f"LNO-CCSD  E_corr = {lno.e_cc:.8f}     CCSD E_corr = {mycc.e_corr:.8f}")
-print(f"LNO-AFQMC E_corr = {e_qmc:.6f} +/- {e_qmc_err:.6f}")
-print(f"LNO-AFQMC E_corr + dMP2 = {e_qmc + mymp.e_corr - lno.e_mp:.6f} +/- {e_qmc_err:.6f}")
-print(f"AFQMC/pt2CCSD E_corr (full space) = {e_ref - mf.e_tot:.6f} +/- {err_ref:.6f}")
+# print(f"\nLNO-MP2   E_corr = {lno.e_mp:.8f}     MP2  E_corr = {mymp.e_corr:.8f}")
+# print(f"LNO-CCSD  E_corr = {lno.e_cc:.8f}     CCSD E_corr = {mycc.e_corr:.8f}")
+# print(f"LNO-AFQMC E_corr = {e_qmc:.6f} +/- {e_qmc_err:.6f}")
+# print(f"LNO-AFQMC E_corr + dMP2 = {e_qmc + mymp.e_corr - lno.e_mp:.6f} +/- {e_qmc_err:.6f}")
+# print(f"AFQMC/pt2CCSD E_corr (full space) = {e_ref - mf.e_tot:.6f} +/- {err_ref:.6f}")
 
 # one fragment again, from its file (written with save_frag_data): no LNO, CCSD or
 # integral work, straight to the QMC
