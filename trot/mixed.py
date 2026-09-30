@@ -80,6 +80,11 @@ class GuideSpec:
                    a CC object); "cc": needs the CC object itself
     ham_bases:     hamiltonians it can propagate on: "restricted" and/or "uchol"
     walker_kinds:  walker representations its ops accept
+    chunked_meas_ops:
+                   optional (sys, ham_basis, nchol_chunk) -> MeasOps whose local energy
+                   sums the cholesky vectors nchol_chunk at a time, or None where that
+                   guide's energy has no such knob on that hamiltonian. setup_mixed uses
+                   it to run the guide energy with the trial's chunk plan
     """
 
     name: str
@@ -87,6 +92,7 @@ class GuideSpec:
     source: str
     ham_bases: frozenset[str]
     walker_kinds: frozenset[str]
+    chunked_meas_ops: Callable[[Any, str, int], MeasOps | None] | None = None
 
     def source_obj(self, obj: Any) -> Any:
         """The pyscf object the guide is staged from."""
@@ -177,6 +183,28 @@ class MixedRecipe:
 # guides
 # ------------------------------------------------------------------------------------
 
+def _rhf_chunked_meas_ops(sys: Any, ham_basis: str, nchol_chunk: int) -> MeasOps | None:
+    """meas.rhf's low memory mode: the local energy sums batches of nchol_chunk vectors."""
+    from .meas.rhf import make_rhf_meas_ops
+
+    return make_rhf_meas_ops(sys, memory_mode="low", chol_batch_size=int(nchol_chunk))
+
+
+def _uhf_chunked_meas_ops(sys: Any, ham_basis: str, nchol_chunk: int) -> MeasOps | None:
+    """
+    On the uchol hamiltonian, meas.uhf_uh scans the local energy over chunks of
+    nchol_chunk vectors. meas.uhf's kernel on the restricted hamiltonian has no chunking,
+    so the guide is left as it is there.
+    """
+    if ham_basis != "uchol":
+        return None
+    from .meas.uhf_uh import make_uhf_meas_ops_uh
+
+    return make_uhf_meas_ops_uh(sys, nchol_chunk=int(nchol_chunk))
+
+
+# cisd and ucisd have no chunked_meas_ops: their local energies already scan the cholesky
+# vectors one at a time
 GUIDES: dict[str, GuideSpec] = {
     "rhf": GuideSpec(
         name="rhf",
@@ -184,6 +212,7 @@ GUIDES: dict[str, GuideSpec] = {
         source="mf",
         ham_bases=frozenset({"restricted"}),
         walker_kinds=frozenset({"restricted", "unrestricted", "generalized"}),
+        chunked_meas_ops=_rhf_chunked_meas_ops,
     ),
     # on the restricted hamiltonian as Afqmc(uhf) runs it, and on the unrestricted one as
     # AfqmcUh does
@@ -193,6 +222,7 @@ GUIDES: dict[str, GuideSpec] = {
         source="mf",
         ham_bases=frozenset({"restricted", "uchol"}),
         walker_kinds=frozenset({"unrestricted", "generalized"}),
+        chunked_meas_ops=_uhf_chunked_meas_ops,
     ),
     "cisd": GuideSpec(
         name="cisd",

@@ -307,6 +307,63 @@ def test_bar_and_chunk_trials_give_the_same_run(nh2_ucc, guide):
     assert res.trial_analysis.error_method == "blocking"
 
 
+@pytest.mark.parametrize("guide", ["uhf", "ucisd"])
+def test_guide_energy_uses_the_trial_chunk(nh2_ucc, guide):
+    """
+    The UHF guide's local energy is summed over the trial's cholesky chunk, and the run
+    matches an unchunked one; the UCISD guide, which scans one vector at a time, is kept.
+    """
+    runs = {}
+    for chunk in (2, 10_000):
+        af = AfqmcMixed(
+            nh2_ucc,
+            guide=guide,
+            trial="upt2ccsd_bar",
+            nchol_chunk=chunk,
+            chol_cut=1e-6,
+            mixed_precision=False,
+            **_PARAMS,
+        )
+        job = _quiet(af.build_job)
+        kernel = job.meas_ops.require_kernel("energy")
+        if guide == "uhf":
+            assert job.guide_nchol_chunk == job.mix_meas_ctx().nchol_chunk
+            assert kernel.keywords["nchol_chunk"] == job.guide_nchol_chunk
+        else:
+            assert job.guide_nchol_chunk is None
+            assert not hasattr(kernel, "keywords")
+        runs[chunk] = (af, *_quiet(af.kernel))
+    (small, e_s, err_s), (whole, e_w, err_w) = runs[2], runs[10_000]
+    if guide == "uhf":
+        assert small.job.guide_nchol_chunk <= 2 < whole.job.guide_nchol_chunk
+    assert e_s == pytest.approx(e_w, abs=1e-8)
+    assert err_s == pytest.approx(err_w, abs=1e-8)
+    assert small.guide_e_tot == pytest.approx(whole.guide_e_tot, abs=1e-8)
+
+
+def test_xla_memory_mode_runs(nh2_ucc):
+    """max_memory="xla" on the unrestricted hamiltonian: the plan comes from the compiled kernels."""
+    import jax
+
+    if jax.devices()[0].platform != "gpu":
+        pytest.skip("needs XLA's GPU memory analysis")
+    runs = {}
+    for mm in ("analytic", "xla"):
+        af = AfqmcMixed(
+            nh2_ucc,
+            trial="upt2ccsd_bar",
+            chol_cut=1e-6,
+            mixed_precision=False,
+            max_memory=mm,
+            **_PARAMS,
+        )
+        job = _quiet(af.build_job)
+        assert job.chunk_plan is not None and ("xla" in job.chunk_plan.note) == (mm == "xla")
+        assert job.guide_nchol_chunk == job.chunk_plan.nchol_chunk
+        runs[mm] = _quiet(af.kernel)
+    assert runs["xla"][0] == pytest.approx(runs["analytic"][0], abs=1e-8)
+
+
 def test_mixed_precision_default_and_chunk_plan(nh2_ucc):
     af = AfqmcMixed(nh2_ucc, trial="upt2ccsd_bar", max_memory=2000, **_PARAMS)
     assert af.mixed_precision is True and af.guide == "uhf"

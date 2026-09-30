@@ -20,13 +20,136 @@ from . import driver_mixed
 from .core.ops import MeasOps
 from .core.system import WalkerKind
 from .driver_mixed import MixedQmcResult
-from .meas.pt2ccsd_chunking import device_memory_budget_bytes
+from .meas.pt2ccsd_chunking import (
+    DEVICE_MEMORY_FRACTION,
+    XLA_DEVICE_MEMORY_FRACTION,
+    abstract_walkers,
+    device_memory_budget_bytes,
+    plan_pt2ccsd_chunking_xla,
+    pytree_bytes,
+)
 from .mixed import MixedRecipe, get_mixed_recipe
 from .prop.blocks import block as default_block
 from .prop.types import QmcParams, QmcParamsBase
 from .setup import Job, _assemble_job, _make_params, _make_prop, _resolve_default_walker_kind
 from .setup_u import setup_uh
 from .staging import StagedInputs, TrialInput
+
+MemoryBudget = Union[float, str, None]
+
+
+def resolve_memory_budget(max_memory: MemoryBudget) -> tuple[str, int | None]:
+    """
+    (mode, budget_bytes) of a chunk plan from the max_memory argument: a number is a
+    budget in MB for the analytic model; "analytic" is that model against
+    DEVICE_MEMORY_FRACTION of the device memory; "xla" sizes the chunk from the compiled
+    kernels against XLA_DEVICE_MEMORY_FRACTION of it; None is "analytic". The budget is
+    None when the backend reports no device memory (CPU).
+    """
+    if max_memory is None:
+        return "analytic", device_memory_budget_bytes()
+    if isinstance(max_memory, str):
+        mode = max_memory.strip().lower()
+        if mode == "xla":
+            return mode, device_memory_budget_bytes(XLA_DEVICE_MEMORY_FRACTION)
+        if mode == "analytic":
+            return mode, device_memory_budget_bytes(DEVICE_MEMORY_FRACTION)
+        raise ValueError(
+            f"max_memory must be a number of MB, 'analytic', 'xla' or None, got {max_memory!r}."
+        )
+    return "analytic", int(float(max_memory) * 1024**2)
+
+
+def _cholesky_bytes(ham_data: Any) -> int:
+    """The bytes of the hamiltonian's cholesky tensor(s)."""
+    return sum(
+        pytree_bytes(getattr(ham_data, name))
+        for name in ("chol", "chol_a", "chol_b")
+        if getattr(ham_data, name, None) is not None
+    )
+
+
+def _resident_bytes(
+    job: "JobMixed", trial_meas_ops: MeasOps, *, guide_mixed_precision: bool
+) -> int:
+    """
+    What the run keeps on the device whatever the chunking: the hamiltonian, the guide's
+    data and contexts (measurement and propagation), the trial's data and context, and
+    two copies of the walker population (the state and its resampled successor). The
+    measurement contexts are sized by tracing their builders, not built; the propagation
+    context is the cholesky tensor again, in the propagator's precision, plus small
+    matrices.
+    """
+    import jax
+
+    assert job.params is not None
+    guide_meas_ctx = jax.eval_shape(job.meas_ops.build_meas_ctx, job.ham_data, job.trial_data)
+    trial_meas_ctx = jax.eval_shape(trial_meas_ops.build_meas_ctx, job.ham_data, job.mix_trial_data)
+    prop_ctx = _cholesky_bytes(job.ham_data) // (2 if guide_mixed_precision else 1)
+    walkers = abstract_walkers(job.sys, int(job.params.n_walkers))
+    return prop_ctx + sum(
+        pytree_bytes(x)
+        for x in (
+            job.ham_data,
+            job.trial_data,
+            guide_meas_ctx,
+            job.mix_trial_data,
+            trial_meas_ctx,
+            walkers,
+            walkers,
+        )
+    )
+
+
+def _plan_xla(
+    job: "JobMixed",
+    rec: MixedRecipe,
+    *,
+    budget_bytes: int,
+    nchol_chunk: int | None,
+    trial_mp: bool,
+    guide_mp: bool,
+    n_devices: int,
+) -> Any:
+    """The xla chunk plan of the job's trial and guide; None when XLA reports no sizes."""
+    import jax
+
+    from .core.ops import k_energy
+
+    assert job.params is not None
+    nchol = int(job.ham_data.nchol)
+
+    def make_trial_meas_ops(k: int) -> MeasOps:
+        return rec.make_trial_meas_ops(job.sys, mixed_precision=trial_mp, nchol_chunk=int(k))
+
+    make_chunked = rec.guide_spec.chunked_meas_ops
+
+    def guide_energy(k: int) -> tuple[Any, Any, Any] | None:
+        ops = make_chunked(job.sys, rec.ham_basis, int(k)) if make_chunked is not None else None
+        if ops is None:
+            ops = job.meas_ops  # the guide's energy as it will run: unchunked
+        if not ops.has_kernel(k_energy):
+            return None
+        ctx = jax.eval_shape(ops.build_meas_ctx, job.ham_data, job.trial_data)
+        return ops.require_kernel(k_energy), ctx, job.trial_data
+
+    resident = _resident_bytes(
+        job, make_trial_meas_ops(nchol_chunk or nchol), guide_mixed_precision=guide_mp
+    )
+    return plan_pt2ccsd_chunking_xla(
+        sys=job.sys,
+        ham_data=job.ham_data,
+        trial_data=job.mix_trial_data,
+        make_trial_meas_ops=make_trial_meas_ops,
+        n_walkers=int(job.params.n_walkers),
+        nchol=nchol,
+        budget_bytes=int(budget_bytes),
+        resident_bytes=resident,
+        n_chunks=int(job.params.n_chunks),
+        nchol_chunk=nchol_chunk,
+        n_devices=n_devices,
+        guide_energy=guide_energy,
+    )
 
 
 def _walker_devices(mesh: Mesh | None) -> int:
@@ -54,6 +177,8 @@ class JobMixed(Job):
     mix_trial_meas_ops: MeasOps = None  # type: ignore[assignment]
     # how the memory budget was split between the two chunking knobs, None without a plan
     chunk_plan: Any = None
+    # cholesky vectors per step of the guide's local energy, None when it sums them at once
+    guide_nchol_chunk: int | None = None
     _runtime_mix_meas_ctx: object | None = field(default=None, init=False, repr=False)
 
     params_cls: ClassVar[type[QmcParamsBase]] = QmcParams
@@ -105,7 +230,7 @@ def setup_mixed(
     recipe: MixedRecipe | str = "pt2ccsd",
     trial_input: TrialInput | None = None,
     nchol_chunk: int | None = None,
-    max_memory: float | None = None,
+    max_memory: MemoryBudget = None,
     # staging options (used only if we need to stage)
     norb_frozen_core: Any = None,
     chol_cut: float = 1e-5,
@@ -141,12 +266,16 @@ def setup_mixed(
     trial_mixed_precision is given, to the trial estimator; trial_mixed_precision sets the
     trial's precision on its own, so the two sides can be studied separately.
 
-    The cholesky chunk of a chunked trial (pt2ccsd_bar, upt2ccsd, upt2ccsd_bar) is sized by
-    the recipe's memory model against a byte budget: max_memory (MB) when given, else a
-    share of the device allocator limit, else DEFAULT_NCHOL_CHUNK when the backend reports
-    no limit. The plan can raise params.n_chunks (the walker chunk count), never lower it,
-    and the driver's own automatic walker chunking may raise it further after compiling.
-    nchol_chunk, when given, is taken as fixed and only n_chunks is derived.
+    The cholesky chunk of a chunked trial (pt2ccsd_bar, upt2ccsd, upt2ccsd_bar) is sized
+    against a memory budget (resolve_memory_budget): max_memory in MB, or "analytic"
+    (the default, None) for the recipe's memory model against a share of the device
+    memory, or "xla" for a plan read from the compiled kernels (pt2ccsd_chunking's
+    plan_pt2ccsd_chunking_xla) against a larger share; DEFAULT_NCHOL_CHUNK when the
+    backend reports no device memory. The guide's local energy then runs with the same
+    cholesky chunk (GuideSpec.chunked_meas_ops). The plan can raise params.n_chunks (the
+    walker chunk count), never lower it, and the driver's own automatic walker chunking
+    may raise it further after compiling. nchol_chunk, when given, is taken as fixed and
+    only n_chunks is derived.
 
     Basic usage is through AfqmcMixed rather than this function directly.
     """
@@ -219,29 +348,44 @@ def setup_mixed(
     # size the cholesky chunk of a chunked trial against the memory budget
     if rec.plan_chunking is not None:
         assert job.params is not None
-        budget = (
-            int(float(max_memory) * 1024**2)
-            if max_memory is not None
-            else device_memory_budget_bytes()
-        )
+        mode, budget = resolve_memory_budget(max_memory)
         if budget is not None:
-            plan = rec.plan_chunking(
-                job.sys,
-                job.ham_data,
-                job.mix_trial_data,
-                n_walkers=job.params.n_walkers,
-                budget_bytes=budget,
-                n_chunks=job.params.n_chunks,
-                nchol_chunk=nchol_chunk,
-                mixed_precision=trial_mp,
-                n_devices=_walker_devices(mesh),
-            )
+            plan = None
+            if mode == "xla":
+                plan = _plan_xla(
+                    job,
+                    rec,
+                    budget_bytes=budget,
+                    nchol_chunk=nchol_chunk,
+                    trial_mp=trial_mp,
+                    guide_mp=bool(mixed_precision),
+                    n_devices=_walker_devices(mesh),
+                )
+                if plan is None:
+                    print(
+                        "[setup] the backend reports no compiled memory sizes; the chunk plan "
+                        "falls back to the analytic model"
+                    )
+            if plan is None:
+                plan = rec.plan_chunking(
+                    job.sys,
+                    job.ham_data,
+                    job.mix_trial_data,
+                    n_walkers=job.params.n_walkers,
+                    budget_bytes=budget,
+                    n_chunks=job.params.n_chunks,
+                    nchol_chunk=nchol_chunk,
+                    mixed_precision=trial_mp,
+                    n_devices=_walker_devices(mesh),
+                )
             nchol_chunk = plan.nchol_chunk
             job.chunk_plan = plan
             # the plan only ever raises n_chunks, so this cannot undercut a caller's setting
             if plan.n_chunks != job.params.n_chunks:
                 job.params = replace(job.params, n_chunks=plan.n_chunks)
-    elif max_memory is not None:
+    elif max_memory is not None and not (
+        isinstance(max_memory, str) and max_memory.strip().lower() == "analytic"
+    ):
         raise ValueError(
             f"trial {rec.trial!r} scans one cholesky vector at a time and has no memory "
             "model, so there is nothing for max_memory to size; use the chunked "
@@ -251,4 +395,17 @@ def setup_mixed(
     job.mix_trial_meas_ops = rec.make_trial_meas_ops(
         job.sys, mixed_precision=trial_mp, nchol_chunk=nchol_chunk
     )
+
+    # The guide's local energy sums over the same cholesky index, with the same walkers in
+    # flight, and holds less per walker per cholesky vector than the trial's kernel (a
+    # (nocc, nocc) block of L.G against the trial's (nocc, norb) and larger ones). The
+    # two run one after the other within a block, so the trial's plan bounds the guide
+    # energy as well: run it with the trial's cholesky chunk. A guide meas_ops passed in
+    # by the caller is kept as given.
+    make_chunked = rec.guide_spec.chunked_meas_ops
+    if nchol_chunk is not None and meas_ops is None and make_chunked is not None:
+        chunked = make_chunked(job.sys, rec.ham_basis, int(nchol_chunk))
+        if chunked is not None:
+            job.meas_ops = chunked
+            job.guide_nchol_chunk = int(nchol_chunk)
     return job

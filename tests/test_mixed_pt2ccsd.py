@@ -283,6 +283,164 @@ def test_bar_and_plain_trials_give_the_same_run(h4, guide):
     assert res.trial_analysis.error_method == "blocking"
 
 
+@pytest.mark.parametrize("guide", ["rhf", "cisd"])
+def test_guide_energy_uses_the_trial_chunk(h4, guide):
+    """
+    The RHF guide's local energy runs in its low memory mode with the trial's cholesky
+    chunk as the batch, and the run matches an unchunked one; the CISD guide, which scans
+    one vector at a time, is kept.
+    """
+    from trot.meas.rhf import get_rhf_meas_cfg
+
+    runs = {}
+    for chunk in (2, 10_000):
+        af = AfqmcMixed(
+            h4,
+            guide=guide,
+            trial="pt2ccsd_bar",
+            nchol_chunk=chunk,
+            chol_cut=1e-6,
+            mixed_precision=False,
+            **_PARAMS,
+        )
+        job = _quiet(af.build_job)
+        cfg = get_rhf_meas_cfg(job.meas_ops)
+        if guide == "rhf":
+            assert job.guide_nchol_chunk == job.mix_meas_ctx().nchol_chunk
+            assert cfg is not None and cfg.memory_mode == "low"
+            assert cfg.chol_batch_size == job.guide_nchol_chunk
+        else:
+            assert job.guide_nchol_chunk is None
+        runs[chunk] = (af, *_quiet(af.kernel))
+    (small, e_s, err_s), (whole, e_w, err_w) = runs[2], runs[10_000]
+    assert e_s == pytest.approx(e_w, abs=1e-8)
+    assert err_s == pytest.approx(err_w, abs=1e-8)
+    assert small.guide_e_tot == pytest.approx(whole.guide_e_tot, abs=1e-8)
+
+
+def test_resolve_memory_budget():
+    from trot.meas.pt2ccsd_chunking import (
+        DEVICE_MEMORY_FRACTION,
+        XLA_DEVICE_MEMORY_FRACTION,
+        device_memory_bytes,
+    )
+    from trot.setup_mixed import resolve_memory_budget
+
+    assert resolve_memory_budget(2000) == ("analytic", 2000 * 1024**2)
+    total = device_memory_bytes()
+    for arg, mode, fraction in (
+        (None, "analytic", DEVICE_MEMORY_FRACTION),
+        ("analytic", "analytic", DEVICE_MEMORY_FRACTION),
+        ("XLA", "xla", XLA_DEVICE_MEMORY_FRACTION),
+    ):
+        got_mode, budget = resolve_memory_budget(arg)
+        assert got_mode == mode
+        assert budget == (None if total is None else int(fraction * total))
+    with pytest.raises(ValueError, match="'analytic', 'xla'"):
+        resolve_memory_budget("compiled")
+    # the unchunked trial has nothing to size: a number or "xla" is an error, "analytic" is not
+    for bad in (2000, "xla"):
+        with pytest.raises(ValueError, match="no memory model"):
+            _quiet(AfqmcMixed(_h4_ccsd(), trial="pt2ccsd", max_memory=bad, **_PARAMS).build_job)
+    _quiet(AfqmcMixed(_h4_ccsd(), trial="pt2ccsd", max_memory="analytic", **_PARAMS).build_job)
+
+
+def _gpu_memory_analysis_available() -> bool:
+    import jax
+
+    return jax.devices()[0].platform == "gpu"
+
+
+@pytest.mark.skipif(not _gpu_memory_analysis_available(), reason="needs XLA's GPU memory analysis")
+def test_xla_plan_fits_the_compiled_scratch(h4):
+    """
+    The xla plan's bytes are what a fresh compile at the chosen chunk and walker count
+    reports, and they fit the budget: with a loose budget the whole tensor goes in one
+    step, with tight ones the cholesky chunk shrinks, then the walkers give way.
+    """
+    import jax
+
+    from trot.core.ops import k_energy
+    from trot.meas.pt2ccsd_chunking import (
+        abstract_walkers,
+        compiled_kernel_bytes,
+        plan_pt2ccsd_chunking_xla,
+    )
+
+    af = AfqmcMixed(h4, trial="pt2ccsd_bar", chol_cut=1e-6, mixed_precision=False, **_PARAMS)
+    job = _quiet(af.build_job)
+    rec = job.recipe
+    nchol = int(job.ham_data.nchol)
+
+    def make_ops(k):
+        return rec.make_trial_meas_ops(job.sys, mixed_precision=False, nchol_chunk=k)
+
+    def scratch(k, w):
+        ops = make_ops(k)
+        ctx = jax.eval_shape(ops.build_meas_ctx, job.ham_data, job.mix_trial_data)
+        got = compiled_kernel_bytes(
+            ops.require_kernel(k_energy),
+            abstract_walkers(job.sys, w),
+            job.ham_data,
+            ctx,
+            job.mix_trial_data,
+        )
+        assert got is not None
+        return got[0]
+
+    def plan_for(budget, **kw):
+        return plan_pt2ccsd_chunking_xla(
+            sys=job.sys,
+            ham_data=job.ham_data,
+            trial_data=job.mix_trial_data,
+            make_trial_meas_ops=make_ops,
+            n_walkers=_PARAMS["n_walkers"],
+            nchol=nchol,
+            budget_bytes=budget + 1000,
+            resident_bytes=1000,
+            **kw,
+        )
+
+    n_w = _PARAMS["n_walkers"]
+    whole = scratch(nchol, n_w)
+    plan = plan_for(10 * whole)
+    assert plan.nchol_chunk == nchol and plan.n_chunks == 1 and "xla" in plan.note
+    assert plan.bytes_used == 1000 + whole
+    # between one vector per step and the whole tensor: the cholesky chunk shrinks
+    one = scratch(1, n_w)
+    plan = plan_for((one + whole) // 2)
+    assert 1 <= plan.nchol_chunk < nchol and plan.n_chunks == 1
+    assert plan.bytes_used == 1000 + scratch(plan.nchol_chunk, n_w) <= plan.budget_bytes
+    # not even one vector per step fits with every walker in flight: the walkers give
+    # way, here down to one at a time
+    single = (scratch(1, 1) + scratch(1, 2)) // 2
+    plan = plan_for(single)
+    assert plan.n_chunks == n_w and plan.walkers_in_flight == 1
+    assert plan.bytes_used == 1000 + scratch(plan.nchol_chunk, 1) <= plan.budget_bytes
+    # a caller's chunk is kept and only the walkers give way
+    plan = plan_for(single, nchol_chunk=1)
+    assert plan.nchol_chunk == 1 and plan.n_chunks == n_w
+    with pytest.raises(ValueError, match="too small"):
+        plan_for(scratch(1, 1) // 2)
+    # n_chunks is a floor
+    assert plan_for(10 * whole, n_chunks=3).n_chunks == 3
+
+
+@pytest.mark.skipif(not _gpu_memory_analysis_available(), reason="needs XLA's GPU memory analysis")
+def test_xla_memory_mode_runs(h4):
+    """max_memory="xla" plans from the compiled kernels and gives the analytic plan's run."""
+    runs = {}
+    for mm in ("analytic", "xla"):
+        af = AfqmcMixed(
+            h4, trial="pt2ccsd_bar", chol_cut=1e-6, mixed_precision=False, max_memory=mm, **_PARAMS
+        )
+        job = _quiet(af.build_job)
+        assert job.chunk_plan is not None and ("xla" in job.chunk_plan.note) == (mm == "xla")
+        assert job.guide_nchol_chunk == job.chunk_plan.nchol_chunk
+        runs[mm] = _quiet(af.kernel)
+    assert runs["xla"][0] == pytest.approx(runs["analytic"][0], abs=1e-8)
+
+
 def test_tau_eql_sets_the_equilibration_blocks(h4):
     """tau_eql fixes the equilibration length whatever dt and n_prop_steps are."""
     from trot.prop.types import QmcParams

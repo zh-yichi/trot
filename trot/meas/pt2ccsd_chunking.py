@@ -12,6 +12,7 @@ holds what decides that size:
     pt2ccsd_memory_model      the model of the restricted bar kernel
     upt2ccsd_memory_model     the model of the unrestricted chunk and bar kernels
     plan_pt2ccsd_chunking     split a byte budget between the cholesky and walker chunks
+    plan_pt2ccsd_chunking_xla the same split, sized by compiling the kernels themselves
     device_memory_budget_bytes
                               a budget from the device allocator limit, when it reports one
 
@@ -20,12 +21,19 @@ Only when a single cholesky vector per step still does not fit are the walkers c
 and the cholesky chunk is then chosen again against the smaller walker count. The walker
 chunk count the plan settles on is a floor: the driver's automatic walker chunking may
 raise it further after compilation, never lower it.
+
+The analytic models count the arrays the kernels name and treat that as a floor, which
+in practice over-reserves (the arrays XLA keeps alive at once are fewer). The xla plan
+(max_memory="xla") asks the compiler instead: the trial and guide energy kernels are
+compiled at the run's shapes with abstract inputs, nothing allocated or run, and the
+scratch memory XLA assigns them is read back. That figure is what the device uses when
+the kernel runs; the budget is therefore a larger share of the device (XLA_DEVICE_MEMORY_FRACTION).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
@@ -38,6 +46,12 @@ DEFAULT_NCHOL_CHUNK = 100
 # the share of the device allocator limit the trial measurement may plan against; the
 # rest is left to the propagator, the guide kernels and XLA's transient buffers
 DEVICE_MEMORY_FRACTION = 0.5
+# the share of the device memory the xla plan may fill with resident arrays plus the
+# compiled scratch of the largest kernel; the rest is headroom for the propagator's
+# transients and the allocator
+XLA_DEVICE_MEMORY_FRACTION = 0.85
+# cholesky chunks the xla plan compiles to fit its line scratch(k) = a + b k
+XLA_PROBE_CHUNKS = (16, 64)
 
 
 @dataclass(frozen=True)
@@ -359,12 +373,29 @@ def plan_pt2ccsd_chunking(
     )
 
 
-def device_memory_budget_bytes(fraction: float = DEVICE_MEMORY_FRACTION) -> int | None:
+def _nvidia_smi_memory_bytes() -> int | None:
+    """The smallest device memory nvidia-smi reports, or None when it cannot be asked."""
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except Exception:
+        return None
+    totals = [int(line.strip()) for line in out.splitlines() if line.strip().isdigit()]
+    return min(totals) * 1024**2 if totals else None
+
+
+def device_memory_bytes() -> int | None:
     """
-    A byte budget for the trial measurement: fraction of the smallest allocator limit
-    the devices report (the same statistic the driver's automatic walker chunking reads),
-    or None when the backend reports none (CPU), in which case the callers fall back to
-    DEFAULT_NCHOL_CHUNK.
+    The smallest device memory the devices report: the allocator limit when jax reports
+    one (the same statistic the driver's automatic walker chunking reads), else on a GPU
+    backend under the platform allocator, which reports no statistics, the total from
+    nvidia-smi. None on a CPU backend.
     """
     limits: list[int] = []
     for device in jax.devices():
@@ -373,14 +404,266 @@ def device_memory_budget_bytes(fraction: float = DEVICE_MEMORY_FRACTION) -> int 
         except (RuntimeError, NotImplementedError):
             stats = None
         if not stats:
-            return None
+            limits = []
+            break
         value = next(
             (stats[key] for key in ("bytes_limit", "memory_limit", "total_memory") if key in stats),
             None,
         )
         if value is None or int(value) <= 0:
-            return None
+            limits = []
+            break
         limits.append(int(value))
-    if not limits:
+    if limits:
+        return min(limits)
+    if jax.devices()[0].platform != "gpu":
         return None
-    return int(float(fraction) * min(limits))
+    return _nvidia_smi_memory_bytes()
+
+
+def device_memory_budget_bytes(fraction: float = DEVICE_MEMORY_FRACTION) -> int | None:
+    """
+    A byte budget for the trial measurement: fraction of the device memory
+    (device_memory_bytes), or None when the backend reports none (CPU), in which case the
+    callers fall back to DEFAULT_NCHOL_CHUNK.
+    """
+    total = device_memory_bytes()
+    return None if total is None else int(float(fraction) * total)
+
+
+# ======================================================================================
+# the xla plan: sizes read from the compiled kernels
+# ======================================================================================
+
+
+def abstract_walkers(sys: Any, n_walkers: int, dtype: Any = jnp.complex128) -> Any:
+    """
+    The shapes of n_walkers walkers of sys's kind, as jax.ShapeDtypeStruct leaves, in the
+    dtype the walkers take once propagated (complex128).
+    """
+    kind = sys.walker_kind.lower()
+    nup, ndn = (int(n) for n in sys.nelec)
+    norb = sys.norb
+    if kind == "unrestricted":
+        norb_a, norb_b = (int(n) for n in norb) if isinstance(norb, tuple) else (int(norb),) * 2
+        return (
+            jax.ShapeDtypeStruct((n_walkers, norb_a, nup), dtype),
+            jax.ShapeDtypeStruct((n_walkers, norb_b, ndn), dtype),
+        )
+    if isinstance(norb, tuple):
+        raise ValueError(f"walker_kind={kind!r} needs one orbital count, got norb={norb}")
+    if kind == "restricted":
+        return jax.ShapeDtypeStruct((n_walkers, int(norb), nup), dtype)
+    if kind == "generalized":
+        return jax.ShapeDtypeStruct((n_walkers, 2 * int(norb), nup + ndn), dtype)
+    raise ValueError(f"unknown walker_kind: {sys.walker_kind}")
+
+
+def _is_arraylike(x: Any) -> bool:
+    return hasattr(x, "shape") and hasattr(x, "dtype")
+
+
+def abstract_like(tree: Any) -> Any:
+    """The pytree with every array leaf replaced by its jax.ShapeDtypeStruct."""
+    return jax.tree_util.tree_map(
+        lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype) if _is_arraylike(x) else x, tree
+    )
+
+
+def pytree_bytes(tree: Any) -> int:
+    """The bytes of the array leaves of a pytree (arrays or ShapeDtypeStructs)."""
+    total = 0
+    for leaf in jax.tree_util.tree_leaves(tree):
+        if _is_arraylike(leaf):
+            n = 1
+            for d in leaf.shape:
+                n *= int(d)
+            total += n * int(jnp.dtype(leaf.dtype).itemsize)
+    return total
+
+
+def compiled_kernel_bytes(
+    kernel: Any, walkers: Any, ham_data: Any, meas_ctx: Any, trial_data: Any
+) -> tuple[int, int] | None:
+    """
+    (scratch, arguments) in bytes of the kernel vmapped over the given walkers, as XLA
+    assigns them when compiling at these shapes: the arguments abstract, nothing
+    allocated, GPU autotuning off so nothing runs. scratch is the temporaries plus the
+    output, what the device holds beyond the arguments while the kernel runs. None when
+    the backend reports no memory analysis.
+    """
+    f = jax.jit(
+        jax.vmap(kernel, in_axes=(0, None, None, None)),
+        compiler_options={"xla_gpu_autotune_level": 0},
+    )
+    compiled = f.lower(
+        abstract_like(walkers),
+        abstract_like(ham_data),
+        abstract_like(meas_ctx),
+        abstract_like(trial_data),
+    ).compile()
+    analysis = compiled.memory_analysis()
+    if analysis is None:
+        return None
+    scratch = int(analysis.temp_size_in_bytes) + int(analysis.output_size_in_bytes)
+    return scratch, int(analysis.argument_size_in_bytes)
+
+
+def plan_pt2ccsd_chunking_xla(
+    *,
+    sys: Any,
+    ham_data: Any,
+    trial_data: Any,
+    make_trial_meas_ops: Callable[[int], Any],
+    n_walkers: int,
+    nchol: int,
+    budget_bytes: int,
+    resident_bytes: int,
+    n_chunks: int = 1,
+    nchol_chunk: int | None = None,
+    n_devices: int = 1,
+    guide_energy: Callable[[int], tuple[Any, Any, Any] | None] | None = None,
+    probe_chunks: tuple[int, int] = XLA_PROBE_CHUNKS,
+) -> ChunkPlan | None:
+    """
+    plan_pt2ccsd_chunking with the kernels' scratch read from their compilation.
+
+    make_trial_meas_ops(nchol_chunk) gives the trial's MeasOps for a chunk; its energy
+    kernel is compiled, vmapped over the walkers in flight, at two probe chunks, the line
+    scratch(k) = a + b k through them picks the largest chunk that fits
+    budget_bytes - resident_bytes, and one more compile at that chunk confirms it (and
+    shrinks it when the line was optimistic). guide_energy(nchol_chunk), when given,
+    returns the (kernel, meas_ctx, trial_data) of the guide's local energy at that chunk;
+    it runs in the same block, after the trial, so the larger of the two scratch sizes is
+    what the plan fits. As in the analytic plan the walkers give way only when one vector
+    per step does not fit, and n_chunks is a floor. resident_bytes is what stays on the
+    device for the whole run (hamiltonian, contexts, walkers); the caller measures it.
+
+    None when the backend reports no memory analysis, so the caller can fall back to the
+    analytic model.
+    """
+    from ..core.ops import k_energy
+
+    n_walkers = int(n_walkers)
+    n_devices = max(1, int(n_devices))
+    nchol = int(nchol)
+    nc = max(1, int(n_chunks))
+    avail = int(budget_bytes) - int(resident_bytes)
+    if avail <= 0:
+        raise ValueError(
+            f"a memory budget of {budget_bytes / 1024**2:.4g} MB is too small: the arrays "
+            f"resident for the whole run already take {resident_bytes / 1024**2:.4g} MB."
+        )
+    n_compiles = 0
+
+    def in_flight(nc_: int) -> int:
+        return _ceil_div(_ceil_div(n_walkers, nc_), n_devices)
+
+    def chunk_of(k: int) -> int:
+        _, k_eff, _ = equal_chunks(nchol, max(1, min(int(k), nchol)))
+        return int(k_eff)
+
+    def scratch(w: int, k: int) -> int | None:
+        nonlocal n_compiles
+        ops = make_trial_meas_ops(k)
+        ctx = jax.eval_shape(ops.build_meas_ctx, ham_data, trial_data)
+        walkers = abstract_walkers(sys, w)
+        got = compiled_kernel_bytes(
+            ops.require_kernel(k_energy), walkers, ham_data, ctx, trial_data
+        )
+        n_compiles += 1
+        if got is None:
+            return None
+        bytes_ = got[0]
+        if guide_energy is not None:
+            guide = guide_energy(k)
+            if guide is not None:
+                kernel_g, ctx_g, data_g = guide
+                got_g = compiled_kernel_bytes(kernel_g, walkers, ham_data, ctx_g, data_g)
+                n_compiles += 1
+                if got_g is not None:
+                    bytes_ = max(bytes_, got_g[0])
+        return bytes_
+
+    def fewer_walkers(nc_: int, w: int, need: int) -> int:
+        """The walker chunk count that scales the walkers in flight down to fit need."""
+        w_max = max(1, int(w * avail / max(need, 1)))
+        if w == 1 and need > avail:
+            raise ValueError(
+                f"a memory budget of {budget_bytes / 1024**2:.4g} MB is too small: one walker "
+                f"at nchol_chunk=1 needs {need / 1024**2:.4g} MB beyond the resident "
+                f"{resident_bytes / 1024**2:.4g} MB."
+            )
+        return max(nc_ + 1, _ceil_div(n_walkers, w_max * n_devices))
+
+    a = b = 0.0
+    if nchol_chunk is not None:
+        k = chunk_of(int(nchol_chunk))
+        while True:
+            w = in_flight(nc)
+            s = scratch(w, k)
+            if s is None:
+                return None
+            if s <= avail:
+                break
+            nc = fewer_walkers(nc, w, s)
+        note = f"nchol_chunk fixed by the caller; xla: {n_compiles} compiles"
+    else:
+        k1 = chunk_of(min(probe_chunks[0], nchol))
+        k2 = chunk_of(min(probe_chunks[1], nchol))
+        if k1 == k2 and nchol > 1:
+            # fewer vectors than the probes: the line runs from one vector to all of them
+            k1, k2 = 1, nchol
+        while True:
+            w = in_flight(nc)
+            if k2 == k1:
+                # too few vectors to draw a line through: the whole set is one probe
+                s = scratch(w, k2)
+                if s is None:
+                    return None
+                a, b, k = float(s), 0.0, k2
+            else:
+                s1, s2 = scratch(w, k1), scratch(w, k2)
+                if s1 is None or s2 is None:
+                    return None
+                b = max(0.0, (s2 - s1) / (k2 - k1))
+                a = s1 - b * k1
+                if a + b >= avail:
+                    # not even one vector per step fits: the walkers give way
+                    nc = fewer_walkers(nc, w, int(a + b))
+                    continue
+                k = chunk_of(int((avail - a) / b)) if b > 0 else nchol
+                s = scratch(w, k)
+                if s is None:
+                    return None
+                # the line is fitted at small chunks; at large ones XLA's schedule can
+                # cost more, so the confirming compile shrinks the chunk when needed
+                for _ in range(4):
+                    if s <= avail or k == 1:
+                        break
+                    k = chunk_of(int(k * 0.9 * avail / s))
+                    s = scratch(w, k)
+                    if s is None:
+                        return None
+            if s <= avail:
+                break
+            nc = fewer_walkers(nc, w, s)
+        note = (
+            "whole cholesky tensor fits in one step"
+            if k >= nchol
+            else "cholesky chunk set by the budget"
+        ) + f"; xla: {n_compiles} compiles"
+
+    w = in_flight(nc)
+    model = Pt2ccsdMemoryModel(
+        resident=int(resident_bytes), per_walker=int(max(a, 0.0) / w), per_walker_chol=int(b / w)
+    )
+    return ChunkPlan(
+        nchol_chunk=k,
+        n_chunks=nc,
+        walkers_in_flight=w,
+        bytes_used=int(resident_bytes) + int(s),
+        budget_bytes=int(budget_bytes),
+        model=model,
+        note=note,
+    )

@@ -139,7 +139,8 @@ class LnoFragMixed(AfqmcMixed):
     max_error : early-stop target of the fragment error; None runs all n_blocks.
     stop_ratio, min_blocks : stop once err < stop_ratio * max_error and at least
         min_blocks sampling blocks are in (0.7, 120 as in afqmc).
-    max_memory (MB) sizes the trial's cholesky chunk; when not given it is
+    max_memory sizes the trial's cholesky chunk: a budget in MB, "analytic" or "xla" as
+    for AfqmcMixed (the latter reads the sizes from the compiled kernels); when not given it is
     DEVICE_MEMORY_FRACTION of the device memory (device_memory_budget_mb), also under the
     platform allocator where jax itself reports no limit.
     The remaining keywords are AfqmcMixed's (max_memory, nchol_chunk, mixed_precision
@@ -161,7 +162,7 @@ class LnoFragMixed(AfqmcMixed):
         outlier_zeta: float = 20.0,
         staged: StagedInputs | None = None,
         emf: float | None = None,
-        max_memory: float | None = None,
+        max_memory: float | str | None = None,
         nchol_chunk: int | None = None,
         mixed_precision: bool = True,
         guide_mixed_precision: bool | None = None,
@@ -227,6 +228,9 @@ class LnoFragMixed(AfqmcMixed):
         self.max_memory_source = "max_memory"
         if max_memory is None:
             max_memory, self.max_memory_source = device_memory_budget_mb()
+        elif isinstance(max_memory, str):
+            # "analytic" / "xla": setup_mixed resolves the budget against the device memory
+            self.max_memory_source = f"max_memory={max_memory!r}"
         self.max_memory = max_memory
         self.nchol_chunk = nchol_chunk
         self.tau_eql = None if tau_eql is None else float(tau_eql)
@@ -371,7 +375,12 @@ class LnoFragMixed(AfqmcMixed):
         print(f" E(LNO-CCSD)     = {frag.efrag_cc:.8f}")
         print(f" max_error       = {'None' if self.max_error is None else f'{self.max_error:.2e}'}")
         print(f" stop_ratio      = {self.stop_ratio}  min_blocks = {self.min_blocks}")
-        budget = "None" if self.max_memory is None else f"{self.max_memory:.0f} MB"
+        if self.max_memory is None:
+            budget = "None"
+        elif isinstance(self.max_memory, str):
+            budget = self.max_memory
+        else:
+            budget = f"{self.max_memory:.0f} MB"
         print(f" max_memory      = {budget}  ({self.max_memory_source})")
         super().dump_flags(job)
 
@@ -509,7 +518,7 @@ class LnoAfqmcMixed:
         stop_ratio: float = 0.7,
         min_blocks: int = 120,
         chol_cut: float = 1e-5,
-        max_memory: float | None = None,
+        max_memory: float | str | None = None,
         nchol_chunk: int | None = None,
         mixed_precision: bool = True,
         guide_mixed_precision: bool | None = None,

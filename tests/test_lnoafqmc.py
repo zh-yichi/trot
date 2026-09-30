@@ -651,6 +651,33 @@ def test_frag_memory_budget_and_chunk_plan(o2, tmp_path):
             assert fm.build_job().chunk_plan is not None
 
 
+def test_frag_memory_mode_strings(o2):
+    """max_memory="analytic" / "xla" pass through to the fragment's chunk plan."""
+    import jax
+
+    mf, frag = o2["mf"], o2["frags"][0]
+    on_gpu = jax.devices()[0].platform == "gpu"
+    for mm in ("analytic", "xla"):
+        fm = LnoFragMixed(
+            mf, frag, chol_cut=CHOL_CUT, trial="pt2ccsd_fast", n_walkers=8, max_memory=mm
+        )
+        assert fm.max_memory == mm and fm.max_memory_source == f"max_memory={mm!r}"
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            job = fm.build_job()
+            fm.dump_flags(job)
+        assert f" max_memory      = {mm}  (max_memory={mm!r})" in buf.getvalue()
+        if on_gpu:
+            assert job.chunk_plan is not None
+            assert ("xla" in job.chunk_plan.note) == (mm == "xla")
+            assert job.guide_nchol_chunk == job.chunk_plan.nchol_chunk
+    with pytest.raises(ValueError, match="'analytic', 'xla'"):
+        with contextlib.redirect_stdout(io.StringIO()):
+            LnoFragMixed(
+                mf, frag, chol_cut=CHOL_CUT, trial="pt2ccsd_fast", n_walkers=8, max_memory="foo"
+            ).build_job()
+
+
 def test_cpu_gpu_split_reproduces_one_machine_loop(o2, tmp_path):
     """
     run_qmc=False + save_frag_data writes the fragment files and runs no AFQMC; a second
