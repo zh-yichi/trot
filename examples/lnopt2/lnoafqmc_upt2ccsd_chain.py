@@ -9,7 +9,7 @@ from pyscf.data.elements import chemcore
 from trot.lnoafqmc import LnoAfqmcMixed, iao_fragment
 
 a = 1.20577  # O-O bond length (Angstrom)
-d = 3        # centre-to-centre distance between the two molecules (Angstrom)
+d = 3  # centre-to-centre distance between the two molecules (Angstrom)
 na, nc = 2, 8  # atoms per monomer, number of monomers
 
 atoms = ""
@@ -42,7 +42,7 @@ lno = LnoAfqmcMixed(
     run_frag=[0],
     lno_thresh=1e-6,
     nfrozen=nfrozen,
-    trial="upt2ccsd_fast",  # the default for a UHF mf; guide=None -> the UHF guide, or guide="ucisd"
+    trial="upt2ccsd",  # the default for a UHF mf; guide=None -> the UHF guide, or guide="ucisd"
     target_error=1e-5,
     n_walkers=300,
     n_eql_blocks=80,
@@ -50,6 +50,6 @@ lno = LnoAfqmcMixed(
     dt=0.005,
     seed=27,
     guide_mixed_precision=False,
-    trial_mixed_precision=True, # specify mixed precision separately
+    trial_mixed_precision=True,  # specify mixed precision separately
 )
 e_qmc, e_qmc_err = lno.kernel()

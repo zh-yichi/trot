@@ -329,7 +329,7 @@ def test_resolve_memory_budget():
     assert resolve_memory_budget(2000) == ("analytic", 2000 * 1024**2)
     total = device_memory_bytes()
     for arg, mode, fraction in (
-        (None, "analytic", DEVICE_MEMORY_FRACTION),
+        (None, "xla", XLA_DEVICE_MEMORY_FRACTION),
         ("analytic", "analytic", DEVICE_MEMORY_FRACTION),
         ("XLA", "xla", XLA_DEVICE_MEMORY_FRACTION),
     ):

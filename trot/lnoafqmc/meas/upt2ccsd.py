@@ -1,21 +1,26 @@
 """
-The unrestricted LNO fragment pt2CCSD estimator with the fragment projectors in factored
-form ("upt2ccsd_fast"): the same four numbers per walker as meas/upt2ccsd_bar.py
-(TRIAL_COMPONENTS, combined by frag_pt2ccsd_energy_fn), to roundoff, with the
-contraction path of the restricted pt2ccsd_fast kernel (meas/pt2ccsd_fast.py) applied
-per spin.
+The LNO fragment pt2CCSD estimator, unrestricted (uchol) hamiltonian.
+
+Ported from afqmc's lno_afqmc/wavefunctions_unrestricted.py (class upt2ccsd) on top of
+the branch's meas/upt2ccsd_bar_uh.py. As the restricted one (meas/pt2ccsd.py) it
+measures with the similarity transformed hamiltonian against the bare reference: each
+spin's exp(T1_s) sits on that spin's hamiltonian and walker, alpha and beta each in their
+own LNO basis over one shared cholesky index. The kernel returns
+TRIAL_COMPONENTS = [t2frg, e0frg, e1frg, e0] per walker and the fragment energy is
+E_F = <e0frg> + <e1frg> - <t2frg><e0> (frag_pt2ccsd_energy_fn). The contraction path is
+the restricted kernel's applied per spin, with the fragment projectors kept in factored
+form.
 
 Sizes: nlo = L local orbitals, nocc_s = o_s, nvir_s = v_s, norb_s = n_s, k cholesky
 vectors per scan step; costs are per walker and per step.
 
 Projectors. prjlo_s = U_s U_s^H with U_s = <act_occ_s|lo_s> of shape (o_s, L). Every
 projected quantity is built as (something)_{I...} = sum_i U_{iI} (something)_{i...} on
-both sides and I is contracted last, so the doubles (trial/upt2ccsd_fast.py) carry the
-local index on their first slot and the T2 contractions cost L o v^2 per block instead of
-o^2 v^2. The same-spin blocks are antisymmetric in (a, b), which the bar kernel already
-uses to have one contraction per index pair (the exchange term is the direct term with
-a and b swapped); that carries over unchanged, and the four blocks aa, ab, ba, bb each
-need one contraction over their first (local) pair.
+both sides and I is contracted last, so the doubles (trial/upt2ccsd.py) carry the local
+index on their first slot and the T2 contractions cost L o v^2 per block instead of
+o^2 v^2. The same-spin blocks are antisymmetric in (a, b), so one contraction per index
+pair suffices (the exchange term is the direct term with a and b swapped), and the four
+blocks aa, ab, ba, bb each need one contraction over their first (local) pair.
 
 Green's functions. green_s = [1 | gf_s], so gl_oo,s = L_oo,s^T + gf_s L_ov,s^T and
 gl_ov,s = L_vo,s^T + gf_s L_vv,s^T are formed from the blocks of L_g,s (o_s n_s v_s), and
@@ -59,27 +64,87 @@ from ...meas.pt2ccsd_chunking import (
 )
 from ...meas.upt2ccsd_uh import e2_0_g, nchol_of
 from ...trial.upt2ccsd_bar_uh import build_bar_intermediates_u
-from ..trial.upt2ccsd_fast import Upt2ccsdFastTrial, overlap_u
-from .pt2ccsd_bar import TRIAL_COMPONENTS, frag_pt2ccsd_energy_fn
-from .upt2ccsd_bar import e0t1orb_from_chol_u, plan_chunking_for_run_u, ufock_from_chol
+from ...meas.upt2ccsd_uh import plan_chunking_for_run_u as _plan_chunking_for_run_u
+from ..trial.upt2ccsd import Upt2ccsdTrial, overlap_u
+from .pt2ccsd import TRIAL_COMPONENTS, frag_pt2ccsd_energy_fn
 
 __all__ = [
     "TRIAL_COMPONENTS",
     "frag_pt2ccsd_energy_fn",
-    "Upt2ccsdFastMeasCtx",
+    "Upt2ccsdMeasCtx",
+    "ufock_from_chol",
+    "e0t1orb_from_chol_u",
     "build_meas_ctx",
-    "energy_kernel_uw_uh_fast",
-    "make_upt2ccsd_fast_meas_ops",
-    "get_upt2ccsd_fast_meas_cfg",
-    "plan_chunking_for_run_u_fast",
+    "energy_kernel_uw_uh",
+    "make_upt2ccsd_meas_ops",
+    "get_upt2ccsd_meas_cfg",
+    "plan_chunking_for_run_u",
 ]
 
-_UPT2CCSD_FAST_MEAS_CFG_ATTR = "_lno_upt2ccsd_fast_meas_cfg"
+_UPT2CCSD_FRAG_MEAS_CFG_ATTR = "_lno_upt2ccsd_meas_cfg"
+
+
+def ufock_from_chol(
+    nocc: tuple[int, int], h1: tuple[jax.Array, jax.Array], chol: tuple[jax.Array, jax.Array]
+) -> tuple[jax.Array, jax.Array]:
+    """
+    Unrestricted fock matrices of (h1_s, chol_s) at the reference occupying each spin's
+    first nocc_s orbitals: h1_s + J[a + b] - K[s]. Written for non-symmetric chol (the
+    transformed tensors), as afqmc's integral.get_ufock.
+    """
+    nocc_a, nocc_b = nocc
+    chol_a, chol_b = chol
+    tr_l = jnp.einsum("gii->g", chol_a[:, :nocc_a, :nocc_a], optimize="optimal") + jnp.einsum(
+        "gii->g", chol_b[:, :nocc_b, :nocc_b], optimize="optimal"
+    )
+    out = []
+    for h1_s, chol_s, nocc_s in ((h1[0], chol_a, nocc_a), (h1[1], chol_b, nocc_b)):
+        jeff = jnp.einsum("gpq,g->pq", chol_s, tr_l, optimize="optimal")
+        keff = jnp.einsum(
+            "gpj,gjq->pq", chol_s[:, :, :nocc_s], chol_s[:, :nocc_s, :], optimize="optimal"
+        )
+        out.append(h1_s + jeff - keff)
+    return out[0], out[1]
+
+
+def _frag_two_body(
+    lg_a: jax.Array, lg_b: jax.Array, prjlo_a: jax.Array, prjlo_b: jax.Array
+) -> jax.Array:
+    """
+    1/2 sum_g [ (L_a P_a)(tr L_a + tr L_b) - (L_a L_a P_a) + the same for beta ], with
+    lg_s a (k, nocc_s, nocc_s) contraction of the ov cholesky block with an ov matrix.
+    The projected two-body form shared by e0t1orb (with t1) and e0frg (with the green).
+    """
+    tr = jnp.einsum("gjj->g", lg_a, optimize="optimal") + jnp.einsum(
+        "gjj->g", lg_b, optimize="optimal"
+    )
+    coul = jnp.einsum("gik,ik,g->", lg_a, prjlo_a, tr, optimize="optimal") + jnp.einsum(
+        "gik,ik,g->", lg_b, prjlo_b, tr, optimize="optimal"
+    )
+    exch = jnp.einsum("gij,gjk,ik->", lg_a, lg_a, prjlo_a, optimize="optimal") + jnp.einsum(
+        "gij,gjk,ik->", lg_b, lg_b, prjlo_b, optimize="optimal"
+    )
+    return 0.5 * (coul - exch)
+
+
+def e0t1orb_from_chol_u(ham_data: HamCholU, trial_data: Upt2ccsdTrial) -> jax.Array:
+    """
+    <exp(T1)HF| H |HF> restricted to the fragment, from the untransformed cholesky
+    vectors. afqmc's ham_data['e0t1orb'] (aa + ab + ba + bb).
+    """
+    nocc_a, nocc_b = trial_data.nocc
+    lt1_a = jnp.einsum(
+        "ia,gja->gij", trial_data.t1a, ham_data.chol_a[:, :nocc_a, nocc_a:], optimize="optimal"
+    )
+    lt1_b = jnp.einsum(
+        "ia,gja->gij", trial_data.t1b, ham_data.chol_b[:, :nocc_b, nocc_b:], optimize="optimal"
+    )
+    return _frag_two_body(lt1_a, lt1_b, trial_data.prjlo_a, trial_data.prjlo_b)
 
 
 @tree_util.register_pytree_node_class
 @dataclass(frozen=True)
-class Upt2ccsdFastMeasCtx:
+class Upt2ccsdMeasCtx:
     cfg: Pt2ccsdChunkMeasCfg  # static
     nchol_chunk: int  # static; sets the shape the chol tensors are reshaped to
     exp_t1_a: jax.Array  # (norb_a, norb_a)
@@ -145,9 +210,9 @@ class Upt2ccsdFastMeasCtx:
 
 def build_meas_ctx(
     ham_data: HamCholU,
-    trial_data: Upt2ccsdFastTrial,
+    trial_data: Upt2ccsdTrial,
     cfg: Pt2ccsdChunkMeasCfg = Pt2ccsdChunkMeasCfg(),
-) -> Upt2ccsdFastMeasCtx:
+) -> Upt2ccsdMeasCtx:
     if ham_data.basis != "uchol":
         raise ValueError(
             "the unrestricted fragment pt2CCSD MeasOps assume HamCholU.basis == 'uchol'; "
@@ -160,7 +225,7 @@ def build_meas_ctx(
         trial_data.nocc, (bar["h1_bar_a"], bar["h1_bar_b"]), (bar["chol_bar_a"], bar["chol_bar_b"])
     )
     u_a, u_b = trial_data.u_a, trial_data.u_b
-    return Upt2ccsdFastMeasCtx(
+    return Upt2ccsdMeasCtx(
         cfg=cfg,
         nchol_chunk=resolve_nchol_chunk(nchol_of(ham_data), cfg.nchol_chunk),
         exp_t1_a=bar["exp_t1_a"],
@@ -181,8 +246,7 @@ def build_meas_ctx(
         fock_ov_u_b=jnp.einsum(
             "kI,ka->Ia", u_b.conj(), fock_bar_b[:nocc_b, nocc_b:], optimize="optimal"
         ),
-        # the constant needs prjlo_s and t1_s, which the fast trial exposes as well
-        e0t1orb=e0t1orb_from_chol_u(ham_data, cast(Any, trial_data)),
+        e0t1orb=e0t1orb_from_chol_u(ham_data, trial_data),
     )
 
 
@@ -200,14 +264,14 @@ class _Walker(NamedTuple):
 
 
 def _t2g(
-    trial_data: Upt2ccsdFastTrial,
+    trial_data: Upt2ccsdTrial,
     gf: tuple[jax.Array, jax.Array],
     gc: tuple[jax.Array, jax.Array],
     rtype: Any,
     ctype: Any,
 ) -> tuple[jax.Array, jax.Array]:
     """
-    The (o_s, v_s) one-body T2 intermediates t2g_s of the bar kernel (the matrices its
+    The (o_s, v_s) one-body T2 intermediates t2g_s (the matrices
     t2_green_s = greenp_s t2g_s^T green_s are built from), with the doubles carrying the
     local index: a block's first pair closes with gc_s, its second pair with gf of the
     other slot and the projector's second factor after. The (a, b) antisymmetry of the
@@ -247,8 +311,8 @@ def _t2g(
 
 def _walker(
     walker: tuple[jax.Array, jax.Array],
-    meas_ctx: Upt2ccsdFastMeasCtx,
-    trial_data: Upt2ccsdFastTrial,
+    meas_ctx: Upt2ccsdMeasCtx,
+    trial_data: Upt2ccsdTrial,
     rtype: Any,
     ctype: Any,
 ) -> _Walker:
@@ -275,7 +339,7 @@ def _walker(
         jnp.einsum("pq,pq->", h1[s][: nocc[s], :], green[s], optimize="optimal") for s in range(2)
     )
     # everything that carries T2 runs in the mixed dtypes (the precision policy of
-    # meas/pt2ccsd_fast.py); the greens functions, e0 and e0frg stay in double
+    # meas/pt2ccsd.py); the greens functions, e0 and e0frg stay in double
     t2g = _t2g(trial_data, (gf[0], gf[1]), (gc[0], gc[1]), rtype, ctype)  # ctype
     # <P T2>: the spin sum of <t2g_s, gf_s> counts every block twice
     gt2g_s = [
@@ -305,11 +369,11 @@ def _walker(
     )
 
 
-def energy_kernel_uw_uh_fast(
+def energy_kernel_uw_uh(
     walker: tuple[jax.Array, jax.Array],
     ham_data: HamCholU,
-    meas_ctx: Upt2ccsdFastMeasCtx,
-    trial_data: Upt2ccsdFastTrial,
+    meas_ctx: Upt2ccsdMeasCtx,
+    trial_data: Upt2ccsdTrial,
 ) -> jax.Array:
     """
     The fragment pt2CCSD estimator for one unrestricted walker, [t2frg, e0frg, e1frg, e0],
@@ -423,14 +487,18 @@ def energy_kernel_uw_uh_fast(
     return jnp.stack([t2frg, e0frg, e1frg, e0])
 
 
-def make_upt2ccsd_fast_meas_ops(
+def make_upt2ccsd_meas_ops(
     sys: Any,
     *,
     mixed_precision: bool = True,
     testing: bool = False,
     nchol_chunk: int | None = None,
 ) -> MeasOps:
-    """MeasOps of the unrestricted fragment upt2ccsd_fast trial; see make_upt2ccsd_meas_ops."""
+    """
+    MeasOps of the unrestricted fragment pt2CCSD trial on the uchol hamiltonian: overlap_u
+    and the "energy" kernel that returns TRIAL_COMPONENTS per walker, in the signature
+    setup_mixed drives.
+    """
     if sys.walker_kind.lower() != "unrestricted":
         raise ValueError(
             "the unrestricted fragment pt2CCSD MeasOps require walker_kind='unrestricted', "
@@ -442,21 +510,21 @@ def make_upt2ccsd_fast_meas_ops(
     meas_ops = MeasOps(
         overlap=overlap_u,
         build_meas_ctx=lambda ham_data, trial_data: build_meas_ctx(ham_data, trial_data, cfg),
-        kernels={k_energy: energy_kernel_uw_uh_fast},
+        kernels={k_energy: energy_kernel_uw_uh},
     )
-    object.__setattr__(meas_ops, _UPT2CCSD_FAST_MEAS_CFG_ATTR, cfg)
+    object.__setattr__(meas_ops, _UPT2CCSD_FRAG_MEAS_CFG_ATTR, cfg)
     return meas_ops
 
 
-def get_upt2ccsd_fast_meas_cfg(meas_ops: MeasOps) -> Pt2ccsdChunkMeasCfg | None:
-    cfg = getattr(meas_ops, _UPT2CCSD_FAST_MEAS_CFG_ATTR, None)
+def get_upt2ccsd_meas_cfg(meas_ops: MeasOps) -> Pt2ccsdChunkMeasCfg | None:
+    cfg = getattr(meas_ops, _UPT2CCSD_FRAG_MEAS_CFG_ATTR, None)
     return cfg if isinstance(cfg, Pt2ccsdChunkMeasCfg) else None
 
 
-def plan_chunking_for_run_u_fast(
+def plan_chunking_for_run_u(
     sys: Any,
     ham_data: HamCholU,
-    trial_data: Upt2ccsdFastTrial,
+    trial_data: Upt2ccsdTrial,
     *,
     n_walkers: int,
     budget_bytes: int,
@@ -465,10 +533,15 @@ def plan_chunking_for_run_u_fast(
     mixed_precision: bool = True,
     n_devices: int = 1,
 ) -> ChunkPlan:
-    """The recipe's memory hook: the bar kernel's model, which over-counts this kernel."""
-    return plan_chunking_for_run_u(
+    """
+    The recipe's analytic memory hook: the branch's unrestricted bar memory model, which
+    over-counts this kernel (its T2 blocks and chunk intermediates carry nlo where the
+    model counts nocc), so the plan errs on the safe side. max_memory="xla" sizes the
+    chunk from the compiled kernel instead.
+    """
+    return _plan_chunking_for_run_u(
         sys,
-        cast(Any, ham_data),
+        ham_data,
         cast(Any, trial_data),
         n_walkers=n_walkers,
         budget_bytes=budget_bytes,
@@ -476,4 +549,5 @@ def plan_chunking_for_run_u_fast(
         nchol_chunk=nchol_chunk,
         mixed_precision=mixed_precision,
         n_devices=n_devices,
+        bar=True,
     )

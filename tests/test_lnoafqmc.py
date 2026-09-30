@@ -38,11 +38,9 @@ from trot.lnoafqmc import LnoAfqmcMixed, LnoFragMixed, iao_fragment
 from trot.lnoafqmc import integral as li
 from trot.lnoafqmc import las, pipeline, solvers
 from trot.lnoafqmc import staging as lst
-from trot.lnoafqmc.meas import pt2ccsd_bar as lm
-from trot.lnoafqmc.meas import pt2ccsd_fast as lf
+from trot.lnoafqmc.meas import pt2ccsd as lm
 from trot.lnoafqmc.mixed import available_mixed_recipes, get_mixed_recipe
 from trot.lnoafqmc.trial.pt2ccsd import make_pt2ccsd_trial_data, overlap_r
-from trot.lnoafqmc.trial.pt2ccsd_fast import make_pt2ccsd_fast_trial_data
 from trot.meas.pt2ccsd_bar import build_meas_ctx as trot_build_ctx
 from trot.meas.pt2ccsd_bar import energy_kernel_rw_rh_bar as trot_bar_kernel
 from trot.meas.pt2ccsd_chunking import make_chunk_meas_cfg
@@ -113,6 +111,7 @@ def frag0(o2):
     ops = lm.make_pt2ccsd_meas_ops(sys_, mixed_precision=False, testing=True, nchol_chunk=3)
     ctx = ops.build_meas_ctx(ham_data, trial_data)
     t2_full = np.asarray(frag.t2).transpose(0, 2, 1, 3)  # unprojected, (i,a,j,b)
+    assert trial_data.nlo < trial_data.nocc
     return dict(
         ham=ham,
         sys=sys_,
@@ -201,23 +200,30 @@ def test_las_ordering_is_asserted(o2):
 # ----------------------------------------------------------------------------- kernel
 
 
+def _trial_with_u(tin, u, t2_full, sys_):
+    """The fragment trial input with the projector factor u (nocc, nlo) and full doubles."""
+    t2u = np.einsum("iajb,iI->Iajb", t2_full, u)
+    d = dict(tin.data)
+    d["u"] = u
+    d["t2x"] = 2 * t2u - t2u.transpose(0, 3, 2, 1)
+    return make_pt2ccsd_trial_data(d, sys_)
+
+
 def test_kernel_prjlo_one_limit_matches_bar_kernel(frag0):
-    """With the identity projector the fragment kernel is the branch's pt2ccsd_bar kernel:
-    t2frg = theta, e1frg = h_t, e0 = electronic_0, and e0frg = electronic_0 - E_HF."""
+    """With the identity projector (U = 1, nlo = nocc) the fragment kernel is the branch's
+    pt2ccsd_bar kernel: t2frg = theta, e1frg = h_t, e0 = electronic_0, and
+    e0frg = electronic_0 - E_HF."""
     sys_, ham_data, tin, ops = frag0["sys"], frag0["ham_data"], frag0["tin"], frag0["ops"]
     nocc, norb = sys_.nup, sys_.norb
     t2_full = frag0["t2_full"]
-    d = dict(tin.data)
-    d["prjlo"] = np.eye(nocc)
-    d["t2"] = t2_full
-    td = make_pt2ccsd_trial_data(d, sys_)
+    td = _trial_with_u(tin, np.eye(nocc), t2_full, sys_)
     ctx = ops.build_meas_ctx(ham_data, td)
     ttrial = TrotPt2ccsdTrial(mo_t=td.mo_t, t2=jnp.asarray(t2_full))
     cfg = make_chunk_meas_cfg(mixed_precision=False, testing=True, nchol_chunk=3)
     tctx = trot_build_ctx(ham_data, ttrial, cfg)
     e_hf = _e_hf_el(frag0["ham"])
     for w in _random_walkers(norb, nocc, 4):
-        out = np.asarray(lm.energy_kernel_rw_rh_bar(w, ham_data, ctx, td))
+        out = np.asarray(lm.energy_kernel_rw_rh(w, ham_data, ctx, td))
         ref = np.asarray(trot_bar_kernel(w, ham_data, tctx, ttrial))  # [theta, e0, h_t]
         assert abs(out[0] - ref[0]) < 1e-9
         assert abs(out[3] - ref[1]) < 1e-9
@@ -234,25 +240,17 @@ def test_kernel_partition_of_unity(frag0, o2):
     ncore = int(np.sum(np.asarray(frag.lno_frozen) < nocc_full))  # frozen occupied count
     s1e = mf.get_ovlp()
     actocc = frag.lno_coeff[:, ncore : ncore + nocc]
-    prj = []
-    for f in range(len(frag_list)):
-        u = actocc.T @ s1e @ lo_coeff[:, frag_list[f]]
-        prj.append(u @ u.T)
-    assert np.abs(sum(prj) - np.eye(nocc)).max() < 1e-10
+    us = [actocc.T @ s1e @ lo_coeff[:, frag_list[f]] for f in range(len(frag_list))]
+    assert np.abs(sum(u @ u.T for u in us) - np.eye(nocc)).max() < 1e-10
 
     t2_full = frag0["t2_full"]
     tds, ctxs = [], []
-    for p in prj + [np.eye(nocc)]:
-        d = dict(tin.data)
-        d["prjlo"] = p
-        d["t2"] = np.einsum("iajb,ik->kajb", t2_full, p)
-        td = make_pt2ccsd_trial_data(d, sys_)
+    for u in us + [np.eye(nocc)]:
+        td = _trial_with_u(tin, u, t2_full, sys_)
         tds.append(td)
         ctxs.append(ops.build_meas_ctx(ham_data, td))
     for w in _random_walkers(norb, nocc, 4, seed=11):
-        parts = [
-            np.asarray(lm.energy_kernel_rw_rh_bar(w, ham_data, c, t)) for c, t in zip(ctxs, tds)
-        ]
+        parts = [np.asarray(lm.energy_kernel_rw_rh(w, ham_data, c, t)) for c, t in zip(ctxs, tds)]
         full = parts[-1]
         s = parts[0] + parts[1]
         assert np.abs(s[:3] - full[:3]).max() < 1e-9  # t2frg, e0frg, e1frg are additive
@@ -272,10 +270,11 @@ def test_kernel_chunking_and_precision_are_consistent(frag0):
     ctx_mp = ops_mp.build_meas_ctx(ham_data, td)
     cfg = lm.get_pt2ccsd_meas_cfg(ops_mp)
     assert cfg is not None and cfg.mixed_real_dtype == jnp.float32 and cfg.nchol_chunk == 5
+    assert ctx1.chol_ov_u.shape == (ham_data.chol.shape[0], td.nlo, td.nvir)
     for w in _random_walkers(sys_.norb, sys_.nup, 3, seed=2):
-        ref = np.asarray(lm.energy_kernel_rw_rh_bar(w, ham_data, ref_ctx, td))
-        out1 = np.asarray(lm.energy_kernel_rw_rh_bar(w, ham_data, ctx1, td))
-        out_mp = np.asarray(lm.energy_kernel_rw_rh_bar(w, ham_data, ctx_mp, td))
+        ref = np.asarray(lm.energy_kernel_rw_rh(w, ham_data, ref_ctx, td))
+        out1 = np.asarray(lm.energy_kernel_rw_rh(w, ham_data, ctx1, td))
+        out_mp = np.asarray(lm.energy_kernel_rw_rh(w, ham_data, ctx_mp, td))
         assert np.abs(out1 - ref).max() < 1e-10
         assert np.abs(out_mp - ref).max() < 1e-4
     del ref_ops
@@ -315,14 +314,14 @@ def test_chunk_plan_sizes_the_fragment_kernel(frag0):
     assert fixed.nchol_chunk == 4
 
 
-# ----------------------------------------------------------------------------- pt2ccsd_fast
+# ----------------------------------------------------------------------------- trial staging
 
 
-def test_fast_trial_staging(o2):
-    """t2u = t2 U on the first index, U = <act_occ|lo> with nlo < nocc; prjlo = U U^T."""
+def test_trial_staging(o2):
+    """t2u = t2 U on the first index, U = <act_occ|lo> with nlo < nocc; t2x folds the exchange."""
     frag = o2["frags"][0]
-    tin = lst.stage_pt2ccsd_fast_trial(frag)
-    assert tin.kind == "pt2ccsd_fast"
+    tin = lst.stage_pt2ccsd_trial(frag)
+    assert tin.kind == "pt2ccsd"
     u = np.asarray(tin.data["u"])
     nocc, nlo = u.shape
     assert nlo < nocc and np.array_equal(u, np.asarray(frag.uocc_loc))
@@ -330,71 +329,44 @@ def test_fast_trial_staging(o2):
     t2u = np.einsum("iajb,iI->Iajb", t2, u)
     assert tin.data["t2x"].shape == (nlo, t2.shape[1], nocc, t2.shape[3])
     np.testing.assert_allclose(tin.data["t2x"], 2 * t2u - t2u.transpose(0, 3, 2, 1), atol=1e-14)
-    # the projected doubles of the pt2ccsd trial are t2u closed with the second factor
-    tin_bar = lst.stage_pt2ccsd_trial(frag)
-    np.testing.assert_allclose(np.einsum("Iajb,kI->kajb", t2u, u), tin_bar.data["t2"], atol=1e-12)
-    np.testing.assert_allclose(u @ u.T, tin_bar.data["prjlo"], atol=1e-12)
+    np.testing.assert_allclose(tin.data["mo_t"][nocc:, :], np.asarray(frag.t1).T, atol=1e-14)
+    with pytest.raises(ValueError, match="restricted fragment data"):
+        lst.stage_upt2ccsd_trial(frag)
 
 
-def test_fast_kernel_matches_bar_kernel(frag0, o2):
-    """The factored projector gives the same four components as the bar kernel, to roundoff."""
-    sys_, ham_data, td, ctx = frag0["sys"], frag0["ham_data"], frag0["trial_data"], frag0["ctx"]
-    frag = o2["frags"][0]
-    tin = lst.stage_pt2ccsd_fast_trial(frag)
-    tdf = make_pt2ccsd_fast_trial_data(tin.data, sys_)
-    assert tdf.nocc == td.nocc and tdf.nvir == td.nvir and tdf.nlo < tdf.nocc
-    ctxs = [
-        lf.make_pt2ccsd_fast_meas_ops(
-            sys_, mixed_precision=False, testing=True, nchol_chunk=k
-        ).build_meas_ctx(ham_data, tdf)
-        for k in (1, 3, None)
-    ]
-    assert ctxs[0].chol_ov_u.shape == (ham_data.chol.shape[0], tdf.nlo, tdf.nvir)
-    for w in _random_walkers(sys_.norb, sys_.nup, 4, seed=13):
-        ref = np.asarray(lm.energy_kernel_rw_rh_bar(w, ham_data, ctx, td))
-        for c in ctxs:
-            out = np.asarray(lf.energy_kernel_rw_rh_fast(w, ham_data, c, tdf))
-            assert np.abs(out - ref).max() < 1e-9
-    # mixed precision: the T2 contractions in single precision
-    ops_mp = lf.make_pt2ccsd_fast_meas_ops(sys_, mixed_precision=True, nchol_chunk=4)
-    ctx_mp = ops_mp.build_meas_ctx(ham_data, tdf)
-    assert lf.get_pt2ccsd_fast_meas_cfg(ops_mp).mixed_real_dtype == jnp.float32
-    w = next(_random_walkers(sys_.norb, sys_.nup, 1, seed=4))
-    ref = np.asarray(lm.energy_kernel_rw_rh_bar(w, ham_data, ctx, td))
-    assert (
-        np.abs(np.asarray(lf.energy_kernel_rw_rh_fast(w, ham_data, ctx_mp, tdf)) - ref).max() < 1e-4
-    )
-
-
-def test_fast_recipes():
-    assert ("rhf", "pt2ccsd_fast") in available_mixed_recipes()
-    assert ("cisd", "pt2ccsd_fast") in available_mixed_recipes()
+def test_trial_aliases():
+    """The "_fast" names of the earlier releases resolve to the (only) estimators."""
+    assert ("rhf", "pt2ccsd_fast") not in available_mixed_recipes()
     rec = get_mixed_recipe("pt2ccsd_fast")
-    assert rec.guide == "rhf" and rec.components == lm.TRIAL_COMPONENTS
-    assert rec.energy_fn is lm.frag_pt2ccsd_energy_fn and rec.needs_amplitudes
+    assert rec.trial == "pt2ccsd" and rec.guide == "rhf"
+    assert get_mixed_recipe("pt2ccsd_fast", guide="cisd").trial == "pt2ccsd"
     with pytest.raises(ValueError):
         get_mixed_recipe("pt2ccsd_fast", guide="uhf")
 
 
-def test_fast_trial_run_reproduces_pt2ccsd_run(o2, tmp_path):
-    """From one fragment file and seed, trial="pt2ccsd_fast" is the trial="pt2ccsd" run."""
+def test_projected_and_full_amplitude_files_give_the_same_run(o2, tmp_path):
+    """From one fragment and seed, the run from a file with the projected doubles is the run
+    from one with the full doubles; the "_fast" alias names the same trial."""
     mf, frag = o2["mf"], o2["frags"][0]
     qmc: dict[str, Any] = dict(
         n_walkers=20, n_eql_blocks=2, n_blocks=20, dt=0.005, n_prop_steps=10, seed=3
     )
     with contextlib.redirect_stdout(io.StringIO()):
-        path = LnoFragMixed(mf, frag, chol_cut=CHOL_CUT).save(tmp_path / "frag1.h5")
-        fm_bar = LnoFragMixed.from_frag_data(path, trial="pt2ccsd", mixed_precision=False, **qmc)
-        e_bar, err_bar = fm_bar.kernel()
-        fm_fast = LnoFragMixed.from_frag_data(
-            path, trial="pt2ccsd_fast", mixed_precision=False, **qmc
+        fm = LnoFragMixed(mf, frag, chol_cut=CHOL_CUT)
+        path_full = fm.save(tmp_path / "full.h5", amplitudes="full")
+        path_proj = fm.save(tmp_path / "proj.h5")
+        fm_full = LnoFragMixed.from_frag_data(
+            path_full, trial="pt2ccsd", mixed_precision=False, **qmc
         )
-        e_fast, err_fast = fm_fast.kernel()
-    assert fm_fast.trial == "pt2ccsd_fast" and fm_fast.build_job().mix_trial_data.nlo < 6
-    r_bar, r_fast = fm_bar.qmc_result, fm_fast.qmc_result
-    assert abs(r_fast.frag_init_energy - r_bar.frag_init_energy) < 1e-10
-    assert abs(e_fast - e_bar) < 1e-8 and abs(err_fast - err_bar) < 1e-8
-    assert abs(fm_fast.guide_e_tot - fm_bar.guide_e_tot) < 1e-10
+        e_full, err_full = fm_full.kernel()
+        fm_proj = LnoFragMixed.from_frag_data(
+            path_proj, trial="pt2ccsd_fast", mixed_precision=False, **qmc
+        )
+        e_proj, err_proj = fm_proj.kernel()
+    assert fm_proj.trial == "pt2ccsd" and fm_proj.build_job().mix_trial_data.nlo < 6
+    assert abs(fm_proj.qmc_result.frag_init_energy - fm_full.qmc_result.frag_init_energy) < 1e-10
+    assert abs(e_proj - e_full) < 1e-8 and abs(err_proj - err_full) < 1e-8
+    assert abs(fm_proj.guide_e_tot - fm_full.guide_e_tot) < 1e-10
 
 
 # ----------------------------------------------------------------------------- statistics
@@ -458,9 +430,10 @@ def test_frag_file_round_trip(o2, tmp_path):
         path = fm.save(tmp_path / "frag1.h5")
         frag2, staged, attrs = lst.load_frag(path)
     assert frag2.frag_name == frag.frag_name and frag2.nact == frag.nact
-    # the pt2ccsd trial stores the full doubles
-    assert np.allclose(frag2.t2, frag.t2) and np.allclose(frag2.uocc_loc, frag.uocc_loc)
-    assert frag2.t2u is None and frag2.has_full_amplitudes
+    # by default the file carries the projected doubles
+    assert frag2.t2 is None and np.allclose(frag2.uocc_loc, frag.uocc_loc)
+    assert frag2.has_amplitudes and not frag2.has_full_amplitudes
+    np.testing.assert_allclose(frag2.t2u, lst.projected_doubles(frag), atol=1e-14)
     assert staged.ham.norb == 8 and staged.trial.kind == "rhf"
     assert abs(attrs["emf"] - mf.e_tot) < 1e-12
     # the guide staged by the branch in the fragment basis is the identity on the active LNOs
@@ -473,15 +446,13 @@ def test_frag_file_round_trip(o2, tmp_path):
 
 
 def test_frag_file_projected_doubles(o2, tmp_path):
-    """A file written for the fast trial carries t2u = t2 U instead of t2; every pt2CCSD trial
-    re-runs from it, the CISD guide (which needs the full doubles) refuses it."""
+    """A file carries t2u = t2 U instead of t2 by default; the trial re-runs from it, a CISD
+    guide it was not written with (which needs the full doubles) refuses it."""
     import h5py
 
     mf, frag = o2["mf"], o2["frags"][0]
     with contextlib.redirect_stdout(io.StringIO()):
-        path = LnoFragMixed(mf, frag, trial="pt2ccsd_fast", chol_cut=CHOL_CUT).save(
-            tmp_path / "f.h5"
-        )
+        path = LnoFragMixed(mf, frag, trial="pt2ccsd", chol_cut=CHOL_CUT).save(tmp_path / "f.h5")
         frag2, _, _ = lst.load_frag(path)
     with h5py.File(path, "r") as f:
         assert "t2u" in f["amplitudes"] and "t2" not in f["amplitudes"]
@@ -490,27 +461,25 @@ def test_frag_file_projected_doubles(o2, tmp_path):
     assert frag2.t2 is None and frag2.t2u.shape == (nlo, nvir, nocc, nvir)
     assert frag2.has_amplitudes and not frag2.has_full_amplitudes
     np.testing.assert_allclose(frag2.t2u, lst.projected_doubles(frag), atol=1e-14)
-    # the same trial inputs as from the full amplitudes, for both pt2CCSD trials
-    for stager in (lst.stage_pt2ccsd_trial, lst.stage_pt2ccsd_fast_trial):
-        a, b = stager(frag), stager(frag2)
-        for k in a.data:
-            np.testing.assert_allclose(np.asarray(a.data[k]), np.asarray(b.data[k]), atol=1e-12)
+    # the same trial input as from the full amplitudes
+    a, b = lst.stage_pt2ccsd_trial(frag), lst.stage_pt2ccsd_trial(frag2)
+    for k in a.data:
+        np.testing.assert_allclose(np.asarray(a.data[k]), np.asarray(b.data[k]), atol=1e-12)
     with contextlib.redirect_stdout(io.StringIO()):
-        for trial in ("pt2ccsd_fast", "pt2ccsd"):
-            job = LnoFragMixed.from_frag_data(path, trial=trial).build_job()
-            assert job.mix_trial_data.nocc == nocc
+        job = LnoFragMixed.from_frag_data(path, trial="pt2ccsd").build_job()
+        assert job.mix_trial_data.nocc == nocc
     with pytest.raises(ValueError, match="full fragment CCSD amplitudes"):
         LnoFragMixed.from_frag_data(path, guide="cisd").build_job()
     # a file written with the CISD guide carries that guide, so it re-runs with it
     with contextlib.redirect_stdout(io.StringIO()):
-        path2 = LnoFragMixed(mf, frag, trial="pt2ccsd_fast", guide="cisd", chol_cut=CHOL_CUT).save(
+        path2 = LnoFragMixed(mf, frag, trial="pt2ccsd", guide="cisd", chol_cut=CHOL_CUT).save(
             tmp_path / "f2.h5"
         )
-        job2 = LnoFragMixed.from_frag_data(path2, trial="pt2ccsd_fast", guide="cisd").build_job()
+        job2 = LnoFragMixed.from_frag_data(path2, trial="pt2ccsd", guide="cisd").build_job()
     assert job2.staged.trial.kind == "cisd"
-    # amplitudes="full" keeps the full doubles even for the fast trial
+    # amplitudes="full" keeps the full doubles
     with contextlib.redirect_stdout(io.StringIO()):
-        path3 = LnoFragMixed(mf, frag, trial="pt2ccsd_fast", chol_cut=CHOL_CUT).save(
+        path3 = LnoFragMixed(mf, frag, trial="pt2ccsd", chol_cut=CHOL_CUT).save(
             tmp_path / "f3.h5", amplitudes="full"
         )
     assert lst.load_frag(path3)[0].has_full_amplitudes
@@ -608,23 +577,18 @@ def test_lno_afqmc_o2_end_to_end(o2, tmp_path, request):
 
 def test_frag_memory_budget_and_chunk_plan(o2, tmp_path):
     """
-    Without max_memory the fragment takes its budget from the device (also under the
-    platform allocator, where jax reports none), so the trial gets a chunk plan; the plan
-    and its memory lines are in the banner; an explicit max_memory sizes the chunk.
+    Without max_memory the fragment plans its chunk from the compiled kernels against the
+    device memory (also under the platform allocator, where jax reports none); the plan
+    and its memory lines are in the banner; an explicit max_memory sizes the chunk with
+    the analytic model.
     """
     import jax
 
-    from trot.lnoafqmc.afqmc import device_memory_budget_mb
-
     mf, frag = o2["mf"], o2["frags"][0]
-    budget, source = device_memory_budget_mb()
     on_gpu = jax.devices()[0].platform == "gpu"
-    assert (budget is not None) == on_gpu
-    fm = LnoFragMixed(mf, frag, chol_cut=CHOL_CUT, trial="pt2ccsd_fast", n_walkers=8)
-    assert fm.max_memory == budget and fm.max_memory_source == source
-    small = LnoFragMixed(
-        mf, frag, chol_cut=CHOL_CUT, trial="pt2ccsd_fast", n_walkers=8, max_memory=2
-    )
+    fm = LnoFragMixed(mf, frag, chol_cut=CHOL_CUT, trial="pt2ccsd", n_walkers=8)
+    assert fm.max_memory == "xla" and fm.max_memory_source == "default"
+    small = LnoFragMixed(mf, frag, chol_cut=CHOL_CUT, trial="pt2ccsd", n_walkers=8, max_memory=2)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         job = small.build_job()
@@ -648,7 +612,8 @@ def test_frag_memory_budget_and_chunk_plan(o2, tmp_path):
         assert key in text, key
     if on_gpu:
         with contextlib.redirect_stdout(io.StringIO()):
-            assert fm.build_job().chunk_plan is not None
+            plan = fm.build_job().chunk_plan
+        assert plan is not None and "xla" in plan.note
 
 
 def test_frag_memory_mode_strings(o2):
@@ -658,9 +623,7 @@ def test_frag_memory_mode_strings(o2):
     mf, frag = o2["mf"], o2["frags"][0]
     on_gpu = jax.devices()[0].platform == "gpu"
     for mm in ("analytic", "xla"):
-        fm = LnoFragMixed(
-            mf, frag, chol_cut=CHOL_CUT, trial="pt2ccsd_fast", n_walkers=8, max_memory=mm
-        )
+        fm = LnoFragMixed(mf, frag, chol_cut=CHOL_CUT, trial="pt2ccsd", n_walkers=8, max_memory=mm)
         assert fm.max_memory == mm and fm.max_memory_source == f"max_memory={mm!r}"
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
@@ -674,7 +637,7 @@ def test_frag_memory_mode_strings(o2):
     with pytest.raises(ValueError, match="'analytic', 'xla'"):
         with contextlib.redirect_stdout(io.StringIO()):
             LnoFragMixed(
-                mf, frag, chol_cut=CHOL_CUT, trial="pt2ccsd_fast", n_walkers=8, max_memory="foo"
+                mf, frag, chol_cut=CHOL_CUT, trial="pt2ccsd", n_walkers=8, max_memory="foo"
             ).build_job()
 
 
@@ -685,7 +648,7 @@ def test_cpu_gpu_split_reproduces_one_machine_loop(o2, tmp_path):
     seed and settings, reproduces the one-machine loop fragment by fragment.
     """
     mf, nfrozen = o2["mf"], o2["nfrozen"]
-    common: dict[str, Any] = dict(trial="pt2ccsd_fast", seed=17, mixed_precision=False)
+    common: dict[str, Any] = dict(trial="pt2ccsd", seed=17, mixed_precision=False)
     qmc: dict[str, Any] = dict(n_walkers=20, n_eql_blocks=2, n_blocks=20, dt=0.005, n_prop_steps=10)
     lno_args = (mf, o2["lo_coeff"], o2["frag_list"])
     lno_kw: dict[str, Any] = dict(

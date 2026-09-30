@@ -1147,14 +1147,14 @@ class AfqmcMixed(Afqmc):
         Cholesky vectors per scan step of a chunked trial, set directly; by default it
         is sized by the trial's memory model against the memory budget.
     max_memory : float or str, optional
-        How the cholesky chunk of the trial measurement is sized, per device. A number
-        is a budget in MB for the recipe's analytic memory model; ``"analytic"`` (the
-        default) is that model against a share of the device memory
-        (meas.pt2ccsd_chunking.DEVICE_MEMORY_FRACTION); ``"xla"`` compiles the trial and
-        guide energy kernels at the run's shapes and sizes the chunk from the scratch
-        memory XLA reports, against a larger share (XLA_DEVICE_MEMORY_FRACTION). On a
-        backend that reports no device memory the default chunk size is used. The guide's
-        local energy is summed with the same chunk.
+        How the cholesky chunk of the trial measurement is sized, per device. ``"xla"``
+        (the default) compiles the trial and guide energy kernels at the run's shapes and
+        sizes the chunk from the scratch memory XLA reports, against a share of the
+        device memory (meas.pt2ccsd_chunking.XLA_DEVICE_MEMORY_FRACTION); ``"analytic"``
+        uses the recipe's memory model against a smaller share (DEVICE_MEMORY_FRACTION); a
+        number is a budget in MB for that model. On a backend that reports no device
+        memory the default chunk size is used. The guide's local energy is summed with
+        the same chunk.
     mixed_precision : bool, optional
         Single precision for the T2 contractions of the trial estimator and the
         propagator's cholesky products, by default True; partial sums are always

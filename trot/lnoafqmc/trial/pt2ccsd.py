@@ -16,50 +16,84 @@ __all__ = ["Pt2ccsdTrial", "overlap_r", "make_pt2ccsd_trial_data"]
 @dataclass(frozen=True)
 class Pt2ccsdTrial:
     """
-    Restricted pt2CCSD trial of one LNO fragment, in the LNO basis where the reference
-    determinant occupies the first nocc orbitals. trot's trial/pt2ccsd.Pt2ccsdTrial plus
-    the fragment projector.
+    Restricted pt2CCSD trial of one LNO fragment (meas/pt2ccsd.py), in the LNO basis
+    where the reference determinant occupies the first nocc orbitals: trot's
+    trial/pt2ccsd.Pt2ccsdTrial plus the fragment projector, kept in factored form.
+
+    The projector is prjlo = U U^H with U = <act_occ|lo> the (nocc, nlo) overlap of the
+    active occupied orbitals with the fragment's orthonormal local orbitals (U itself
+    need not have orthonormal columns: the active occupied space of a truncated fragment
+    does not contain the local orbitals entirely). Projecting the doubles on their first
+    occupied index, t2_{k a j b} = sum_i t2_{i a j b} prjlo_{i k}, would keep a full
+    (nocc, ...) tensor; instead the doubles carry only the local index,
+    t2u_{I a j b} = sum_i t2_{i a j b} U_{i I}, and the second factor U^H_{I k} is applied
+    inside the energy kernel, where the local index I is contracted last. nlo is the
+    number of local orbitals of the fragment (the IAOs on one atom, say), typically much
+    smaller than nocc, so the T2 contractions and the projected two-body terms cost
+    nlo/nocc of the dense-projector ones.
+
+    Every direct/exchange pair of T2 terms in the kernel is of the form
+    2 (X_{Ia} t2u_{Iajb} Y_{jb}) - (X_{Ib} t2u_{Iajb} Y_{ja}), which is one contraction
+    with the exchange folded into the amplitudes,
+
+        t2x_{I a j b} = 2 t2u_{I a j b} - t2u_{I b j a}      (nlo, nvir, nocc, nvir)
+
+    so that is what the trial stores (t2u = (2 t2x + t2x_{Ibja}) / 3 if ever needed).
 
     Arrays:
       mo_t:  (norb, nocc)              exp(T1)|HF> by Thouless' theorem
-      t2:    (nocc, nvir, nocc, nvir)  t2_{k a j b} = sum_i t2_{i a j b} prjlo_{i k}: the
-                                       doubles projected on the fragment in their first
-                                       occupied index, so no longer symmetric in (ia)(jb)
-      prjlo: (nocc, nocc)              U U^T, U = <act_occ|lo> of the fragment
+      t2x:   (nlo, nvir, nocc, nvir)   the projected doubles, exchange folded in
+      u:     (nocc, nlo)               U = <act_occ|lo>
       t1:    (nocc, nvir)              the singles, unprojected (for e0t1orb)
     """
 
     mo_t: jax.Array
-    t2: jax.Array
-    prjlo: jax.Array
+    t2x: jax.Array
+    u: jax.Array
     t1: jax.Array
 
     @property
     def nocc(self) -> int:
-        return int(self.t2.shape[0])
+        return int(self.u.shape[0])
+
+    @property
+    def nlo(self) -> int:
+        return int(self.u.shape[1])
 
     @property
     def nvir(self) -> int:
-        return int(self.t2.shape[1])
+        return int(self.t2x.shape[1])
 
     @property
     def norb(self) -> int:
         return int(self.nocc + self.nvir)
 
+    @property
+    def prjlo(self) -> jax.Array:
+        """The (nocc, nocc) fragment projector U U^H (for e0t1orb and checks)."""
+        return self.u @ self.u.conj().T
+
     def tree_flatten(self):
-        return (self.mo_t, self.t2, self.prjlo, self.t1), None
+        return (self.mo_t, self.t2x, self.u, self.t1), None
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        mo_t, t2, prjlo, t1 = children
-        return cls(mo_t=mo_t, t2=t2, prjlo=prjlo, t1=t1)
+        mo_t, t2x, u, t1 = children
+        return cls(mo_t=mo_t, t2x=t2x, u=u, t1=t1)
 
 
 def make_pt2ccsd_trial_data(data: dict, sys: System) -> Pt2ccsdTrial:
+    """From staging.stage_pt2ccsd_trial's data."""
     mo_t = jnp.asarray(data["mo_t"])[:, : sys.nup]
-    return Pt2ccsdTrial(
+    td = Pt2ccsdTrial(
         mo_t=mo_t,
-        t2=jnp.asarray(data["t2"]),
-        prjlo=jnp.asarray(data["prjlo"]),
+        t2x=jnp.asarray(data["t2x"]),
+        u=jnp.asarray(data["u"]),
         t1=jnp.asarray(data["t1"]),
     )
+    if td.nocc != sys.nup or td.norb != sys.norb:
+        raise ValueError(
+            f"the fragment amplitudes span norb={td.norb} with nocc={td.nocc} but the "
+            f"fragment hamiltonian has norb={sys.norb} and nocc={sys.nup}."
+        )
+    return td

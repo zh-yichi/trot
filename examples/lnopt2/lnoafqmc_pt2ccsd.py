@@ -65,8 +65,6 @@ lno = LnoAfqmcMixed(
     nfrozen=nfrozen,
     run_frag=None,  # e.g. [0] to run one fragment
     trial="pt2ccsd",  # guide=None -> the HF guide; guide="cisd" propagates with the fragment CISD.
-    #                   "pt2ccsd_fast" is the same estimator with the fragment projector
-    #                   factored, cheaper for fragments with many more occupied than local orbitals
     target_error=1e-5,  # each fragment stops once its error < 0.7 * target / sqrt(nfrag),
     #                     after at least min_blocks=120 sampling blocks; None runs all n_blocks
     n_walkers=300,
@@ -77,7 +75,7 @@ lno = LnoAfqmcMixed(
     mixed_precision=False,  # True by default (single precision T2 contractions, double sums);
     # guide_mixed_precision / trial_mixed_precision set the guide and the trial apart
     # max_memory=4000,  # MB budget of the trial measurement; by default a share of the device
-    # frag_output="./fragment_fast.out",  # -> ./fragment.out1, ./fragment.out2, ... (optional)
+    # frag_output="./fragment.out",  # -> ./fragment.out1, ./fragment.out2, ... (optional)
     # lno_output="./lno_result.out",  # the results table (optional)
     # save_frag_data="./frag_data",  # -> ./frag_data/frag{i}.h5, re-runnable without mf (optional)
 )

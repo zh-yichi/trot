@@ -61,44 +61,6 @@ def _device_bytes_in_use() -> int | None:
     return None
 
 
-def device_memory_budget_mb() -> tuple[float | None, str]:
-    """
-    The trial's memory budget in MB when no max_memory is given, and where it came from.
-
-    jax reports an allocator limit only for the pool allocator; under the platform
-    allocator (what the fragment loop selects, so device memory is handed back between
-    fragments) device.memory_stats() is empty and setup_mixed would plan nothing. Then
-    the driver is asked for the device's total memory through nvidia-smi, and the same
-    fraction of it (DEVICE_MEMORY_FRACTION) is the budget. None on a CPU backend, where
-    the trial keeps its fixed default chunk.
-    """
-    from ..meas.pt2ccsd_chunking import DEVICE_MEMORY_FRACTION, device_memory_budget_bytes
-
-    budget = device_memory_budget_bytes()
-    if budget is not None:
-        return budget / 1024**2, "jax allocator limit"
-    try:
-        import jax
-
-        if jax.devices()[0].platform != "gpu":
-            return None, "no device memory limit (CPU backend)"
-    except Exception:
-        return None, "no device memory limit"
-    try:
-        out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-        ).stdout
-        totals = [int(line.strip()) for line in out.splitlines() if line.strip().isdigit()]
-    except Exception:
-        totals = []
-    if not totals:
-        return None, "no device memory limit (nvidia-smi unavailable)"
-    return DEVICE_MEMORY_FRACTION * min(totals), f"{DEVICE_MEMORY_FRACTION:g} x device memory"
-
-
 def _release_device() -> None:
     """Hand the fragment's device memory back: drop the compiled kernels, collect."""
     import jax
@@ -139,10 +101,10 @@ class LnoFragMixed(AfqmcMixed):
     max_error : early-stop target of the fragment error; None runs all n_blocks.
     stop_ratio, min_blocks : stop once err < stop_ratio * max_error and at least
         min_blocks sampling blocks are in (0.7, 120 as in afqmc).
-    max_memory sizes the trial's cholesky chunk: a budget in MB, "analytic" or "xla" as
-    for AfqmcMixed (the latter reads the sizes from the compiled kernels); when not given it is
-    DEVICE_MEMORY_FRACTION of the device memory (device_memory_budget_mb), also under the
-    platform allocator where jax itself reports no limit.
+    max_memory sizes the trial's cholesky chunk as for AfqmcMixed: "xla" (the default)
+    reads the sizes from the compiled kernels, "analytic" uses the memory model, a number
+    is a budget in MB for it. The device memory is read from nvidia-smi under the platform
+    allocator, where jax itself reports no limit.
     The remaining keywords are AfqmcMixed's (max_memory, nchol_chunk, mixed_precision
     with the per side guide_mixed_precision / trial_mixed_precision, chol_cut,
     n_eql_blocks, n_blocks, seed, dt, n_prop_steps, n_walkers, n_chunks, error_method,
@@ -227,7 +189,7 @@ class LnoFragMixed(AfqmcMixed):
         )
         self.max_memory_source = "max_memory"
         if max_memory is None:
-            max_memory, self.max_memory_source = device_memory_budget_mb()
+            max_memory, self.max_memory_source = "xla", "default"
         elif isinstance(max_memory, str):
             # "analytic" / "xla": setup_mixed resolves the budget against the device memory
             self.max_memory_source = f"max_memory={max_memory!r}"
@@ -270,13 +232,14 @@ class LnoFragMixed(AfqmcMixed):
         self, path: Union[str, Path], *, amplitudes: str | None = None, nfrag_tot: int | None = None
     ) -> Path:
         """
-        Write the self-contained fragment file (see staging.dump_frag). With the fast
-        trials the doubles are stored projected on the fragment (nlo/nocc the size of
-        t2), which is all they need; the other trials store the full CCSD doubles, which
-        the CISD guides need as well. amplitudes="full" / "projected" overrides that.
+        Write the self-contained fragment file (see staging.dump_frag). By default the
+        doubles are stored projected on the fragment (nlo/nocc the size of t2), which is
+        all the pt2CCSD trials need; the file also carries the staged guide, so it re-runs
+        with a CISD guide it was written with. Only re-staging a CISD guide the file was
+        not written with needs the full CCSD doubles: amplitudes="full" keeps them.
         """
         if amplitudes is None:
-            amplitudes = "projected" if self.trial.endswith("_fast") else "full"
+            amplitudes = "projected"
         staged = self.stage()
         return dump_frag(
             path,
@@ -453,7 +416,7 @@ class LnoAfqmcMixed:
     and save_frag_data=DIR the loop runs steps 1-3 and writes DIR/frag{i}.h5, the fragment
     hamiltonian, guide and amplitudes of every fragment, then stops; on the GPU machine
 
-        lno = LnoAfqmcMixed(frag_data=DIR, trial="pt2ccsd_fast", seed=17, ...)
+        lno = LnoAfqmcMixed(frag_data=DIR, trial="pt2ccsd", seed=17, ...)
         e_qmc, e_qmc_err = lno.kernel()
 
     runs step 4 for every file with no mean field, LNO, CCSD or integral work, and fills

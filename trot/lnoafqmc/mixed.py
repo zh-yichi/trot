@@ -7,11 +7,11 @@ identity reference per spin of the uchol fragment hamiltonian (staging.stage_uhf
 the CISD ones come from the fragment's CCSD amplitudes (staging.stage_cisd_guide /
 stage_ucisd_guide). The trials are the fragment estimators, in a table of their own
 because the names coincide with trot's: "pt2ccsd" there is the full-space trial, here it
-is the fragment one (the bar estimator on the similarity transformed hamiltonian,
-meas/pt2ccsd_bar.py), "pt2ccsd_fast" the same estimator with the fragment projector
-kept factored so the local index is contracted last (meas/pt2ccsd_fast.py), and
-"upt2ccsd" the unrestricted counterpart on the uchol fragment hamiltonian
-(meas/upt2ccsd_bar.py).
+is the fragment one (the estimator on the similarity transformed hamiltonian with the
+fragment projector kept factored so the local index is contracted last,
+meas/pt2ccsd.py), and "upt2ccsd" the unrestricted counterpart on the uchol fragment
+hamiltonian (meas/upt2ccsd.py). The names "pt2ccsd_fast" / "upt2ccsd_fast" of the
+earlier releases are accepted as aliases.
 get_mixed_recipe(trial, guide) pairs the two through trot's pair_recipe, so the same
 compatibility rules (hamiltonian basis, walker kind) apply, and the block function and
 the statistics are the branch's (prop/blocks_mixed.block_mixed, the component
@@ -26,42 +26,28 @@ from typing import Any, Callable
 
 from ..mixed import GUIDES, GuideSpec, MixedRecipe, TrialSpec, pair_recipe
 from .integral import build_ham_lno_df, build_ham_ulno_df
-from .meas.pt2ccsd_bar import (
+from .meas.pt2ccsd import (
     TRIAL_COMPONENTS,
     frag_pt2ccsd_energy_fn,
     get_pt2ccsd_meas_cfg,
     make_pt2ccsd_meas_ops,
     plan_chunking_for_run,
 )
-from .meas.pt2ccsd_fast import (
-    get_pt2ccsd_fast_meas_cfg,
-    make_pt2ccsd_fast_meas_ops,
-    plan_chunking_for_run_fast,
-)
-from .meas.upt2ccsd_bar import (
+from .meas.upt2ccsd import (
     get_upt2ccsd_meas_cfg,
     make_upt2ccsd_meas_ops,
     plan_chunking_for_run_u,
 )
-from .meas.upt2ccsd_fast import (
-    get_upt2ccsd_fast_meas_cfg,
-    make_upt2ccsd_fast_meas_ops,
-    plan_chunking_for_run_u_fast,
-)
 from .staging import (
     LnoFragData,
     stage_cisd_guide,
-    stage_pt2ccsd_fast_trial,
     stage_pt2ccsd_trial,
     stage_ucisd_guide,
     stage_uhf_guide,
-    stage_upt2ccsd_fast_trial,
     stage_upt2ccsd_trial,
 )
 from .trial.pt2ccsd import make_pt2ccsd_trial_data
-from .trial.pt2ccsd_fast import make_pt2ccsd_fast_trial_data
 from .trial.upt2ccsd import make_upt2ccsd_trial_data
-from .trial.upt2ccsd_fast import make_upt2ccsd_fast_trial_data
 
 
 @dataclass(frozen=True)
@@ -96,7 +82,12 @@ GUIDE_STAGERS: dict[str, Callable[[LnoFragData], Any]] = {
 AMPLITUDE_GUIDES: frozenset[str] = frozenset({"cisd", "ucisd"})
 
 
+# the names of the earlier releases, when the dense-projector estimators were "pt2ccsd" /
+# "upt2ccsd" and the factored ones "pt2ccsd_fast" / "upt2ccsd_fast"
+TRIAL_ALIASES: dict[str, str] = {"pt2ccsd_fast": "pt2ccsd", "upt2ccsd_fast": "upt2ccsd"}
+
 TRIALS: dict[str, TrialSpec] = {
+    # the restricted fragment trial (meas/pt2ccsd.py)
     "pt2ccsd": TrialSpec(
         name="pt2ccsd",
         kind="pt2ccsd",
@@ -112,25 +103,8 @@ TRIALS: dict[str, TrialSpec] = {
         plan_chunking=plan_chunking_for_run,
         cfg_getter=get_pt2ccsd_meas_cfg,
     ),
-    # the same estimator with the fragment projector kept factored, U U^H, and the local
-    # index contracted last: the same numbers at nlo/nocc of the cost (meas/pt2ccsd_fast.py)
-    "pt2ccsd_fast": TrialSpec(
-        name="pt2ccsd_fast",
-        kind="pt2ccsd_fast",
-        stage=stage_pt2ccsd_fast_trial,
-        make_data=make_pt2ccsd_fast_trial_data,
-        make_meas_ops=make_pt2ccsd_fast_meas_ops,
-        components=TRIAL_COMPONENTS,
-        energy_fn=frag_pt2ccsd_energy_fn,
-        ham_basis="restricted",
-        walker_kinds=frozenset({"restricted"}),
-        cc_kind="ccsd",
-        default_guide="rhf",
-        plan_chunking=plan_chunking_for_run_fast,
-        cfg_getter=get_pt2ccsd_fast_meas_cfg,
-    ),
     # the unrestricted fragment trial, on the uchol fragment hamiltonian (each spin in its
-    # own LNO basis, one shared cholesky index) with unrestricted walkers
+    # own LNO basis, one shared cholesky index) with unrestricted walkers (meas/upt2ccsd.py)
     "upt2ccsd": TrialSpec(
         name="upt2ccsd",
         kind="upt2ccsd",
@@ -145,22 +119,6 @@ TRIALS: dict[str, TrialSpec] = {
         default_guide="uhf",
         plan_chunking=plan_chunking_for_run_u,
         cfg_getter=get_upt2ccsd_meas_cfg,
-    ),
-    # the unrestricted estimator with the projectors kept factored (meas/upt2ccsd_fast.py)
-    "upt2ccsd_fast": TrialSpec(
-        name="upt2ccsd_fast",
-        kind="upt2ccsd_fast",
-        stage=stage_upt2ccsd_fast_trial,
-        make_data=make_upt2ccsd_fast_trial_data,
-        make_meas_ops=make_upt2ccsd_fast_meas_ops,
-        components=TRIAL_COMPONENTS,
-        energy_fn=frag_pt2ccsd_energy_fn,
-        ham_basis="uchol",
-        walker_kinds=frozenset({"unrestricted"}),
-        cc_kind="uccsd",
-        default_guide="uhf",
-        plan_chunking=plan_chunking_for_run_u_fast,
-        cfg_getter=get_upt2ccsd_fast_meas_cfg,
     ),
 }
 
@@ -206,6 +164,7 @@ def get_mixed_recipe(trial: str, guide: str | None = None) -> LnoMixedRecipe:
     default guide (the corresponding HF); an unregistered or incompatible pair lists what
     is available.
     """
+    trial = TRIAL_ALIASES.get(trial, trial)
     trials = sorted(TRIALS)
     if trial not in trials:
         raise ValueError(f"unknown LNO trial {trial!r}; available: {', '.join(trials)}")
@@ -236,6 +195,7 @@ def needs_amplitudes(recipe: LnoMixedRecipe) -> bool:
 __all__ = [
     "LnoMixedRecipe",
     "MIXED_RECIPES",
+    "TRIAL_ALIASES",
     "DEFAULT_GUIDE",
     "GUIDE_STAGERS",
     "AMPLITUDE_GUIDES",

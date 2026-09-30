@@ -43,11 +43,11 @@ def resolve_memory_budget(max_memory: MemoryBudget) -> tuple[str, int | None]:
     (mode, budget_bytes) of a chunk plan from the max_memory argument: a number is a
     budget in MB for the analytic model; "analytic" is that model against
     DEVICE_MEMORY_FRACTION of the device memory; "xla" sizes the chunk from the compiled
-    kernels against XLA_DEVICE_MEMORY_FRACTION of it; None is "analytic". The budget is
-    None when the backend reports no device memory (CPU).
+    kernels against XLA_DEVICE_MEMORY_FRACTION of it; None is "xla". The budget is None
+    when the backend reports no device memory (CPU).
     """
     if max_memory is None:
-        return "analytic", device_memory_budget_bytes()
+        max_memory = "xla"
     if isinstance(max_memory, str):
         mode = max_memory.strip().lower()
         if mode == "xla":
@@ -267,10 +267,10 @@ def setup_mixed(
     trial's precision on its own, so the two sides can be studied separately.
 
     The cholesky chunk of a chunked trial (pt2ccsd_bar, upt2ccsd, upt2ccsd_bar) is sized
-    against a memory budget (resolve_memory_budget): max_memory in MB, or "analytic"
-    (the default, None) for the recipe's memory model against a share of the device
-    memory, or "xla" for a plan read from the compiled kernels (pt2ccsd_chunking's
-    plan_pt2ccsd_chunking_xla) against a larger share; DEFAULT_NCHOL_CHUNK when the
+    against a memory budget (resolve_memory_budget): "xla" (the default, None) for a plan
+    read from the compiled kernels (pt2ccsd_chunking's plan_pt2ccsd_chunking_xla) against
+    a share of the device memory, or "analytic" for the recipe's memory model against a
+    smaller share, or max_memory in MB for that model; DEFAULT_NCHOL_CHUNK when the
     backend reports no device memory. The guide's local energy then runs with the same
     cholesky chunk (GuideSpec.chunked_meas_ops). The plan can raise params.n_chunks (the
     walker chunk count), never lower it, and the driver's own automatic walker chunking

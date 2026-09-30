@@ -10,13 +10,14 @@ LNO-AFQMC on trot's mixed guide/trial pipeline.
 
 Per fragment, kernel() runs make_las -> LNO-MP2 -> LNO-CCSD -> LNO-AFQMC. The AFQMC of one
 fragment is an AfqmcMixed run (LnoFragMixed) on the fragment hamiltonian, with the guide built
-by trot's own staging and the fragment energy measured against the pt2CCSD trial, the bar
-estimator on the similarity transformed hamiltonian (meas/pt2ccsd_bar.py). An RHF mean
-field runs trial="pt2ccsd" (restricted walkers, RHF or CISD guide).
+by trot's own staging and the fragment energy measured against the pt2CCSD trial, the
+estimator on the similarity transformed hamiltonian with the fragment projector kept
+factored (meas/pt2ccsd.py, meas/upt2ccsd.py). An RHF mean field runs trial="pt2ccsd"
+(restricted walkers, RHF or CISD guide), a UHF one trial="upt2ccsd".
 
 The package only imports from core trot (the mixed guide/trial pipeline: trot/mixed.py,
-setup_mixed.py, driver_mixed.py, prop/blocks_mixed.py and the chunked pt2ccsd_bar
-kernel); it does not touch the RHF-trial LNO code in trot/lno.py, trot/afqmc.py
+setup_mixed.py, driver_mixed.py, prop/blocks_mixed.py and the cholesky chunk plan of
+meas/pt2ccsd_chunking.py); it does not touch the RHF-trial LNO code in trot/lno.py, trot/afqmc.py
 (AfqmcLno, AfqmcLnoFrag) or trot/meas/rhf.py.
 
 Fragments run one after another in this process, so what one fragment put on the device

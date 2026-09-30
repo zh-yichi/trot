@@ -5,9 +5,9 @@ Re-running one LNO fragment's AFQMC from its saved file
 LnoAfqmcMixed(save_frag_data=DIR) writes DIR/frag{i}.h5 for every fragment it runs: the
 fragment hamiltonian in the active LNO basis (h0, h1, the cholesky vectors), the staged
 guide, the LNO data (lno_coeff, the frozen LNO indices, the overlap U = <act occ|lo> the
-fragment projector is built from) and the CCSD amplitudes the trial needs: the full t2
-for the pt2ccsd / upt2ccsd trials, the projected t2u = t2 U (nlo/nocc the size) for the
-_fast ones. A re-run needs nothing else: no mean field, no LNO, CCSD or integral work.
+fragment projector is built from) and the CCSD amplitudes the trial needs: the projected
+t2u = t2 U (nlo/nocc the size of t2) by default, the full t2 with amplitudes="full". A
+re-run needs nothing else: no mean field, no LNO, CCSD or integral work.
 
 Part 1 below produces such files on a small water tetramer (skipped when they exist);
 part 2 re-runs one fragment from its file with LnoFragMixed.from_frag_data; part 3 does
@@ -59,7 +59,7 @@ if not os.path.exists(os.path.join(FRAG_DIR, "frag1.h5")):
         frag_name=frag_name,
         lno_thresh=1e-5,
         nfrozen=nfrozen,
-        trial="pt2ccsd_fast",  # the files then carry t2u instead of t2
+        trial="pt2ccsd",
         n_walkers=50,
         n_eql_blocks=4,
         n_blocks=20,
@@ -69,13 +69,13 @@ if not os.path.exists(os.path.join(FRAG_DIR, "frag1.h5")):
     lno.kernel()
 
 # ---------------------------------------------------------------------- part 2: re-run a fragment
-# Every LnoFragMixed keyword can be given: the trial ("pt2ccsd" or "pt2ccsd_fast" both
-# work from a file with t2u; "upt2ccsd(_fast)" for a UHF fragment), the guide (the file's
-# own by default; "cisd" needs a file with the full t2 or one written with that guide),
+# Every LnoFragMixed keyword can be given: the trial ("pt2ccsd"; "upt2ccsd" for a UHF
+# fragment), the guide (the file's own by default; "cisd" needs a file with the full t2 or
+# one written with that guide),
 # the run length, the seed, the early stop, the precision of the guide and the trial.
 frag = LnoFragMixed.from_frag_data(
     os.path.join(FRAG_DIR, "frag1.h5"),
-    trial="pt2ccsd_fast",
+    trial="pt2ccsd",
     n_walkers=200,
     n_eql_blocks=40,
     n_blocks=200,
@@ -104,7 +104,7 @@ print(f"HF energy stored with the file: {frag.emf:.8f}")
 # ---------------------------------------------------------------------- part 3: the command line
 # The same re-run in its own process (LnoAfqmcMixed(isolate=True) does this per fragment):
 #
-#     echo '{"trial": "pt2ccsd_fast", "n_walkers": 200, "n_eql_blocks": 40, "n_blocks": 200, "seed": 11}' > opts.json
+#     echo '{"trial": "pt2ccsd", "n_walkers": 200, "n_eql_blocks": 40, "n_blocks": 200, "seed": 11}' > opts.json
 #     python -m trot.lnoafqmc.run_frag frag_data/frag1.h5 --options opts.json --out res.json
 #
 # res.json then holds e_frag, e_frag_err, guide_e, guide_e_err, n_blocks_run and frag_idx.

@@ -31,7 +31,7 @@ from trot.lnoafqmc import LnoAfqmcMixed
 
 FRAG_DIR = "./frag_data"
 STEP = sys.argv[1] if len(sys.argv) > 1 else "cpu"
-TRIAL = "pt2ccsd_fast"
+TRIAL = "pt2ccsd"
 
 if STEP == "cpu":
     from trot.lnoafqmc import iao_fragment
@@ -63,7 +63,7 @@ if STEP == "cpu":
         frag_name=frag_name,
         lno_thresh=3e-5,
         nfrozen=nfrozen,
-        trial=TRIAL,  # decides what the files carry (the _fast trials: the projected t2)
+        trial=TRIAL,
         run_qmc=False,
         save_frag_data=FRAG_DIR,
         lno_output="lno_cpu.out",

@@ -43,7 +43,7 @@ from ..prop.blocks_mixed import MixedBlockFn
 from ..prop.types import PropOps, PropState, QmcParams
 from ..stat_utils import blocking_analysis_ratio, component_estimator_outlier_mask, reject_outliers
 from ..walkers import stochastic_reconfiguration
-from .meas.pt2ccsd_bar import TRIAL_COMPONENTS, frag_pt2ccsd_energy_fn
+from .meas.pt2ccsd import TRIAL_COMPONENTS, frag_pt2ccsd_energy_fn
 
 print = partial(print, flush=True)
 

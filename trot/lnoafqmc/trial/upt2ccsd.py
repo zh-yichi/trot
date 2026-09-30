@@ -21,60 +21,74 @@ def overlap_u(walker: Any, trial_data: Any) -> jax.Array:
 @dataclass(frozen=True)
 class Upt2ccsdTrial:
     """
-    Unrestricted pt2CCSD trial of one LNO fragment. Each spin lives in its own LNO basis,
-    the one the uchol fragment hamiltonian is built in, with that spin's reference
-    occupying its first nocc orbitals. The branch's trial/upt2ccsd_uh.Upt2ccsdTrial plus
-    the fragment projectors.
+    Unrestricted pt2CCSD trial of one LNO fragment (meas/upt2ccsd.py), each spin in its
+    own LNO basis, with the fragment projectors kept in factored form:
+    prjlo_s = U_s U_s^H, U_s = <act_occ_s|lo_s> of shape (nocc_s, nlo), and the doubles
+    carrying the local index instead of the projected occupied one,
+
+        t2aa_u_{Iajb} = sum_i t2aa_{iajb} U_a_{iI}       (nlo, nvir_a, nocc_a, nvir_a)
+        t2ab_u_{Iajb} = sum_i t2ab_{iajb} U_a_{iI}       (nlo, nvir_a, nocc_b, nvir_b)
+        t2ba_u_{Iajb} = sum_i t2ba_{iajb} U_b_{iI}       (nlo, nvir_b, nocc_a, nvir_a)
+        t2bb_u_{Iajb} = sum_i t2bb_{iajb} U_b_{iI}       (nlo, nvir_b, nocc_b, nvir_b)
+
+    The second factor U_s^H is applied inside the kernel with the local index contracted
+    last. The same-spin blocks are antisymmetric in (a, b) (the projection touches only
+    the first occupied index), which is what lets one contraction per index pair serve
+    both the direct and the exchange term; t2ab_u and t2ba_u are independent.
 
     Arrays:
-      mo_t_a: (norb_a, nocc_a)                 exp(T1a)|HF_a> by Thouless' theorem
-      mo_t_b: (norb_b, nocc_b)                 exp(T1b)|HF_b>
-      t2aa:   (nocc_a, nvir_a, nocc_a, nvir_a) t2_{k a j b} = sum_i t2_{i a j b} prjlo_a_{i k}
-      t2ab:   (nocc_a, nvir_a, nocc_b, nvir_b) projected on its alpha (first) index
-      t2ba:   (nocc_b, nvir_b, nocc_a, nvir_a) t2ab with the spins swapped, projected on
-                                               its beta (first) index
-      t2bb:   (nocc_b, nvir_b, nocc_b, nvir_b) projected with prjlo_b
-      prjlo_a, prjlo_b: (nocc_s, nocc_s)       U_s U_s^T, U_s = <act_occ_s|lo_s>
-      t1a, t1b: (nocc_s, nvir_s)               the singles, unprojected (for e0t1orb)
-
-    The projection acts on the first occupied index only, so the same-spin blocks stay
-    antisymmetric in (a, b) but not in (i, j), and t2ab and t2ba are independent.
+      mo_t_a, mo_t_b: (norb_s, nocc_s)   exp(T1_s)|HF_s> by Thouless' theorem
+      t2aa_u, t2ab_u, t2ba_u, t2bb_u     as above
+      u_a, u_b: (nocc_s, nlo)            U_s = <act_occ_s|lo_s>
+      t1a, t1b: (nocc_s, nvir_s)         the singles, unprojected (for e0t1orb)
     """
 
     mo_t_a: jax.Array
     mo_t_b: jax.Array
-    t2aa: jax.Array
-    t2ab: jax.Array
-    t2ba: jax.Array
-    t2bb: jax.Array
-    prjlo_a: jax.Array
-    prjlo_b: jax.Array
+    t2aa_u: jax.Array
+    t2ab_u: jax.Array
+    t2ba_u: jax.Array
+    t2bb_u: jax.Array
+    u_a: jax.Array
+    u_b: jax.Array
     t1a: jax.Array
     t1b: jax.Array
 
     @property
     def nocc(self) -> tuple[int, int]:
-        return (int(self.t2ab.shape[0]), int(self.t2ab.shape[2]))
+        return (int(self.u_a.shape[0]), int(self.u_b.shape[0]))
+
+    @property
+    def nlo(self) -> int:
+        return int(self.u_a.shape[1])
 
     @property
     def nvir(self) -> tuple[int, int]:
-        return (int(self.t2ab.shape[1]), int(self.t2ab.shape[3]))
+        return (int(self.t2ab_u.shape[1]), int(self.t2ab_u.shape[3]))
 
     @property
     def norb(self) -> tuple[int, int]:
         nocc, nvir = self.nocc, self.nvir
         return (nocc[0] + nvir[0], nocc[1] + nvir[1])
 
+    @property
+    def prjlo_a(self) -> jax.Array:
+        return self.u_a @ self.u_a.conj().T
+
+    @property
+    def prjlo_b(self) -> jax.Array:
+        return self.u_b @ self.u_b.conj().T
+
     def tree_flatten(self):
         children = (
             self.mo_t_a,
             self.mo_t_b,
-            self.t2aa,
-            self.t2ab,
-            self.t2ba,
-            self.t2bb,
-            self.prjlo_a,
-            self.prjlo_b,
+            self.t2aa_u,
+            self.t2ab_u,
+            self.t2ba_u,
+            self.t2bb_u,
+            self.u_a,
+            self.u_b,
             self.t1a,
             self.t1b,
         )
@@ -82,16 +96,16 @@ class Upt2ccsdTrial:
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        mo_t_a, mo_t_b, t2aa, t2ab, t2ba, t2bb, prjlo_a, prjlo_b, t1a, t1b = children
+        mo_t_a, mo_t_b, t2aa_u, t2ab_u, t2ba_u, t2bb_u, u_a, u_b, t1a, t1b = children
         return cls(
             mo_t_a=mo_t_a,
             mo_t_b=mo_t_b,
-            t2aa=t2aa,
-            t2ab=t2ab,
-            t2ba=t2ba,
-            t2bb=t2bb,
-            prjlo_a=prjlo_a,
-            prjlo_b=prjlo_b,
+            t2aa_u=t2aa_u,
+            t2ab_u=t2ab_u,
+            t2ba_u=t2ba_u,
+            t2bb_u=t2bb_u,
+            u_a=u_a,
+            u_b=u_b,
             t1a=t1a,
             t1b=t1b,
         )
@@ -102,12 +116,12 @@ def make_upt2ccsd_trial_data(data: dict, sys: Any) -> Upt2ccsdTrial:
     td = Upt2ccsdTrial(
         mo_t_a=jnp.asarray(data["mo_t_a"])[:, : sys.nup],
         mo_t_b=jnp.asarray(data["mo_t_b"])[:, : sys.ndn],
-        t2aa=jnp.asarray(data["t2aa"]),
-        t2ab=jnp.asarray(data["t2ab"]),
-        t2ba=jnp.asarray(data["t2ba"]),
-        t2bb=jnp.asarray(data["t2bb"]),
-        prjlo_a=jnp.asarray(data["prjlo_a"]),
-        prjlo_b=jnp.asarray(data["prjlo_b"]),
+        t2aa_u=jnp.asarray(data["t2aa_u"]),
+        t2ab_u=jnp.asarray(data["t2ab_u"]),
+        t2ba_u=jnp.asarray(data["t2ba_u"]),
+        t2bb_u=jnp.asarray(data["t2bb_u"]),
+        u_a=jnp.asarray(data["u_a"]),
+        u_b=jnp.asarray(data["u_b"]),
         t1a=jnp.asarray(data["t1a"]),
         t1b=jnp.asarray(data["t1b"]),
     )

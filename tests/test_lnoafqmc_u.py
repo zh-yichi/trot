@@ -33,11 +33,9 @@ from trot.lnoafqmc import LnoAfqmcMixed, LnoFragMixed, iao_fragment
 from trot.lnoafqmc import integral as li
 from trot.lnoafqmc import pipeline, solvers
 from trot.lnoafqmc import staging as lst
-from trot.lnoafqmc.meas import upt2ccsd_bar as lmu
-from trot.lnoafqmc.meas import upt2ccsd_fast as lfu
+from trot.lnoafqmc.meas import upt2ccsd as lmu
 from trot.lnoafqmc.mixed import available_mixed_recipes, get_mixed_recipe
 from trot.lnoafqmc.trial.upt2ccsd import make_upt2ccsd_trial_data, overlap_u
-from trot.lnoafqmc.trial.upt2ccsd_fast import make_upt2ccsd_fast_trial_data
 from trot.meas.pt2ccsd_chunking import make_chunk_meas_cfg
 from trot.meas.upt2ccsd_bar_uh import build_meas_ctx as trot_build_ctx
 from trot.meas.upt2ccsd_bar_uh import energy_kernel_uw_uh_bar as trot_bar_kernel
@@ -141,16 +139,17 @@ def _random_walkers(norb, nelec, n, seed=7) -> Iterator[Any]:
         )
 
 
-def _projected_trial(ufrag0, prj_a, prj_b):
+def _projected_trial(ufrag0, u_a, u_b):
+    """The fragment trial with the projector factors u_s (nocc_s, nlo) and the full doubles."""
     t2aa, t2ab, t2bb = ufrag0["t2_full"]
     d = dict(ufrag0["tin"].data)
     d.update(
-        prjlo_a=prj_a,
-        prjlo_b=prj_b,
-        t2aa=np.einsum("iajb,ik->kajb", t2aa, prj_a),
-        t2ab=np.einsum("iajb,ik->kajb", t2ab, prj_a),
-        t2ba=np.einsum("jbia,ik->kajb", t2ab, prj_b),
-        t2bb=np.einsum("iajb,ik->kajb", t2bb, prj_b),
+        u_a=u_a,
+        u_b=u_b,
+        t2aa_u=np.einsum("iajb,iI->Iajb", t2aa, u_a),
+        t2ab_u=np.einsum("iajb,iI->Iajb", t2ab, u_a),
+        t2ba_u=np.einsum("jbia,iI->Iajb", t2ab, u_b),
+        t2bb_u=np.einsum("iajb,iI->Iajb", t2bb, u_b),
     )
     td = make_upt2ccsd_trial_data(d, ufrag0["sys"])
     return td, ufrag0["ops"].build_meas_ctx(ufrag0["ham_data"], td)
@@ -181,7 +180,8 @@ def test_u_fragment_hamiltonian_reproduces_hf_energy(ufrag0, o2t):
 
 
 def test_u_kernel_prjlo_one_limit_matches_bar_kernel(ufrag0):
-    """With identity projectors the fragment kernel is the branch's upt2ccsd_bar kernel; e0frg is e0 - E_HF."""
+    """With identity projectors (U_s = 1) the fragment kernel is the branch's upt2ccsd_bar
+    kernel; e0frg is e0 - E_HF."""
     ham, ham_data = ufrag0["ham"], ufrag0["ham_data"]
     na, nb = ham.nelec
     td, ctx = _projected_trial(ufrag0, np.eye(na), np.eye(nb))
@@ -197,7 +197,7 @@ def test_u_kernel_prjlo_one_limit_matches_bar_kernel(ufrag0):
     tctx = trot_build_ctx(ham_data, ttrial, cfg)
     e_hf = _e_hf_el(ham)
     for w in _random_walkers(ham.norb, ham.nelec, 4):
-        out = np.asarray(lmu.energy_kernel_uw_uh_bar(w, ham_data, ctx, td))
+        out = np.asarray(lmu.energy_kernel_uw_uh(w, ham_data, ctx, td))
         ref = np.asarray(trot_bar_kernel(w, ham_data, tctx, ttrial))  # [theta, e0, h_t]
         assert abs(out[0] - ref[0]) < 1e-9
         assert abs(out[3] - ref[1]) < 1e-9
@@ -212,25 +212,24 @@ def test_u_kernel_partition_of_unity(ufrag0, o2t):
     ham, ham_data = ufrag0["ham"], ufrag0["ham_data"]
     ncore, nocc, _, _ = li.get_las_idx(mf, frag.lno_frozen)
     s1e = mf.get_ovlp()
-    prj = []
+    us = []
     for f in range(len(frag_list)):
-        pp = []
+        uu = []
         for s in range(2):
             actocc = np.asarray(frag.lno_coeff[s])[:, ncore[s] : ncore[s] + nocc[s]]
-            u = actocc.T @ s1e @ np.asarray(lo_coeff[s])[:, frag_list[f][s]]
-            pp.append(u @ u.T)
-        prj.append(pp)
+            uu.append(actocc.T @ s1e @ np.asarray(lo_coeff[s])[:, frag_list[f][s]])
+        us.append(uu)
     for s in range(2):
-        assert np.abs(sum(p[s] for p in prj) - np.eye(nocc[s])).max() < 1e-10
-    # the staged projector is fragment 0's
-    assert np.abs(ufrag0["tin"].data["prjlo_a"] - prj[0][0]).max() < 1e-10
-    assert np.abs(ufrag0["tin"].data["prjlo_b"] - prj[0][1]).max() < 1e-10
+        assert np.abs(sum(u[s] @ u[s].T for u in us) - np.eye(nocc[s])).max() < 1e-10
+    # the staged projector factors are fragment 0's
+    assert np.abs(ufrag0["tin"].data["u_a"] - us[0][0]).max() < 1e-10
+    assert np.abs(ufrag0["tin"].data["u_b"] - us[0][1]).max() < 1e-10
 
-    parts = [_projected_trial(ufrag0, *p) for p in prj]
+    parts = [_projected_trial(ufrag0, *u) for u in us]
     td1, ctx1 = _projected_trial(ufrag0, np.eye(nocc[0]), np.eye(nocc[1]))
     for w in _random_walkers(ham.norb, ham.nelec, 4, seed=11):
-        outs = [np.asarray(lmu.energy_kernel_uw_uh_bar(w, ham_data, c, t)) for t, c in parts]
-        full = np.asarray(lmu.energy_kernel_uw_uh_bar(w, ham_data, ctx1, td1))
+        outs = [np.asarray(lmu.energy_kernel_uw_uh(w, ham_data, c, t)) for t, c in parts]
+        full = np.asarray(lmu.energy_kernel_uw_uh(w, ham_data, ctx1, td1))
         s = outs[0] + outs[1]
         assert np.abs(s[:3] - full[:3]).max() < 1e-9  # t2frg, e0frg, e1frg are additive
         assert abs(outs[0][3] - full[3]) < 1e-9  # e0 is the same for every fragment
@@ -248,14 +247,12 @@ def test_u_kernel_chunking_and_precision_are_consistent(ufrag0):
     cfg = lmu.get_upt2ccsd_meas_cfg(ops_mp)
     assert cfg is not None and cfg.mixed_real_dtype == jnp.float32
     for w in _random_walkers(ham.norb, ham.nelec, 3, seed=2):
-        ref = np.asarray(lmu.energy_kernel_uw_uh_bar(w, ham_data, ctx3, td))
+        ref = np.asarray(lmu.energy_kernel_uw_uh(w, ham_data, ctx3, td))
         assert (
-            np.abs(np.asarray(lmu.energy_kernel_uw_uh_bar(w, ham_data, ctx1, td)) - ref).max()
-            < 1e-10
+            np.abs(np.asarray(lmu.energy_kernel_uw_uh(w, ham_data, ctx1, td)) - ref).max() < 1e-10
         )
         assert (
-            np.abs(np.asarray(lmu.energy_kernel_uw_uh_bar(w, ham_data, ctx_mp, td)) - ref).max()
-            < 1e-4
+            np.abs(np.asarray(lmu.energy_kernel_uw_uh(w, ham_data, ctx_mp, td)) - ref).max() < 1e-4
         )
     plan = lmu.plan_chunking_for_run_u(
         sys_, ham_data, td, n_walkers=50, budget_bytes=4 * 1024**3, mixed_precision=False
@@ -276,88 +273,60 @@ def test_u_overlap_is_exp_t1_reference(ufrag0):
         assert abs(complex(overlap_u(w, td)) - complex(obar)) < 1e-10
 
 
-# ----------------------------------------------------------------------------- upt2ccsd_fast
+# ----------------------------------------------------------------------------- trial staging
 
 
-def test_u_fast_trial_staging(o2t):
-    """The factored doubles closed with the projector's second factor are the projected ones."""
+def test_u_trial_staging(o2t):
+    """The doubles carry the local index on their first slot, per block and spin."""
     frag = o2t["frags"][0]
-    tin = lst.stage_upt2ccsd_fast_trial(frag)
-    tin_bar = lst.stage_upt2ccsd_trial(frag)
-    assert tin.kind == "upt2ccsd_fast"
+    tin = lst.stage_upt2ccsd_trial(frag)
+    assert tin.kind == "upt2ccsd"
     ua, ub = np.asarray(tin.data["u_a"]), np.asarray(tin.data["u_b"])
     assert ua.shape[1] == ub.shape[1] and ua.shape[1] < ua.shape[0]
-    for name, u in (("t2aa", ua), ("t2ab", ua), ("t2ba", ub), ("t2bb", ub)):
+    t2u_ref = lst.projected_doubles(frag)
+    for k, (name, u) in enumerate((("t2aa", ua), ("t2ab", ua), ("t2ba", ub), ("t2bb", ub))):
         t2u = np.asarray(tin.data[name + "_u"])
         assert t2u.shape[0] == u.shape[1]
-        np.testing.assert_allclose(
-            np.einsum("Iajb,kI->kajb", t2u, u), np.asarray(tin_bar.data[name]), atol=1e-12
-        )
+        np.testing.assert_allclose(t2u, t2u_ref[k], atol=1e-14)
     # same-spin blocks stay antisymmetric in (a, b) after the projection on i
     for name in ("t2aa_u", "t2bb_u"):
         t = np.asarray(tin.data[name])
         assert np.abs(t + t.transpose(0, 3, 2, 1)).max() < 1e-12
-    np.testing.assert_allclose(ua @ ua.T, tin_bar.data["prjlo_a"], atol=1e-12)
+    with pytest.raises(ValueError, match="needs restricted fragment data"):
+        lst.stage_pt2ccsd_trial(frag)
 
 
-def test_u_fast_kernel_matches_bar_kernel(ufrag0, o2t):
-    """The factored projectors give the same four components as the bar kernel, to roundoff."""
-    ham, sys_, ham_data = ufrag0["ham"], ufrag0["sys"], ufrag0["ham_data"]
-    frag = o2t["frags"][0]
-    td = make_upt2ccsd_trial_data(ufrag0["tin"].data, sys_)
-    ctx = ufrag0["ops"].build_meas_ctx(ham_data, td)
-    tdf = make_upt2ccsd_fast_trial_data(lst.stage_upt2ccsd_fast_trial(frag).data, sys_)
-    assert tdf.nocc == td.nocc and tdf.nvir == td.nvir and tdf.nlo <= min(tdf.nocc)
-    ctxs = [
-        lfu.make_upt2ccsd_fast_meas_ops(
-            sys_, mixed_precision=False, testing=True, nchol_chunk=k
-        ).build_meas_ctx(ham_data, tdf)
-        for k in (1, 3, None)
-    ]
-    for w in _random_walkers(ham.norb, ham.nelec, 4, seed=13):
-        ref = np.asarray(lmu.energy_kernel_uw_uh_bar(w, ham_data, ctx, td))
-        for c in ctxs:
-            out = np.asarray(lfu.energy_kernel_uw_uh_fast(w, ham_data, c, tdf))
-            assert np.abs(out - ref).max() < 1e-8  # e0 is ~150 Ha here
-    ops_mp = lfu.make_upt2ccsd_fast_meas_ops(sys_, mixed_precision=True, nchol_chunk=4)
-    ctx_mp = ops_mp.build_meas_ctx(ham_data, tdf)
-    assert lfu.get_upt2ccsd_fast_meas_cfg(ops_mp).mixed_real_dtype == jnp.float32
-    w = next(_random_walkers(ham.norb, ham.nelec, 1, seed=4))
-    ref = np.asarray(lmu.energy_kernel_uw_uh_bar(w, ham_data, ctx, td))
-    assert (
-        np.abs(np.asarray(lfu.energy_kernel_uw_uh_fast(w, ham_data, ctx_mp, tdf)) - ref).max()
-        < 1e-4
-    )
-
-
-def test_u_fast_recipes():
-    assert ("uhf", "upt2ccsd_fast") in available_mixed_recipes()
-    assert ("ucisd", "upt2ccsd_fast") in available_mixed_recipes()
+def test_u_trial_aliases():
+    assert ("uhf", "upt2ccsd_fast") not in available_mixed_recipes()
     rec = get_mixed_recipe("upt2ccsd_fast")
-    assert rec.guide == "uhf" and rec.ham_basis == "uchol" and rec.needs_amplitudes
+    assert rec.trial == "upt2ccsd" and rec.guide == "uhf" and rec.ham_basis == "uchol"
     with pytest.raises(ValueError):
         get_mixed_recipe("upt2ccsd_fast", guide="rhf")
 
 
-def test_u_fast_trial_run_reproduces_upt2ccsd_run(o2t, tmp_path):
-    """From one fragment file and seed, trial="upt2ccsd_fast" is the trial="upt2ccsd" run."""
+def test_u_projected_and_full_amplitude_files_give_the_same_run(o2t, tmp_path):
+    """From one fragment and seed, the run from a file with the projected doubles is the run
+    from one with the full doubles; the "_fast" alias names the same trial."""
     mf, frag = o2t["mf"], o2t["frags"][0]
     qmc: dict[str, Any] = dict(
         n_walkers=20, n_eql_blocks=2, n_blocks=20, dt=0.005, n_prop_steps=10, seed=3
     )
     with contextlib.redirect_stdout(io.StringIO()):
-        path = LnoFragMixed(mf, frag, chol_cut=CHOL_CUT).save(tmp_path / "frag1.h5")
-        fm_bar = LnoFragMixed.from_frag_data(path, trial="upt2ccsd", mixed_precision=False, **qmc)
-        e_bar, err_bar = fm_bar.kernel()
-        fm_fast = LnoFragMixed.from_frag_data(
-            path, trial="upt2ccsd_fast", mixed_precision=False, **qmc
+        fm = LnoFragMixed(mf, frag, chol_cut=CHOL_CUT)
+        path_full = fm.save(tmp_path / "full.h5", amplitudes="full")
+        path_proj = fm.save(tmp_path / "proj.h5")
+        fm_full = LnoFragMixed.from_frag_data(
+            path_full, trial="upt2ccsd", mixed_precision=False, **qmc
         )
-        e_fast, err_fast = fm_fast.kernel()
-    assert fm_fast.trial == "upt2ccsd_fast"
-    r_bar, r_fast = fm_bar.qmc_result, fm_fast.qmc_result
-    assert abs(r_fast.frag_init_energy - r_bar.frag_init_energy) < 1e-9
-    assert abs(e_fast - e_bar) < 1e-8 and abs(err_fast - err_bar) < 1e-8
-    assert abs(fm_fast.guide_e_tot - fm_bar.guide_e_tot) < 1e-10
+        e_full, err_full = fm_full.kernel()
+        fm_proj = LnoFragMixed.from_frag_data(
+            path_proj, trial="upt2ccsd_fast", mixed_precision=False, **qmc
+        )
+        e_proj, err_proj = fm_proj.kernel()
+    assert fm_proj.trial == "upt2ccsd"
+    assert abs(fm_proj.qmc_result.frag_init_energy - fm_full.qmc_result.frag_init_energy) < 1e-9
+    assert abs(e_proj - e_full) < 1e-8 and abs(err_proj - err_full) < 1e-8
+    assert abs(fm_proj.guide_e_tot - fm_full.guide_e_tot) < 1e-10
 
 
 def test_u_cpu_gpu_split_and_isolated_files(o2t, tmp_path):
@@ -367,7 +336,7 @@ def test_u_cpu_gpu_split_and_isolated_files(o2t, tmp_path):
     the one-machine loop with the same seed.
     """
     mf, nfrozen = o2t["mf"], o2t["nfrozen"]
-    common: dict[str, Any] = dict(trial="upt2ccsd_fast", seed=5, mixed_precision=False)
+    common: dict[str, Any] = dict(trial="upt2ccsd", seed=5, mixed_precision=False)
     qmc: dict[str, Any] = dict(n_walkers=20, n_eql_blocks=2, n_blocks=10, dt=0.005, n_prop_steps=10)
     lno_kw: dict[str, Any] = dict(
         frag_name=o2t["frag_name"], lno_thresh=1e-12, nfrozen=nfrozen, chol_cut=CHOL_CUT
@@ -429,32 +398,28 @@ def test_u_frag_file_round_trip(o2t, tmp_path):
         frag2, staged, attrs = lst.load_frag(path)
     assert fm.trial == "upt2ccsd" and fm.guide == "uhf"
     assert frag2.unrestricted and frag2.nact == frag.nact and frag2.frag_name == frag.frag_name
-    for x, y in zip(frag2.t2, frag.t2):
-        assert np.allclose(x, y)
-    # written for the fast trial, the file carries the four projected blocks instead
-    with contextlib.redirect_stdout(io.StringIO()):
-        path_u = LnoFragMixed(mf, frag, trial="upt2ccsd_fast", chol_cut=CHOL_CUT).save(
-            tmp_path / "frag1_fast.h5"
-        )
-        frag3, _, _ = lst.load_frag(path_u)
+    # by default the file carries the four projected blocks instead of the full doubles
     assert (
-        frag3.t2 is None
-        and len(frag3.t2u) == 4
-        and frag3.t2u[0].shape[0] == frag3.uocc_loc[0].shape[1]
+        frag2.t2 is None
+        and len(frag2.t2u) == 4
+        and frag2.t2u[0].shape[0] == frag2.uocc_loc[0].shape[1]
     )
-    for a, b in zip(frag3.t2u, lst.projected_doubles(frag)):
+    for a, b in zip(frag2.t2u, lst.projected_doubles(frag)):
         np.testing.assert_allclose(a, b, atol=1e-14)
-    for stager in (lst.stage_upt2ccsd_trial, lst.stage_upt2ccsd_fast_trial):
-        x, y = stager(frag), stager(frag3)
-        for k in x.data:
-            np.testing.assert_allclose(np.asarray(x.data[k]), np.asarray(y.data[k]), atol=1e-12)
+    x, y = lst.stage_upt2ccsd_trial(frag), lst.stage_upt2ccsd_trial(frag2)
+    for k in x.data:
+        np.testing.assert_allclose(np.asarray(x.data[k]), np.asarray(y.data[k]), atol=1e-12)
     with contextlib.redirect_stdout(io.StringIO()):
-        for trial in ("upt2ccsd_fast", "upt2ccsd"):
-            assert LnoFragMixed.from_frag_data(
-                path_u, trial=trial
-            ).build_job().mix_trial_data.nocc == (7, 5)
+        job = LnoFragMixed.from_frag_data(path, trial="upt2ccsd").build_job()
+        assert job.mix_trial_data.nocc == (7, 5)
     with pytest.raises(ValueError, match="full fragment CCSD amplitudes"):
-        LnoFragMixed.from_frag_data(path_u, guide="ucisd").build_job()
+        LnoFragMixed.from_frag_data(path, guide="ucisd").build_job()
+    # amplitudes="full" keeps the full doubles
+    with contextlib.redirect_stdout(io.StringIO()):
+        path_full = fm.save(tmp_path / "frag1_full.h5", amplitudes="full")
+        frag3, _, _ = lst.load_frag(path_full)
+    for a, b in zip(frag3.t2, frag.t2):
+        assert np.allclose(a, b)
     assert staged.ham.basis == "uchol" and staged.ham.norb == (8, 8) and staged.trial.kind == "uhf"
     assert np.array_equal(staged.ham.chol_a, ham.chol_a) and np.array_equal(
         staged.ham.h1_b, ham.h1_b

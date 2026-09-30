@@ -23,10 +23,8 @@ from ..staging_u import dump_uh, is_uchol_file, load_uh
 #
 #   LnoFragData          what cpu_stage produces for one fragment
 #   frag_mf              the mean field in the fragment's LNO basis, for trot's guide staging
-#   stage_pt2ccsd_trial  LnoFragData -> TrialInput {mo_t, t2 (projected), prjlo, t1}
-#   stage_pt2ccsd_fast_trial   the same with the projector factored: {mo_t, t2x, u, t1}
+#   stage_pt2ccsd_trial  LnoFragData -> TrialInput {mo_t, t2x, u, t1}, the projector factored
 #   stage_upt2ccsd_trial the unrestricted counterpart
-#   stage_upt2ccsd_fast_trial  the unrestricted counterpart with the projectors factored
 #   projected_doubles    the doubles contracted with U on the first occupied index
 #   dump_frag / load_frag  the self-contained frag{i}.h5 a fragment can be re-run from
 
@@ -52,8 +50,8 @@ class LnoFragData:
     t2u_{Iajb} = sum_i t2_{iajb} U_{iI} in the (I, a, j, b) layout (the four blocks
     t2aa_u, t2ab_u, t2ba_u, t2bb_u for an unrestricted fragment; see
     projected_doubles). It is what the pt2CCSD trials need and nlo/nocc the size of t2,
-    so a fragment file written for a fast trial carries t2u instead of t2. Either one
-    makes has_amplitudes true; the CISD guides need t2.
+    so a fragment file written for them carries t2u instead of t2 unless the guide needs
+    the full doubles. Either one makes has_amplitudes true; the CISD guides need t2.
 
     lno_coeff is ordered [frz_occ | act_occ | act_vir | frz_vir], so the core is the
     leading columns and the active block is contiguous; integral.py relies on that.
@@ -183,41 +181,17 @@ def projected_doubles(frag: LnoFragData) -> Any:
 
 def stage_pt2ccsd_trial(frag: LnoFragData) -> TrialInput:
     """
-    The fragment pt2CCSD trial.
-
-    As trot's stage_pt2ccsd_trial, plus the fragment projector prjlo = U U^T with
-    U = <act_occ|lo>, and t2 projected on its first occupied index,
-    t2_kajb = sum_i t2_iajb prjlo_ik (afqmc's prep.proj_cc_amplitude). t1 is kept
-    unprojected: the meas ctx needs it for e0t1orb.
+    The fragment pt2CCSD trial (trial/pt2ccsd.py): as trot's stage_pt2ccsd_trial, plus
+    the fragment projector in factored form. The doubles are contracted with
+    U = <act_occ|lo> on their first occupied index, t2u_Iajb = sum_i t2_iajb U_iI, and
+    stored with the exchange folded in, t2x_Iajb = 2 t2u_Iajb - t2u_Ibja, next to U
+    itself; the kernel applies the projector's second factor. t1 is kept unprojected:
+    the meas ctx needs it for e0t1orb.
     """
     if frag.unrestricted:
         raise ValueError(
             "stage_pt2ccsd_trial needs restricted fragment data; use stage_upt2ccsd_trial."
         )
-    if not frag.has_amplitudes:
-        raise ValueError("the pt2CCSD trial needs the fragment CCSD amplitudes (run_cc=True).")
-
-    t1 = np.asarray(frag.t1, dtype=np.float64)
-    uocc = np.asarray(frag.uocc_loc)
-    prjlo = uocc @ uocc.T.conj()
-    # t2_kajb = sum_i t2_iajb prjlo_ik = sum_I t2u_Iajb U*_kI
-    t2 = lib.einsum("Iajb,kI->kajb", projected_doubles(frag), uocc.conj(), optimize="optimal")
-
-    data = {"mo_t": _thouless(t1), "t2": t2, "prjlo": prjlo, "t1": t1}
-    return TrialInput(
-        kind="pt2ccsd", data=data, frozen=_as_frozen_array(frag.lno_frozen), source_kind="mf"
-    )
-
-
-def stage_pt2ccsd_fast_trial(frag: LnoFragData) -> TrialInput:
-    """
-    The fragment pt2CCSD trial with the projector in factored form (trial/pt2ccsd_fast.py):
-    the doubles contracted with U = <act_occ|lo> on their first occupied index,
-    t2u_Iajb = sum_i t2_iajb U_iI, stored with the exchange folded in,
-    t2x_Iajb = 2 t2u_Iajb - t2u_Ibja, and U itself; the kernel applies the second factor.
-    """
-    if frag.unrestricted:
-        raise ValueError("stage_pt2ccsd_fast_trial needs restricted fragment data.")
     if not frag.has_amplitudes:
         raise ValueError("the pt2CCSD trial needs the fragment CCSD amplitudes (run_cc=True).")
 
@@ -228,7 +202,7 @@ def stage_pt2ccsd_fast_trial(frag: LnoFragData) -> TrialInput:
 
     data = {"mo_t": _thouless(t1), "t2x": t2x, "u": u, "t1": t1}
     return TrialInput(
-        kind="pt2ccsd_fast", data=data, frozen=_as_frozen_array(frag.lno_frozen), source_kind="mf"
+        kind="pt2ccsd", data=data, frozen=_as_frozen_array(frag.lno_frozen), source_kind="mf"
     )
 
 
@@ -245,7 +219,7 @@ def stage_cisd_guide(frag: LnoFragData) -> TrialInput:
     if not frag.has_full_amplitudes:
         raise ValueError(
             "the CISD guide needs the full fragment CCSD amplitudes (run_cc=True); a fragment "
-            "file written for a fast trial carries only the projected doubles, so re-run "
+            "file written with an HF guide carries only the projected doubles, so re-run "
             "such a file with the guide it was written with, or write it with the CISD guide."
         )
     t1 = np.asarray(frag.t1, dtype=np.float64)
@@ -294,7 +268,7 @@ def stage_ucisd_guide(frag: LnoFragData) -> TrialInput:
     if not frag.has_full_amplitudes:
         raise ValueError(
             "the UCISD guide needs the full fragment CCSD amplitudes (run_cc=True); a fragment "
-            "file written for a fast trial carries only the projected doubles, so re-run "
+            "file written with an HF guide carries only the projected doubles, so re-run "
             "such a file with the guide it was written with, or write it with the UCISD guide."
         )
     t1a, t1b = (np.asarray(t, dtype=np.float64) for t in frag.t1)
@@ -323,50 +297,14 @@ def stage_ucisd_guide(frag: LnoFragData) -> TrialInput:
 
 def stage_upt2ccsd_trial(frag: LnoFragData) -> TrialInput:
     """
-    The unrestricted fragment pt2CCSD trial, in the conventions of trot's
-    stage_upt2ccsd_trial_uh: same-spin blocks antisymmetrized, everything (i,a,j,b), each
-    spin in its own LNO basis. The projection on the first index makes t2ab and t2ba
-    distinct, so both are staged.
+    The unrestricted fragment pt2CCSD trial (trial/upt2ccsd.py), in the conventions of
+    trot's stage_upt2ccsd_trial_uh: same-spin blocks antisymmetrized, everything
+    (i,a,j,b), each spin in its own LNO basis, the doubles contracted with
+    U_s = <act_occ_s|lo_s> on their first occupied index (projected_doubles; the
+    projection makes t2ab and t2ba distinct, so both are staged) next to U_s itself.
     """
     if not frag.unrestricted:
         raise ValueError("stage_upt2ccsd_trial needs unrestricted fragment data.")
-    if not frag.has_amplitudes:
-        raise ValueError("the pt2CCSD trial needs the fragment CCSD amplitudes (run_cc=True).")
-
-    t1a, t1b = (np.asarray(t, dtype=np.float64) for t in frag.t1)
-    t2aa_u, t2ab_u, t2ba_u, t2bb_u = (
-        np.asarray(t, dtype=np.float64) for t in projected_doubles(frag)
-    )
-    ua, ub = (np.asarray(u) for u in frag.uocc_loc)
-    prjlo_a = ua @ ua.T.conj()
-    prjlo_b = ub @ ub.T.conj()
-
-    # t2_kajb = sum_i t2_iajb prjlo_ik = sum_I t2u_Iajb U*_kI, per block
-    data = {
-        "mo_t_a": _thouless(t1a),
-        "mo_t_b": _thouless(t1b),
-        "t2aa": lib.einsum("Iajb,kI->kajb", t2aa_u, ua.conj(), optimize="optimal"),
-        "t2ab": lib.einsum("Iajb,kI->kajb", t2ab_u, ua.conj(), optimize="optimal"),
-        "t2ba": lib.einsum("Iajb,kI->kajb", t2ba_u, ub.conj(), optimize="optimal"),
-        "t2bb": lib.einsum("Iajb,kI->kajb", t2bb_u, ub.conj(), optimize="optimal"),
-        "prjlo_a": prjlo_a,
-        "prjlo_b": prjlo_b,
-        "t1a": t1a,
-        "t1b": t1b,
-    }
-    frozen = tuple(_as_frozen_array(f) for f in frag.lno_frozen)
-    return TrialInput(kind="upt2ccsd", data=data, frozen=frozen[0], source_kind="mf")
-
-
-def stage_upt2ccsd_fast_trial(frag: LnoFragData) -> TrialInput:
-    """
-    The unrestricted fragment pt2CCSD trial with the projectors in factored form
-    (trial/upt2ccsd_fast.py): the conventions of stage_upt2ccsd_trial, the doubles
-    contracted with U_s = <act_occ_s|lo_s> on their first occupied index instead of
-    being projected with U_s U_s^H.
-    """
-    if not frag.unrestricted:
-        raise ValueError("stage_upt2ccsd_fast_trial needs unrestricted fragment data.")
     if not frag.has_amplitudes:
         raise ValueError("the pt2CCSD trial needs the fragment CCSD amplitudes (run_cc=True).")
 
@@ -389,7 +327,7 @@ def stage_upt2ccsd_fast_trial(frag: LnoFragData) -> TrialInput:
         "t1b": t1b,
     }
     frozen = tuple(_as_frozen_array(f) for f in frag.lno_frozen)
-    return TrialInput(kind="upt2ccsd_fast", data=data, frozen=frozen[0], source_kind="mf")
+    return TrialInput(kind="upt2ccsd", data=data, frozen=frozen[0], source_kind="mf")
 
 
 # --------------------------------------------------------------------------- frag{i}.h5
@@ -548,7 +486,7 @@ def load_frag(path: Union[str, Path]) -> tuple[LnoFragData, StagedInputs, dict[s
             ga = f["amplitudes"]
             kw["t1"] = _read_pair_or_array(ga, "t1")
             if "t2u" in ga or "t2aa_u" in ga:
-                # written for a fast trial: the projected doubles only
+                # amplitudes="projected": the projected doubles only
                 if unrestricted:
                     kw["t2u"] = tuple(
                         np.array(ga[n]) for n in ("t2aa_u", "t2ab_u", "t2ba_u", "t2bb_u")

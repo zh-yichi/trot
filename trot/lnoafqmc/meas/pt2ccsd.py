@@ -1,24 +1,39 @@
 """
-The LNO fragment pt2CCSD estimator with the fragment projector in factored form
-("pt2ccsd_fast"): the same four numbers per walker as meas/pt2ccsd_bar.py,
+The LNO fragment pt2CCSD estimator, restricted hamiltonian.
+
+Ported from afqmc's lno_afqmc/wavefunctions_restricted.py (class pt2ccsd) on top of the
+branch's meas/pt2ccsd_bar.py: the fragment energy is measured with the similarity
+transformed hamiltonian H_bar = exp(T1) H exp(-T1) against the bare reference,
+walker_bar = exp(T1) walker, and the two body sums are scanned over chunks of nchol_chunk
+cholesky vectors sized by meas/pt2ccsd_chunking.py. The kernel returns four numbers per
+walker,
 
     t2frg = <HF| P T2 |walker_bar> / <HF|walker_bar>
     e0frg = correlation part of <HF| H_bar |walker_bar> / <HF|walker_bar>, projected
     e1frg = <HF| P T2 H_bar |walker_bar> / <HF|walker_bar>
     e0    = <HF| H_bar |walker_bar> / <HF|walker_bar>, electronic, unprojected
 
-(TRIAL_COMPONENTS, combined by frag_pt2ccsd_energy_fn), to roundoff, at a fraction of
-the cost. Sizes below: nlo < nocc < nvir, norb = nocc + nvir, k cholesky vectors per
-scan step; every cost is per walker and per step.
+(TRIAL_COMPONENTS) and the fragment correlation energy is
+
+    E_F = <e0frg> + <e1frg> - <t2frg><e0>          (frag_pt2ccsd_energy_fn)
+
+over the wp-weighted block averages; there is no h0. P projects the first occupied
+index of T2 on the fragment, which is the LNO partition of the correlation energy: the
+fragment energies add up to the full-space AFQMC/pt2CCSD energy when the local active
+spaces are complete.
+
+Sizes below: nlo < nocc < nvir, norb = nocc + nvir, k cholesky vectors per scan step;
+every cost is per walker and per step.
 
 Projector. prjlo_{ik} = sum_I U_{iI} U^*_{kI} with U = <act_occ|lo> of shape (nocc, nlo).
-The bar kernel contracts prjlo as a dense (nocc, nocc) matrix and keeps T2 projected on
-its first index, so every contraction over that index costs nocc. Here every projected
-quantity is built as (something)_{I...} = sum_i U_{iI} (something)_{i...} on both sides
-of the projector and the local index I is contracted last, so those cost nlo instead.
-The doubles are stored as t2x_{Iajb} = 2 t2u_{Iajb} - t2u_{Ibja} with
-t2u_{Iajb} = sum_i t2_{iajb} U_{iI} (trial/pt2ccsd_fast.py): nlo/nocc of the memory,
-and every direct/exchange pair of the bar kernel is one contraction with t2x.
+Contracting prjlo as a dense (nocc, nocc) matrix, with T2 projected on its first index,
+would cost nocc for every contraction over that index (the O(N^5) form this kernel
+replaced). Here every projected quantity is built as
+(something)_{I...} = sum_i U_{iI} (something)_{i...} on both sides of the projector and
+the local index I is contracted last, so those cost nlo instead. The doubles are stored
+as t2x_{Iajb} = 2 t2u_{Iajb} - t2u_{Ibja} with t2u_{Iajb} = sum_i t2_{iajb} U_{iI}
+(trial/pt2ccsd.py): nlo/nocc of the memory, and every direct/exchange pair of T2 terms
+is one contraction with t2x.
 
 Green's function. The half green against the bare reference is green = [1 | gf] with gf
 the (nocc, nvir) occupied-virtual block, so nothing is ever contracted over its unit
@@ -34,15 +49,14 @@ real U), fu = U^H f_ov and cu_g = U^T L_{g,ov} built once in the ctx:
     e0frg exchange sum_g sum_{Ij} A_{g,Ij} B_{g,jI}, A = cu_g gf^T, B = L_{g,ov} gc^T   (k nlo nocc nvir)
     t2g            the (nocc, nvir) one-body T2 intermediate, two contractions with t2x
                    (nlo nocc nvir^2 each), gt2g = t2frg = <t2g, gf>
-    e2_0           from gl_oo, as in the bar kernel
+    e2_0           from gl_oo, as in the branch's bar kernel
     e2_2_2_1       -sum_g tr(gl_g) sum_{jb} t2g_{jb} glgp_{g,jb}            (k nocc nvir)
     e2_2_2_2       1/2 sum_g sum_{ij} (glgp_g t2g^T)_{ij} gl_{g,ji}          (k nocc^2 nvir)
     e2_2_3         sum_g sum_{Iajb} glgpu_{g,Ia} t2x_{Iajb} glgp_{g,jb}, glgpu = U^H glgp
                                                                           (k nlo nocc nvir^2)
 
-The two e2_2_2 terms use t2_green = greenp t2g^T green only through glgp and t2g, so the
-(norb, norb) t2_green and the half rotated cholesky copy of the bar kernel are not
-needed in the scan; t2_green is formed once per walker for the one-body e1_2 only. The
+The two e2_2_2 terms use t2_green = greenp t2g^T green only through glgp and t2g, so no
+(norb, norb) t2_green and no half rotated cholesky copy enter the scan; t2_green is formed once per walker for the one-body e1_2 only. The
 scan passes the cholesky vectors once and carries all accumulators. The T2 contraction
 (e2_2_3) runs in the mixed dtypes of the cfg; everything else is double.
 """
@@ -63,35 +77,72 @@ from ...meas.pt2ccsd_chunking import (
     Pt2ccsdChunkMeasCfg,
     make_chunk_meas_cfg,
     pad_reshape_chol,
+    plan_pt2ccsd_chunking,
+    pt2ccsd_memory_model,
     resolve_nchol_chunk,
 )
 from ...trial.pt2ccsd_bar import build_bar_intermediates
-from ..trial.pt2ccsd_fast import Pt2ccsdFastTrial, overlap_r
-from .pt2ccsd_bar import (
-    TRIAL_COMPONENTS,
-    e0t1orb_from_chol,
-    fock_from_chol,
-    frag_pt2ccsd_energy_fn,
-    plan_chunking_for_run,
-)
+from ..trial.pt2ccsd import Pt2ccsdTrial, overlap_r
 
 __all__ = [
     "TRIAL_COMPONENTS",
     "frag_pt2ccsd_energy_fn",
-    "Pt2ccsdFastMeasCtx",
+    "Pt2ccsdMeasCtx",
+    "fock_from_chol",
+    "e0t1orb_from_chol",
     "build_meas_ctx",
-    "energy_kernel_rw_rh_fast",
-    "make_pt2ccsd_fast_meas_ops",
-    "get_pt2ccsd_fast_meas_cfg",
-    "plan_chunking_for_run_fast",
+    "energy_kernel_rw_rh",
+    "make_pt2ccsd_meas_ops",
+    "get_pt2ccsd_meas_cfg",
+    "plan_chunking_for_run",
 ]
 
-_PT2CCSD_FAST_MEAS_CFG_ATTR = "_lno_pt2ccsd_fast_meas_cfg"
+TRIAL_COMPONENTS: tuple[str, ...] = ("t2frg", "e0frg", "e1frg", "e0")
+
+_PT2CCSD_FRAG_MEAS_CFG_ATTR = "_lno_pt2ccsd_meas_cfg"
+
+
+def frag_pt2ccsd_energy_fn(h0: Any, components: Any) -> Any:
+    """
+    The fragment correlation energy from the averaged components, in the recipe's
+    energy_fn signature: components (..., 4) in TRIAL_COMPONENTS order,
+
+        E_F = <e0frg> + <e1frg> - <t2frg><e0>.
+
+    h0 is ignored: the fragment estimator is a correlation energy. Applied to a
+    (n_blocks, 4) array it gives the per block proxy energies the outlier filter uses.
+    """
+    c = jnp.asarray(components)
+    return c[..., 1] + c[..., 2] - c[..., 0] * c[..., 3]
+
+
+def fock_from_chol(nocc: int, h1: jax.Array, chol: jax.Array) -> jax.Array:
+    """
+    Closed-shell fock matrix of (h1, chol) at the reference occupying the first nocc
+    orbitals: h1 + 2 J - K. Written for a non-symmetric chol (the transformed tensor),
+    as afqmc's integral.get_rfock.
+    """
+    jeff = jnp.einsum("gpq,gjj->pq", chol, chol[:, :nocc, :nocc], optimize="optimal")
+    keff = jnp.einsum("gpj,gjq->pq", chol[:, :, :nocc], chol[:, :nocc, :], optimize="optimal")
+    return h1 + 2 * jeff - keff
+
+
+def e0t1orb_from_chol(chol: jax.Array, t1: jax.Array, prjlo: jax.Array) -> jax.Array:
+    """
+    <exp(T1)HF| H |HF> restricted to the fragment: the T1-contracted two-body term,
+    2 sum_g (L t1)_ik P_ik tr(L t1)_g - sum_g (L t1)_ij (L t1)_jk P_ik, from the
+    untransformed cholesky vectors. afqmc's ham_data['e0t1orb'].
+    """
+    nocc = t1.shape[0]
+    lt1 = jnp.einsum("ia,gja->gij", t1, chol[:, :nocc, nocc:], optimize="optimal")
+    coul = 2 * jnp.einsum("gik,ik,gjj->", lt1, prjlo, lt1, optimize="optimal")
+    exch = jnp.einsum("gij,gjk,ik->", lt1, lt1, prjlo, optimize="optimal")
+    return coul - exch
 
 
 @tree_util.register_pytree_node_class
 @dataclass(frozen=True)
-class Pt2ccsdFastMeasCtx:
+class Pt2ccsdMeasCtx:
     cfg: Pt2ccsdChunkMeasCfg  # static
     nchol_chunk: int  # static; sets the shape the chol tensor is reshaped to
     exp_t1: jax.Array  # (norb, norb)
@@ -130,9 +181,9 @@ class Pt2ccsdFastMeasCtx:
 
 def build_meas_ctx(
     ham_data: HamChol,
-    trial_data: Pt2ccsdFastTrial,
+    trial_data: Pt2ccsdTrial,
     cfg: Pt2ccsdChunkMeasCfg = Pt2ccsdChunkMeasCfg(),
-) -> Pt2ccsdFastMeasCtx:
+) -> Pt2ccsdMeasCtx:
     if ham_data.basis != "restricted":
         raise ValueError("the fragment pt2CCSD MeasOps assume HamChol.basis == 'restricted'.")
     nchol = int(ham_data.nchol) if ham_data.nchol is not None else int(ham_data.chol.shape[0])
@@ -145,7 +196,7 @@ def build_meas_ctx(
     chol_ov_u = jnp.einsum("iI,gia->gIa", u, bar["chol_bar"][:, :nocc, nocc:], optimize="optimal")
     fock_ov_u = jnp.einsum("kI,ka->Ia", u.conj(), fock_bar[:nocc, nocc:], optimize="optimal")
     e0t1orb = e0t1orb_from_chol(ham_data.chol, trial_data.t1, trial_data.prjlo)
-    return Pt2ccsdFastMeasCtx(
+    return Pt2ccsdMeasCtx(
         cfg=cfg,
         nchol_chunk=resolve_nchol_chunk(nchol, cfg.nchol_chunk),
         exp_t1=bar["exp_t1"],
@@ -157,11 +208,11 @@ def build_meas_ctx(
     )
 
 
-def energy_kernel_rw_rh_fast(
+def energy_kernel_rw_rh(
     walker: jax.Array,
     ham_data: HamChol,
-    meas_ctx: Pt2ccsdFastMeasCtx,
-    trial_data: Pt2ccsdFastTrial,
+    meas_ctx: Pt2ccsdMeasCtx,
+    trial_data: Pt2ccsdTrial,
 ) -> jax.Array:
     """
     The fragment pt2CCSD estimator for one restricted walker, [t2frg, e0frg, e1frg, e0],
@@ -200,7 +251,7 @@ def energy_kernel_rw_rh_fast(
     e1_0 = 2 * hg
 
     # ---- the one-body T2 intermediate t2g (nocc, nvir): the direct and exchange halves
-    # of the bar kernel in one contraction each with t2x, the first index closed with gc,
+    # in one contraction each with t2x, the first index closed with gc,
     # the second factor of the projector applied after the contraction over (j, b)
     # Precision policy: everything that carries T2 (t2g and what is built from it, the
     # T2 contractions in the scan) runs in the mixed dtypes of the cfg; the greens
@@ -294,7 +345,7 @@ def energy_kernel_rw_rh_fast(
     return jnp.stack([t2frg, e0frg, e1frg, e0])
 
 
-def make_pt2ccsd_fast_meas_ops(
+def make_pt2ccsd_meas_ops(
     sys: Any,
     *,
     mixed_precision: bool = True,
@@ -302,8 +353,11 @@ def make_pt2ccsd_fast_meas_ops(
     nchol_chunk: int | None = None,
 ) -> MeasOps:
     """
-    MeasOps of the fragment pt2ccsd_fast trial: overlap_r and the "energy" kernel that
-    returns TRIAL_COMPONENTS per walker. The same signature as make_pt2ccsd_meas_ops.
+    MeasOps of the fragment pt2CCSD trial: overlap_r and the "energy" kernel that returns
+    TRIAL_COMPONENTS per walker. The same signature as the branch's
+    make_pt2ccsd_bar_meas_ops, so setup_mixed drives it unchanged; nchol_chunk caps the
+    cholesky vectors per scan step, and the chunk plan sets it from the memory budget
+    when it is None.
     """
     if sys.walker_kind.lower() != "restricted":
         raise ValueError(
@@ -315,21 +369,21 @@ def make_pt2ccsd_fast_meas_ops(
     meas_ops = MeasOps(
         overlap=overlap_r,
         build_meas_ctx=lambda ham_data, trial_data: build_meas_ctx(ham_data, trial_data, cfg),
-        kernels={k_energy: energy_kernel_rw_rh_fast},
+        kernels={k_energy: energy_kernel_rw_rh},
     )
-    object.__setattr__(meas_ops, _PT2CCSD_FAST_MEAS_CFG_ATTR, cfg)
+    object.__setattr__(meas_ops, _PT2CCSD_FRAG_MEAS_CFG_ATTR, cfg)
     return meas_ops
 
 
-def get_pt2ccsd_fast_meas_cfg(meas_ops: MeasOps) -> Pt2ccsdChunkMeasCfg | None:
-    cfg = getattr(meas_ops, _PT2CCSD_FAST_MEAS_CFG_ATTR, None)
+def get_pt2ccsd_meas_cfg(meas_ops: MeasOps) -> Pt2ccsdChunkMeasCfg | None:
+    cfg = getattr(meas_ops, _PT2CCSD_FRAG_MEAS_CFG_ATTR, None)
     return cfg if isinstance(cfg, Pt2ccsdChunkMeasCfg) else None
 
 
-def plan_chunking_for_run_fast(
+def plan_chunking_for_run(
     sys: Any,
     ham_data: HamChol,
-    trial_data: Pt2ccsdFastTrial,
+    trial_data: Pt2ccsdTrial,
     *,
     n_walkers: int,
     budget_bytes: int,
@@ -339,18 +393,26 @@ def plan_chunking_for_run_fast(
     n_devices: int = 1,
 ) -> ChunkPlan:
     """
-    The recipe's memory hook: the bar kernel's model, which over-counts this kernel (its
-    T2 block and chunk intermediates carry nlo where the model counts nocc), so the plan
-    errs on the safe side.
+    The recipe's analytic memory hook: the branch's bar memory model, which over-counts
+    this kernel (its T2 block and chunk intermediates carry nlo where the model counts
+    nocc), so the plan errs on the safe side. max_memory="xla" sizes the chunk from the
+    compiled kernel instead.
     """
-    return plan_chunking_for_run(
-        sys,
-        ham_data,
-        trial_data,  # type: ignore[arg-type]
+    nchol = int(ham_data.nchol) if ham_data.nchol is not None else int(ham_data.chol.shape[0])
+    model = pt2ccsd_memory_model(
+        norb=trial_data.norb,
+        nocc=trial_data.nocc,
+        nchol=nchol,
         n_walkers=n_walkers,
-        budget_bytes=budget_bytes,
+        real_bytes=4 if mixed_precision else 8,
+        complex_bytes=8 if mixed_precision else 16,
+    )
+    return plan_pt2ccsd_chunking(
+        model,
+        n_walkers=n_walkers,
+        nchol=nchol,
+        budget_bytes=int(budget_bytes),
         n_chunks=n_chunks,
         nchol_chunk=nchol_chunk,
-        mixed_precision=mixed_precision,
         n_devices=n_devices,
     )
