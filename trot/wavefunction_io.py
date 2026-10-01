@@ -26,6 +26,9 @@ dump_wavefunction     the population + basis + run metadata to an h5 file
 load_wavefunction     the file back as a dict of numpy arrays and attributes
 walker_ao_coefficients
                       C @ walker for a loaded file, the walkers' orbitals in the AO basis
+walker_full_coefficients
+                      the walkers with the frozen orbitals put back, in the whole orbital
+                      set: identity on the frozen occupied, zero on the frozen virtual
 """
 
 from __future__ import annotations
@@ -39,6 +42,7 @@ from typing import Any, Union
 import h5py
 import numpy as np
 from numpy.typing import NDArray
+from pyscf import lib
 
 WAVEFUNCTION_FORMAT = "trot_afqmc_wavefunction"
 WAVEFUNCTION_FORMAT_VERSION = 1
@@ -280,9 +284,45 @@ def walker_ao_coefficients(loaded: dict[str, Any]) -> Any:
     """
     if "walkers" in loaded:
         c = loaded["basis"].active_coeff
-        return np.einsum("pq,wqi->wpi", c, loaded["walkers"])
+        return lib.einsum("pq,wqi->wpi", c, loaded["walkers"])
     ca, cb = loaded["basis_a"].active_coeff, loaded["basis_b"].active_coeff
     return (
-        np.einsum("pq,wqi->wpi", ca, loaded["walkers_a"]),
-        np.einsum("pq,wqi->wpi", cb, loaded["walkers_b"]),
+        lib.einsum("pq,wqi->wpi", ca, loaded["walkers_a"]),
+        lib.einsum("pq,wqi->wpi", cb, loaded["walkers_b"]),
+    )
+
+
+def _full_coefficients(basis: WavefunctionBasis, walkers: NDArray) -> NDArray:
+    n, _, nocc = walkers.shape
+    nmo, ncore = int(basis.coeff.shape[1]), int(basis.frozen_occ.size)
+    full = np.zeros((n, nmo, ncore + nocc), dtype=walkers.dtype)
+    full[:, basis.frozen_occ, np.arange(ncore)] = 1.0
+    full[:, basis.active, ncore:] = walkers
+    return full
+
+
+def walker_full_coefficients(loaded: dict[str, Any]) -> Any:
+    """
+    Every walker as a determinant of all the electrons in the whole orbital set
+    basis/coeff, the frozen orbitals put back: (n_walkers, nmo, n_frozen_occ + nocc), an
+    (alpha, beta) pair of them for unrestricted walkers. The columns are the frozen
+    occupied orbitals followed by the walker's own; the rows follow the columns of
+    basis/coeff. With the orbital set ordered [frozen occ | active | frozen vir], as the
+    canonical and the LNO bases are, a walker W becomes
+
+        [[ 1, 0 ],      frozen occupied
+         [ 0, W ],      active
+         [ 0, 0 ]]      frozen virtual
+
+    and basis.coeff @ this is the walker's occupied orbitals in the AO basis.
+    """
+    if loaded["walker_kind"] == "generalized":
+        raise ValueError("generalized walkers mix the spins; there is no per spin block form.")
+    if "walkers" in loaded:
+        return _full_coefficients(loaded["basis"], loaded["walkers"])
+    basis_a = loaded["basis_a"] if "basis_a" in loaded else loaded["basis"]
+    basis_b = loaded["basis_b"] if "basis_b" in loaded else loaded["basis"]
+    return (
+        _full_coefficients(basis_a, loaded["walkers_a"]),
+        _full_coefficients(basis_b, loaded["walkers_b"]),
     )

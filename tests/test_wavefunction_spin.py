@@ -17,7 +17,12 @@ import pytest
 from pyscf import cc, gto, scf
 
 from trot.afqmc import AfqmcMixed
-from trot.wavefunction_io import WavefunctionBasis, dump_wavefunction, load_wavefunction
+from trot.wavefunction_io import (
+    WavefunctionBasis,
+    dump_wavefunction,
+    load_wavefunction,
+    walker_full_coefficients,
+)
 from trot.wavefunction_spin import (
     guide_from_snapshots,
     occupied_ao_orbitals,
@@ -90,6 +95,20 @@ def test_occupied_ao_orbitals_put_the_core_back(population):
         # the active part is orthogonal to the core
         assert (
             np.abs(phi[:, :, :_NCORE].transpose(0, 2, 1) @ s_ao @ phi[:, :, _NCORE:]).max() < 1e-12
+        )
+
+
+def test_full_coefficients_are_the_occupied_orbitals(population):
+    """coeff @ [[1, 0], [0, W]] is what the spin analysis uses, per spin."""
+    wf = population["wf"]
+    phi = occupied_ao_orbitals(wf)
+    full = walker_full_coefficients(wf)
+    for s, key in enumerate(("basis_a", "basis_b")):
+        nocc = phi[s].shape[2]
+        assert full[s].shape == (_NW, _NAO, nocc)
+        np.testing.assert_array_equal(full[s][:, :_NCORE, :_NCORE], np.ones((_NW, 1, 1)))
+        np.testing.assert_allclose(
+            np.einsum("pq,wqi->wpi", wf[key].coeff, full[s]), phi[s], atol=1e-13
         )
 
 

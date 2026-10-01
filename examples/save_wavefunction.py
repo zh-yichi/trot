@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 
 import numpy as np
-from pyscf import cc, gto, scf
+from pyscf import cc, gto, lib, scf
 
 from trot.afqmc import AfqmcMixed
 from trot.wavefunction_io import load_wavefunction, walker_ao_coefficients
@@ -94,5 +94,5 @@ core_a = basis_a.frozen_occ_coeff
 print(f"  AO orbitals: alpha {ao_a.shape}, beta {ao_b.shape}")
 print(
     "  max overlap of a walker orbital with the frozen core: "
-    f"{np.abs(np.einsum('pc,pq,wqi->wci', core_a, s1e, ao_a)).max():.1e}"
+    f"{np.abs(lib.einsum('pc,pq,wqi->wci', core_a, s1e, ao_a)).max():.1e}"
 )

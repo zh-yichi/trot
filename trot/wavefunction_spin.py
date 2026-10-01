@@ -35,6 +35,7 @@ from typing import Any, Union
 
 import numpy as np
 from numpy.typing import NDArray
+from pyscf import lib
 
 from .wavefunction_io import load_wavefunction
 
@@ -72,7 +73,10 @@ def pair_spin(
     m_a, m_b = pa @ sphip_a, pb @ sphip_b
     x_ab, x_ba = pa @ sphip_b, pb @ sphip_a
     overlap = np.linalg.det(m_a) * np.linalg.det(m_b)
-    flip = np.einsum("wij,wji->w", np.linalg.solve(m_a, x_ab), np.linalg.solve(m_b, x_ba))
+    # the trace of the product, per determinant of the stack
+    flip = np.sum(
+        np.linalg.solve(m_a, x_ab) * np.linalg.solve(m_b, x_ba).transpose(0, 2, 1), axis=(1, 2)
+    )
     return overlap, m * (m + 1) + nb - flip
 
 
@@ -82,6 +86,27 @@ def occupied_ao_orbitals(wf: dict[str, Any]) -> tuple[NDArray, NDArray]:
     (n_walkers, nao, N_alpha) and (n_walkers, nao, N_beta) arrays of a file read by
     load_wavefunction. A restricted hamiltonian carries one basis for both spins;
     restricted walkers are the same determinant for both.
+
+    AFQMC runs in the orbital basis |p> with AO coefficients C^m (basis.coeff), so a
+    walker in the AO basis |mu> is, per spin,
+
+        C^ao_{mu,i} = sum_p C^m_{mu,p} C^w_{p,i}
+
+    with C^w the walker in the whole orbital set, the frozen orbitals put back
+    (wavefunction_io.walker_full_coefficients): the identity on the frozen occupied
+    orbitals, the saved walker W on the active ones, zero on the frozen virtual ones,
+
+        C^w = [[ 1, 0 ],      frozen occupied
+               [ 0, W ],      active
+               [ 0, 0 ]]      frozen virtual
+
+    Splitting the sum over p into those three ranges, the frozen virtual part drops out
+    and the two kinds of columns separate:
+
+        C^ao_{mu,i} = C^m_{mu,i}                           i a frozen occupied orbital
+        C^ao_{mu,i} = sum_{p in active} C^m_{mu,p} W_{p,i}  i an occupied orbital of the walker
+
+    that is C^ao = [ C^m_frozen_occ | C^m_active @ W ], which is what is built here.
     """
     if wf["walker_kind"] == "generalized":
         raise ValueError("generalized walkers have no (N_alpha, N_beta); S_z is not fixed.")
@@ -90,7 +115,7 @@ def occupied_ao_orbitals(wf: dict[str, Any]) -> tuple[NDArray, NDArray]:
         basis = wf[bkey] if bkey in wf else wf["basis"]
         walkers = wf[key] if key in wf else wf["walkers"]
         core = basis.frozen_occ_coeff  # (nao, ncore)
-        act = np.einsum("pq,wqi->wpi", basis.active_coeff, walkers)  # (n, nao, nocc_active)
+        act = lib.einsum("pq,wqi->wpi", basis.active_coeff, walkers)  # (n, nao, nocc_active)
         out.append(
             np.concatenate([np.broadcast_to(core, (act.shape[0],) + core.shape), act], axis=2)
         )
@@ -116,8 +141,8 @@ def population_spin(
     """
     phi_a, phi_b = occupied_ao_orbitals(wf)
     n = phi_a.shape[0]
-    sphi_a = np.einsum("pq,wqi->wpi", s_ao, phi_a)
-    sphi_b = np.einsum("pq,wqi->wpi", s_ao, phi_b)
+    sphi_a = lib.einsum("pq,wqi->wpi", s_ao, phi_a)
+    sphi_b = lib.einsum("pq,wqi->wpi", s_ao, phi_b)
     w = np.asarray(wf["weights"])
     c = w / np.asarray(wf["overlaps"])
     m = 0.5 * (phi_a.shape[2] - phi_b.shape[2])

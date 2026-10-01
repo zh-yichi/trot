@@ -100,12 +100,18 @@ def run_frag_qmc(
     trial_meas_ctx: Any | None = None,
     mesh: Mesh | None = None,
     label: str = "",
+    snapshot_fn: Callable[[PropState, dict[str, Any]], None] | None = None,
 ) -> FragQmcResult:
     """
     Equilibration then sampling of one fragment. The importance sampling is governed by
     the guide; the fragment energy is measured against the trial at tau = 0 and from the
     sampling phase on. Returns the fragment correlation energy with its error, and the
     guide energy.
+
+    snapshot_fn, when given, is called as in run_mixed_qmc: with the walker state and a
+    dict of where the run is (phase "init" / "eql" / "sample", block, tau, and the
+    energies of that row; trial_energy is the fragment correlation energy) at tau = 0 and
+    after every printed row. That is how the wavefunction snapshots are saved.
     """
     guide_prop_ctx = guide_prop_ops.build_prop_ctx(ham_data, guide_ops.get_rdm1(guide_data), params)
     if guide_meas_ctx is None:
@@ -174,6 +180,17 @@ def run_frag_qmc(
         f"{guide_block_e_eq[0]:14.10f}  {guide_block_w_eq[0]:12.6e}  "
         f"{e_init:14.10f}  {w_init:12.6e}  {int(state.node_encounters):10d}  {0.0:8.1f}"
     )
+    if snapshot_fn is not None:
+        snapshot_fn(
+            state,
+            dict(
+                phase="init",
+                block=0,
+                tau=0.0,
+                guide_energy=guide_block_e_eq[0],
+                trial_energy=e_init,
+            ),
+        )
     chunk = print_every if print_every > 0 else 1
     for start in range(0, params.n_eql_blocks, chunk):
         n = min(chunk, params.n_eql_blocks - start)
@@ -199,6 +216,13 @@ def run_frag_qmc(
             f"{e_avg:14.10f}  {w_avg:12.6e}  {'-':>14s}  {'-':>12s}  "
             f"{int(state.node_encounters):10d}  {time.perf_counter() - t0:8.1f}"
         )
+        if snapshot_fn is not None:
+            snapshot_fn(
+                cast(PropState, state),
+                dict(
+                    phase="eql", block=start + n, tau=(start + n) * block_time, guide_energy=e_avg
+                ),
+            )
 
     # ------------------------------------------------------------------ sampling
     print(f"\n{tag}Sampling:")
@@ -261,6 +285,19 @@ def run_frag_qmc(
             f"{frag_e_s}  {frag_err_s}  {int(state.node_encounters):10d}  {dt_per_block:10.3f}  "
             f"{elapsed:8.1f}"
         )
+        if snapshot_fn is not None:
+            snapshot_fn(
+                cast(PropState, state),
+                dict(
+                    phase="sample",
+                    block=n_done,
+                    tau=(params.n_eql_blocks + n_done) * block_time,
+                    guide_energy=float(guide_mu),
+                    guide_error=None if guide_se is None else float(guide_se),
+                    trial_energy=None if frag_e is None else float(np.real(frag_e)),
+                    trial_error=None if frag_err is None else float(frag_err),
+                ),
+            )
         if (
             max_error is not None
             and max_error > 0

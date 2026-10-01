@@ -108,6 +108,11 @@ class LnoFragMixed(AfqmcMixed):
     allocator, where jax itself reports no limit.
     save_wavefunction : h5 file for the final walker population and its LNO basis
         (AfqmcMixed.save_wavefunction, wavefunction_io).
+    save_snapshots : directory for snapshots of the walker population along the run, as
+        AfqmcMixed(save_wavefunction=dir) writes them for a canonical calculation:
+        wfn_0000.h5 at tau = 0, then one file per printed row of the equilibration and
+        the sampling, listed in snapshots.json. Each carries the fragment's LNO basis
+        with its frozen occupied and frozen virtual columns.
     The remaining keywords are AfqmcMixed's (max_memory, nchol_chunk, mixed_precision
     with the per side guide_mixed_precision / trial_mixed_precision, chol_cut,
     n_eql_blocks, n_blocks, seed, dt, n_prop_steps, n_walkers, n_chunks, error_method,
@@ -143,6 +148,7 @@ class LnoFragMixed(AfqmcMixed):
         error_method: Literal["gamma", "blocking"] | None = "blocking",
         tau_eql: float | None = None,
         save_wavefunction: Union[str, Path] | None = None,
+        save_snapshots: Union[str, Path] | None = None,
     ):
         if tau_eql is not None and n_eql_blocks is not None:
             raise ValueError("pass either tau_eql or n_eql_blocks, not both.")
@@ -203,6 +209,7 @@ class LnoFragMixed(AfqmcMixed):
         self.save_wavefunction_path = (
             None if save_wavefunction is None else Path(save_wavefunction).expanduser()
         )
+        self.snapshot_dir = None if save_snapshots is None else Path(save_snapshots).expanduser()
 
         self.max_error = max_error
         self.stop_ratio = float(stop_ratio)
@@ -359,6 +366,8 @@ class LnoFragMixed(AfqmcMixed):
         mesh = driver_kwargs.pop("mesh", None)
         job = self.build_job(mesh=mesh)
         self.dump_flags(job)
+        if self.snapshot_dir is not None and "snapshot_fn" not in driver_kwargs:
+            driver_kwargs["snapshot_fn"] = self._wavefunction_snapshot_writer(self.snapshot_dir)
 
         result = run_frag_qmc(
             sys=job.sys,
@@ -498,6 +507,8 @@ class LnoAfqmcMixed:
     save_frag_data : directory for the self-contained frag{i}.h5 files
     save_wavefunction : directory for the fragments' final walker populations,
         wavefunction{i}.h5 each (LnoFragMixed(save_wavefunction=...))
+    save_snapshots : directory for the fragments' wavefunction snapshots along the run,
+        one subdirectory snapshots{i} each (LnoFragMixed(save_snapshots=...))
     isolate : run each fragment's AFQMC in a child process (python -m trot.lnoafqmc.run_frag)
     keep_qmc_results : keep every fragment's FragQmcResult in frag_qmc_results
     debug_memory : raise if device memory does not return to baseline after a fragment
@@ -532,6 +543,7 @@ class LnoAfqmcMixed:
         lno_output: Union[str, Path] | None = None,
         save_frag_data: Union[str, Path] | None = None,
         save_wavefunction: Union[str, Path] | None = None,
+        save_snapshots: Union[str, Path] | None = None,
         isolate: bool = False,
         keep_qmc_results: bool = False,
         debug_memory: bool = False,
@@ -661,6 +673,7 @@ class LnoAfqmcMixed:
             save_frag_data = "frag_data"  # the child process reads the fragment from its file
         self.save_frag_data = save_frag_data
         self.save_wavefunction = save_wavefunction
+        self.save_snapshots = save_snapshots
         self.keep_qmc_results = bool(keep_qmc_results)
         self.debug_memory = bool(debug_memory)
         self.memory_tolerance_mb = float(memory_tolerance_mb)
@@ -805,6 +818,11 @@ class LnoAfqmcMixed:
             min_blocks=self.min_blocks,
             seed=self._frag_seed(frag_idx),
             save_wavefunction=None if wf_path is None else str(wf_path),
+            save_snapshots=(
+                None
+                if self.save_snapshots is None
+                else str(Path(self.save_snapshots) / f"snapshots{frag_idx + 1}")
+            ),
             **self.qmc_kwargs,
         )
 

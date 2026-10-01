@@ -539,6 +539,110 @@ def test_frag_wavefunction_file(o2, tmp_path):
     assert load_wavefunction(tmp_path / "wfs" / "wavefunction2.h5")["attrs"]["frag_idx"] == 1
 
 
+def test_frag_wavefunction_snapshots(tmp_path):
+    """
+    save_snapshots writes the fragment's population at tau = 0 and at every printed row,
+    as the canonical AfqmcMixed(save_wavefunction=dir) does, each file in the LNO basis;
+    with the frozen LNOs put back a walker is [[1, 0], [0, W], [0, 0]] over
+    [frozen occ | active | frozen vir].
+    """
+    import json
+
+    from trot.wavefunction_io import (
+        load_wavefunction,
+        walker_ao_coefficients,
+        walker_full_coefficients,
+    )
+
+    # a basis with enough virtuals and a loose threshold, so that occupied and virtual
+    # LNOs are both frozen
+    mol = gto.M(atom="O 0 0 0; O 0 0 1.208", basis="6-31g", verbose=0, max_memory=16000)
+    mf: Any = scf.RHF(mol).density_fit()
+    mf.kernel()
+    nfrozen = int(elements.chemcore(mol))
+    lo_coeff, frag_list, frag_name = iao_fragment(mf, nfrozen, frag_type="atom")
+    mlno = solvers.get_lnoccsd(mf, lo_coeff, frag_list, nfrozen, [1e-2, 1e-2])
+    mlno.verbose = 0
+    frag = pipeline.cpu_stage(
+        mlno,
+        mf,
+        lo_coeff,
+        frag_list[0],
+        mlno.lno_thresh,
+        [None, None],
+        [[None, None]] * len(frag_list),
+        ["1h", "1h"],
+        mlno.ao2mo(),
+        0,
+        0,
+        frag_name[0],
+        True,
+        True,
+        nfrozen,
+    )
+    assert frag.nfrzocc > 0 and frag.nfrzvir > 0
+    qmc: dict[str, Any] = dict(
+        n_walkers=6, n_eql_blocks=2, n_blocks=8, dt=0.005, n_prop_steps=4, seed=3
+    )
+    snaps = tmp_path / "snaps"
+    with contextlib.redirect_stdout(io.StringIO()):
+        fm = LnoFragMixed(
+            mf, frag, chol_cut=CHOL_CUT, mixed_precision=False, save_snapshots=snaps, **qmc
+        )
+        fm.kernel()
+    n_snap = 1 + qmc["n_eql_blocks"] + qmc["n_blocks"]
+    files = sorted(snaps.glob("wfn_*.h5"))
+    assert [f.name for f in files] == [f"wfn_{k:04d}.h5" for k in range(n_snap)]
+    manifest = json.loads((snaps / "snapshots.json").read_text())
+    assert [m["file"] for m in manifest] == [f.name for f in files]
+    block_time = qmc["dt"] * qmc["n_prop_steps"]
+    assert [m["tau"] for m in manifest] == pytest.approx([k * block_time for k in range(n_snap)])
+    assert [m["phase"] for m in manifest] == ["init"] + ["eql"] * 2 + ["sample"] * 8
+    assert manifest[0]["trial_energy"] == pytest.approx(fm.qmc_result.frag_init_energy)
+    assert manifest[-1]["trial_energy"] == pytest.approx(fm.e_tot, abs=1e-6)
+    # tau = 0: the guide determinant; the last one: the final population
+    wf0, wf = load_wavefunction(files[0]), load_wavefunction(files[-1])
+    np.testing.assert_allclose(wf0["overlaps"], 1.0, atol=1e-12)
+    np.testing.assert_allclose(wf["walkers"], np.asarray(fm.qmc_result.final_state.walkers))
+    assert wf["attrs"]["frag_name"] == frag.frag_name and wf["attrs"]["phase"] == "sample"
+    # the block form in the whole LNO basis
+    basis = wf["basis"]
+    nmo, ncore = basis.coeff.shape[1], frag.nfrzocc
+    assert basis.frozen_occ.size == ncore and basis.frozen_vir.size == frag.nfrzvir
+    assert basis.frozen_occ.tolist() == list(range(ncore))
+    assert basis.active.tolist() == list(range(ncore, nmo - frag.nfrzvir))
+    full = walker_full_coefficients(wf)
+    nocc = wf["walkers"].shape[2]
+    assert full.shape == (6, nmo, ncore + nocc)
+    np.testing.assert_array_equal(
+        full[:, :ncore, :ncore], np.broadcast_to(np.eye(ncore), (6, ncore, ncore))
+    )
+    np.testing.assert_array_equal(full[:, ncore : ncore + basis.norb, ncore:], wf["walkers"])
+    assert not full[:, :ncore, ncore:].any() and not full[:, ncore:, :ncore].any()
+    assert not full[:, ncore + basis.norb :, :].any()
+    ao = np.einsum("pq,wqi->wpi", basis.coeff, full)
+    np.testing.assert_allclose(ao[:, :, ncore:], walker_ao_coefficients(wf), atol=1e-14)
+    np.testing.assert_allclose(ao[0][:, :ncore], basis.frozen_occ_coeff, atol=1e-14)
+    # the loop: one snapshot directory per fragment
+    with contextlib.redirect_stdout(io.StringIO()):
+        lno = LnoAfqmcMixed(
+            mf,
+            lo_coeff,
+            frag_list,
+            frag_name=frag_name,
+            lno_thresh=[1e-2, 1e-2],
+            nfrozen=nfrozen,
+            chol_cut=CHOL_CUT,
+            run_frag=[1],
+            save_snapshots=tmp_path / "all",
+            mixed_precision=False,
+            **qmc,
+        )
+        lno.kernel()
+    assert len(list((tmp_path / "all" / "snapshots2").glob("wfn_*.h5"))) == n_snap
+    assert not (tmp_path / "all" / "snapshots1").exists()
+
+
 def test_frag_mixed_options(o2):
     mf, frag = o2["mf"], o2["frags"][0]
     with pytest.raises(ValueError, match="tau_eql or n_eql_blocks"):
