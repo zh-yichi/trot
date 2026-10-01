@@ -38,10 +38,12 @@ from trot.meas.ucisd import (
 from trot.meas.ucisd_uh import (
     build_meas_ctx_uh,
     energy_kernel_uw_uh,
+    get_ucisd_uh_meas_cfg,
     force_bias_kernel_uw_uh,
     make_ucisd_meas_ops_uh,
     overlap_uw_uh,
 )
+from trot.meas.pt2ccsd_chunking import Pt2ccsdChunkMeasCfg
 from trot.meas.uhf_uh import build_meas_ctx_uh as uhf_build_meas_ctx_uh
 from trot.meas.uhf_uh import energy_kernel_uw_uh as uhf_energy_kernel_uw_uh
 from trot.meas.uhf_uh import force_bias_kernel_uw_uh as uhf_force_bias_kernel_uw_uh
@@ -124,6 +126,44 @@ def test_kernels_reduce_to_restricted(random_pair):
         e_r = complex(energy_kernel_uw_rh(w, ham, ctx_r, trial))
         e_u = complex(energy_kernel_uw_uh(w, ham_u, ctx_u, trial))
         assert e_u == pytest.approx(e_r, rel=1e-10)
+
+
+def test_energy_is_independent_of_the_cholesky_chunk(random_pair):
+    ham_u, trial = random_pair["ham_u"], random_pair["trial"]
+    wa, wb = random_pair["walkers"]
+
+    def ctx(nchol_chunk):
+        return build_meas_ctx_uh(ham_u, trial, Pt2ccsdChunkMeasCfg(nchol_chunk=nchol_chunk))
+
+    assert ctx(None).nchol_chunk == _NCHOL and ctx(3).nchol_chunk == 3
+    for i in range(wa.shape[0]):
+        w = (wa[i], wb[i])
+        # one chunk holding every vector
+        e_ref = complex(energy_kernel_uw_uh(w, ham_u, ctx(_NCHOL), trial))
+        # 1 and 2 divide evenly, 3 and 5 pad the last chunk with zero vectors
+        for nchol_chunk in (1, 2, 3, 5):
+            e_c = complex(energy_kernel_uw_uh(w, ham_u, ctx(nchol_chunk), trial))
+            assert e_c == pytest.approx(e_ref, rel=1e-12)
+
+
+def test_mixed_precision_energy(random_pair):
+    """Single precision <C1 h2> and <C2 h2> contractions, chosen through the meas ctx."""
+    ham_u, trial, sys_u = random_pair["ham_u"], random_pair["trial"], random_pair["sys_u"]
+    wa, wb = random_pair["walkers"]
+    dp = make_ucisd_meas_ops_uh(sys_u, mixed_precision=False, nchol_chunk=3)
+    mp = make_ucisd_meas_ops_uh(sys_u, mixed_precision=True, nchol_chunk=3)
+    ctx_dp, ctx_mp = dp.build_meas_ctx(ham_u, trial), mp.build_meas_ctx(ham_u, trial)
+    assert ctx_dp.cfg.mixed_complex_dtype == jnp.complex128
+    assert ctx_mp.cfg.mixed_complex_dtype == jnp.complex64
+    assert get_ucisd_uh_meas_cfg(mp).nchol_chunk == 3 and ctx_mp.nchol_chunk == 3
+    for i in range(wa.shape[0]):
+        w = (wa[i], wb[i])
+        e_dp = energy_kernel_uw_uh(w, ham_u, ctx_dp, trial)
+        e_mp = energy_kernel_uw_uh(w, ham_u, ctx_mp, trial)
+        assert e_mp.dtype == e_dp.dtype
+        # loose: float32 matmuls on a GPU (TF32) are only good to ~1e-4
+        assert complex(e_mp) == pytest.approx(complex(e_dp), rel=1e-2)
+        assert complex(e_mp) != complex(e_dp)
 
 
 def test_zero_coefficients_reduce_to_uhf(random_pair):
