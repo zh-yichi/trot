@@ -6,6 +6,7 @@ configure_once()
 
 import copy
 import dataclasses
+import json
 import shutil
 from functools import partial
 from pathlib import Path
@@ -110,6 +111,11 @@ class Afqmc:
         or UCISD trials. Mode construction can be cached on a CPU node with
         :meth:`prepare_cisd_trial_cache`; pair-sampling is tuned after AFQMC
         equilibration.
+    save_wavefunction : bool, str or Path, optional
+        Save snapshots of the walker population (walkers, weights, trial overlaps) with
+        the orbital basis it is expressed in, at tau = 0 and at every printed row of the
+        run, to a directory: ``True`` uses ``./wfn_snaps``, a path names the directory
+        (wavefunction_io.dump_wavefunction documents the layout).
     """
 
     params_cls = QmcParams
@@ -132,6 +138,7 @@ class Afqmc:
         n_chunks: int | None = None,
         error_method: Literal["gamma", "blocking"] | None = None,
         cisd_workflow: CisdWorkflowConfig | None = None,
+        save_wavefunction: Union[bool, str, Path] | None = None,
     ):
         self._obj = mf_or_cc
         self._cc: Any = None
@@ -157,6 +164,7 @@ class Afqmc:
         self.walker_kind: WalkerKind | None = None  # resolved in kernel
         self.mixed_precision = True
         self.cisd_workflow = cisd_workflow
+        self.wavefunction_dir = self._wavefunction_dir(save_wavefunction)
 
         self.params: QmcParamsBase | None = None  # resolved in kernel
         defaults = self.params_cls()
@@ -474,6 +482,125 @@ class Afqmc:
     def _coerce_result(self, value: Any) -> Any:
         return float(value)
 
+    # ------------------------------------------------------------------ the wavefunction
+
+    def _wavefunction_names(self) -> tuple[str, str]:
+        """(guide, trial) names for the wavefunction files: the staged trial kind for a plain run."""
+        job = self.job
+        assert job is not None
+        kind = str(job.staged.trial.kind)
+        return getattr(self, "guide", kind), getattr(self, "trial", kind)
+
+    def wavefunction_basis(self) -> WavefunctionBasis | tuple[WavefunctionBasis, WavefunctionBasis]:
+        """
+        The orbital set the run's hamiltonian is built in, as wavefunction_io describes
+        it: the mean field's MOs (the alpha ones for a UHF mean field on the restricted
+        hamiltonian; basis_a / basis_b when they were given) with the frozen core as the
+        leading columns and the active orbitals after it, in the order the walkers use.
+        One set for a restricted hamiltonian, an (alpha, beta) pair for the unrestricted one.
+        """
+        job = self.build_job()
+        if self._scf is None:
+            raise ValueError("the wavefunction basis needs the mean field object (mo_coeff).")
+        frozen = job.staged.meta.get("frozen")
+        if frozen is None:
+            frozen = int(self.norb_frozen_core or 0)
+        frozen = np.asarray(frozen, dtype=np.int64).reshape(-1)
+        mo = np.asarray(self._scf.mo_coeff)
+        ham_basis = str(getattr(job.ham_data, "basis", "restricted"))
+        if ham_basis == "uchol":
+            basis_a, basis_b = getattr(self, "basis_a", None), getattr(self, "basis_b", None)
+            if basis_a is not None and basis_b is not None:
+                coeffs, kind = (basis_a, basis_b), "custom"
+            else:
+                coeffs, kind = (mo[0], mo[1]), "canonical_mo"
+            n_core = (int(frozen[0]), int(frozen[-1]))
+            return tuple(
+                WavefunctionBasis.leading_core(c, n, kind=kind) for c, n in zip(coeffs, n_core)
+            )
+        if ham_basis != "restricted":
+            raise NotImplementedError(
+                f"wavefunction files are not written for the {ham_basis!r} hamiltonian."
+            )
+        if frozen.size != 1:
+            raise ValueError(f"expected one frozen core count, got {frozen.tolist()}.")
+        coeff = mo if mo.ndim == 2 else mo[0]
+        return WavefunctionBasis.leading_core(coeff, int(frozen[0]), kind="canonical_mo")
+
+    def _wavefunction_meta(self) -> dict[str, Any]:
+        """The run attributes every wavefunction file carries; the caller adds where it is."""
+        job = self.job
+        assert job is not None and job.params is not None
+        params = job.params
+        guide, trial = self._wavefunction_names()
+        meta = dict(
+            guide=guide,
+            trial=trial,
+            ham_basis=str(getattr(job.ham_data, "basis", "restricted")),
+            walker_kind=job.sys.walker_kind,
+            norb=job.sys.norb,
+            dt=float(params.dt),
+            n_prop_steps=int(params.n_prop_steps),
+            n_eql_blocks=int(getattr(params, "n_eql_blocks", 0)),
+            n_blocks=int(params.n_blocks),
+            seed=int(params.seed),
+            mixed_precision=bool(getattr(self, "guide_mixed_precision", self.mixed_precision)),
+        )
+        if self._scf is not None:
+            mol = self._scf.mol
+            meta.update(
+                nelectron=int(mol.nelectron),
+                spin=int(mol.spin),
+                charge=int(mol.charge),
+                ao_basis=str(getattr(mol, "basis", "")),
+            )
+        return meta
+
+    def _dump_wavefunction(self, path: Union[str, Path], state: Any, meta: dict[str, Any]) -> Path:
+        job = self.job
+        assert job is not None
+        return dump_wavefunction(
+            path,
+            walkers=state.walkers,
+            weights=state.weights,
+            overlaps=state.overlaps,
+            walker_kind=job.sys.walker_kind,
+            basis=self.wavefunction_basis(),
+            nelec=tuple(int(n) for n in job.sys.nelec),  # type: ignore[arg-type]
+            meta=meta,
+        )
+
+    def _wavefunction_snapshot_writer(
+        self, directory: Path
+    ) -> Callable[[Any, dict[str, Any]], None]:
+        """
+        The driver's snapshot_fn: writes directory/wfn_{k:04d}.h5 for the k-th snapshot,
+        with the phase, block and tau in its attributes, and keeps snapshots.json, the
+        list of the files with those numbers, up to date after every write.
+        """
+        directory.mkdir(parents=True, exist_ok=True)
+        base_meta = self._wavefunction_meta()
+        entries: list[dict[str, Any]] = []
+        manifest = directory / "snapshots.json"
+
+        def write(state: Any, where: dict[str, Any]) -> None:
+            k = len(entries)
+            path = directory / f"wfn_{k:04d}.h5"
+            info = {key: value for key, value in where.items() if value is not None}
+            self._dump_wavefunction(path, state, {**base_meta, "snapshot": k, **info})
+            entries.append({"file": path.name, "snapshot": k, **info})
+            manifest.write_text(json.dumps(entries, indent=1))
+
+        return write
+
+    @staticmethod
+    def _wavefunction_dir(save_wavefunction: Union[bool, str, Path] | None) -> Path | None:
+        if save_wavefunction is None or save_wavefunction is False:
+            return None
+        if save_wavefunction is True:
+            return Path(WAVEFUNCTION_SNAPSHOT_DIR)
+        return Path(save_wavefunction).expanduser()
+
     def kernel(self, **driver_kwargs: Any) -> tuple[Any, Any]:
         """Run AFQMC and return ``(e_tot, e_err)``.
 
@@ -487,6 +614,8 @@ class Afqmc:
         job = self.build_job(mesh=mesh)
         self.dump_flags(job)
 
+        if self.wavefunction_dir is not None and "snapshot_fn" not in driver_kwargs:
+            driver_kwargs["snapshot_fn"] = self._wavefunction_snapshot_writer(self.wavefunction_dir)
         qmc_result = job.kernel(**driver_kwargs)
 
         e_tot = float(qmc_result.mean_energy)
@@ -1079,6 +1208,11 @@ import math  # noqa: E402
 
 from .mixed import MixedRecipe, get_mixed_recipe  # noqa: E402
 from .setup_mixed import JobMixed, setup_mixed  # noqa: E402
+from .wavefunction_io import (  # noqa: E402
+    WAVEFUNCTION_SNAPSHOT_DIR,
+    WavefunctionBasis,
+    dump_wavefunction,
+)
 from .staging import StagedMfOrCc  # noqa: E402
 from .staging_u import stage_ham_input_df  # noqa: E402
 
@@ -1176,6 +1310,16 @@ class AfqmcMixed(Afqmc):
         blocks is derived from it, n_eql_blocks = ceil(tau_eql / (dt * n_prop_steps)), so
         the run equilibrates to (at least) tau_eql whatever the time step and the steps
         per block are. It cannot be combined with n_eql_blocks.
+    save_wavefunction : bool, str or Path, optional
+        Save snapshots of the AFQMC wavefunction, the walker population (walkers,
+        weights, guide overlaps) with the orbital basis it is expressed in, at tau = 0
+        and at every energy measurement point of the run (each printed row of the
+        equilibration and the sampling), to a directory: ``True`` uses ``./wfn_snaps``,
+        a path names the directory. The files are ``wfn_0000.h5``, ``wfn_0001.h5``, ...
+        in order of tau (wavefunction_io.dump_wavefunction documents the layout, each
+        file's attributes carry the phase, block and tau), listed with those numbers in
+        ``snapshots.json``. ``save_wavefunction(path)`` writes the final population of a
+        finished run to one file.
     The remaining parameters are those of ``Afqmc``.
     """
 
@@ -1209,6 +1353,7 @@ class AfqmcMixed(Afqmc):
         n_chunks: int | None = None,
         error_method: Literal["gamma", "blocking"] | None = "blocking",
         tau_eql: float | None = None,
+        save_wavefunction: Union[bool, str, Path] | None = None,
     ):
         from pyscf.cc.uccsd import UCCSD
 
@@ -1283,6 +1428,7 @@ class AfqmcMixed(Afqmc):
         self.nchol_chunk = nchol_chunk
         self.max_memory = max_memory
         self.tau_eql = None if tau_eql is None else float(tau_eql)
+        self.wavefunction_dir = self._wavefunction_dir(save_wavefunction)
 
         self._trial_input: staging.TrialInput | None = None
         self.guide_e_tot: Any = None
@@ -1550,6 +1696,8 @@ class AfqmcMixed(Afqmc):
         job = self.build_job(mesh=mesh)
         self.dump_flags(job)
 
+        if self.wavefunction_dir is not None and "snapshot_fn" not in driver_kwargs:
+            driver_kwargs["snapshot_fn"] = self._wavefunction_snapshot_writer(self.wavefunction_dir)
         qmc_result = job.kernel(**driver_kwargs)
         self.qmc_result = qmc_result
 
@@ -1560,6 +1708,36 @@ class AfqmcMixed(Afqmc):
         return self.e_tot, self.e_err
 
     run = kernel
+
+    # ------------------------------------------------------------------ the wavefunction
+
+    def save_wavefunction(self, path: Union[str, Path]) -> Path:
+        """
+        Write the final walker population of a finished run, |psi> = sum_i w_i/<G|phi_i>
+        |phi_i>, with the guide overlaps and the orbital basis (wavefunction_basis), to an
+        h5 file that wavefunction_io.load_wavefunction reads back.
+        """
+        result = getattr(self, "qmc_result", None)
+        if result is None:
+            raise RuntimeError("no finished run to save; call kernel() first.")
+        job = cast(JobMixed, self.job)
+        assert job is not None
+        params = cast(QmcParams, job.params)
+        n_blocks_run = getattr(result, "n_blocks_run", None)
+        if n_blocks_run is None:
+            n_blocks_run = int(np.asarray(result.trial_block_weights).shape[0])
+        block_time = float(params.dt) * int(params.n_prop_steps)
+        meta = dict(
+            self._wavefunction_meta(),
+            phase="final",
+            block=int(n_blocks_run),
+            tau=(int(params.n_eql_blocks) + int(n_blocks_run)) * block_time,
+            e_tot=float(self.e_tot),
+            e_err=float(self.e_err),
+            guide_e_tot=float(self.guide_e_tot),
+            guide_e_err=float(self.guide_e_err),
+        )
+        return self._dump_wavefunction(path, result.final_state, meta)
 
     @classmethod
     def from_staged(cls, path: Union[str, Path], **kwargs: Any):  # type: ignore[override]

@@ -81,10 +81,11 @@ class GuideSpec:
     ham_bases:     hamiltonians it can propagate on: "restricted" and/or "uchol"
     walker_kinds:  walker representations its ops accept
     chunked_meas_ops:
-                   optional (sys, ham_basis, nchol_chunk) -> MeasOps whose local energy
-                   sums the cholesky vectors nchol_chunk at a time, or None where that
-                   guide's energy has no such knob on that hamiltonian. setup_mixed uses
-                   it to run the guide energy with the trial's chunk plan
+                   optional (sys, ham_basis, nchol_chunk, *, mixed_precision) -> MeasOps
+                   whose local energy sums the cholesky vectors nchol_chunk at a time, or
+                   None where that guide's energy has no such knob on that hamiltonian.
+                   setup_mixed uses it to run the guide energy with the trial's chunk
+                   plan; mixed_precision is the guide's, for the kernels that honour it
     """
 
     name: str
@@ -92,7 +93,7 @@ class GuideSpec:
     source: str
     ham_bases: frozenset[str]
     walker_kinds: frozenset[str]
-    chunked_meas_ops: Callable[[Any, str, int], MeasOps | None] | None = None
+    chunked_meas_ops: Callable[..., MeasOps | None] | None = None
 
     def source_obj(self, obj: Any) -> Any:
         """The pyscf object the guide is staged from."""
@@ -183,14 +184,18 @@ class MixedRecipe:
 # guides
 # ------------------------------------------------------------------------------------
 
-def _rhf_chunked_meas_ops(sys: Any, ham_basis: str, nchol_chunk: int) -> MeasOps | None:
+def _rhf_chunked_meas_ops(
+    sys: Any, ham_basis: str, nchol_chunk: int, *, mixed_precision: bool = False
+) -> MeasOps | None:
     """meas.rhf's low memory mode: the local energy sums batches of nchol_chunk vectors."""
     from .meas.rhf import make_rhf_meas_ops
 
     return make_rhf_meas_ops(sys, memory_mode="low", chol_batch_size=int(nchol_chunk))
 
 
-def _uhf_chunked_meas_ops(sys: Any, ham_basis: str, nchol_chunk: int) -> MeasOps | None:
+def _uhf_chunked_meas_ops(
+    sys: Any, ham_basis: str, nchol_chunk: int, *, mixed_precision: bool = False
+) -> MeasOps | None:
     """
     On the uchol hamiltonian, meas.uhf_uh scans the local energy over chunks of
     nchol_chunk vectors. meas.uhf's kernel on the restricted hamiltonian has no chunking,
@@ -203,8 +208,25 @@ def _uhf_chunked_meas_ops(sys: Any, ham_basis: str, nchol_chunk: int) -> MeasOps
     return make_uhf_meas_ops_uh(sys, nchol_chunk=int(nchol_chunk))
 
 
-# cisd and ucisd have no chunked_meas_ops: their local energies already scan the cholesky
-# vectors one at a time
+def _ucisd_chunked_meas_ops(
+    sys: Any, ham_basis: str, nchol_chunk: int, *, mixed_precision: bool = False
+) -> MeasOps | None:
+    """
+    On the uchol hamiltonian, meas.ucisd_uh scans the local energy over chunks of
+    nchol_chunk vectors. meas.ucisd's kernel on the restricted hamiltonian scans the
+    vectors one at a time, so the guide is left as it is there.
+    """
+    if ham_basis != "uchol":
+        return None
+    from .meas.ucisd_uh import make_ucisd_meas_ops_uh
+
+    return make_ucisd_meas_ops_uh(
+        sys, mixed_precision=mixed_precision, nchol_chunk=int(nchol_chunk)
+    )
+
+
+# cisd has no chunked_meas_ops: its local energy already scans the cholesky vectors one
+# at a time
 GUIDES: dict[str, GuideSpec] = {
     "rhf": GuideSpec(
         name="rhf",
@@ -239,6 +261,7 @@ GUIDES: dict[str, GuideSpec] = {
         source="cc",
         ham_bases=frozenset({"restricted", "uchol"}),
         walker_kinds=frozenset({"unrestricted", "generalized"}),
+        chunked_meas_ops=_ucisd_chunked_meas_ops,
     ),
 }
 

@@ -125,7 +125,11 @@ def _plan_xla(
     make_chunked = rec.guide_spec.chunked_meas_ops
 
     def guide_energy(k: int) -> tuple[Any, Any, Any] | None:
-        ops = make_chunked(job.sys, rec.ham_basis, int(k)) if make_chunked is not None else None
+        ops = (
+            make_chunked(job.sys, rec.ham_basis, int(k), mixed_precision=guide_mp)
+            if make_chunked is not None
+            else None
+        )
         if ops is None:
             ops = job.meas_ops  # the guide's energy as it will run: unchunked
         if not ops.has_kernel(k_energy):
@@ -404,7 +408,9 @@ def setup_mixed(
     # by the caller is kept as given.
     make_chunked = rec.guide_spec.chunked_meas_ops
     if nchol_chunk is not None and meas_ops is None and make_chunked is not None:
-        chunked = make_chunked(job.sys, rec.ham_basis, int(nchol_chunk))
+        chunked = make_chunked(
+            job.sys, rec.ham_basis, int(nchol_chunk), mixed_precision=bool(mixed_precision)
+        )
         if chunked is not None:
             job.meas_ops = chunked
             job.guide_nchol_chunk = int(nchol_chunk)

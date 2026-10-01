@@ -195,11 +195,17 @@ def run_mixed_qmc(
     target_error: float | None = None,
     mesh: Mesh | None = None,
     observable_names: tuple[str, ...] = (),
+    snapshot_fn: Callable[[PropState, dict[str, Any]], None] | None = None,
 ) -> MixedQmcResult:
     """
     Equilibration blocks then sampling blocks. The importance sampling is governed by the
     guide and the energy is measured against the trial; the guide's energy is also
     measured, to update the population control shift and to reject runaway walkers.
+
+    snapshot_fn, when given, is called with the walker state and a dict of where the run
+    is (phase "init" / "eql" / "sample", the block count reached in that phase, tau, and
+    the guide / trial energies so far) at tau = 0 and after every batch of blocks, i.e. at
+    every printed row: that is how the wavefunction snapshots are saved.
 
     The trial is described by what its energy kernel returns per walker (components, in
     order) and how the weighted block means of those combine into an energy
@@ -233,6 +239,17 @@ def run_mixed_qmc(
     trial_energy0, trial_weights0 = _init_trial_energy(
         state, ham_data, trial_data, trial_meas_ops, trial_meas_ctx, params, components, energy_fn
     )
+    if snapshot_fn is not None:
+        snapshot_fn(
+            state,
+            dict(
+                phase="init",
+                block=0,
+                tau=0.0,
+                guide_energy=float(np.real(state.e_estimate)),
+                trial_energy=float(np.real(trial_energy0)),
+            ),
+        )
 
     # the block function is told what the trial kernel returns; the sr_fn binding for a
     # sharded population is the same mechanism
@@ -309,6 +326,16 @@ def run_mixed_qmc(
             f"{int(state.node_encounters):10d}  "
             f"{time.perf_counter() - t0:8.1f}"
         )
+        if snapshot_fn is not None:
+            snapshot_fn(
+                state,
+                dict(
+                    phase="eql",
+                    block=start + n,
+                    tau=(start + n) * block_time,
+                    guide_energy=float(guide_e_chunk_avg),
+                ),
+            )
 
     guide_block_w_eq_arr = jnp.asarray(guide_block_w_eq)
     guide_block_e_eq_arr = jnp.asarray(guide_block_e_eq)
@@ -370,6 +397,19 @@ def run_mixed_qmc(
             f"{dt_per_block:9.3f}  "
             f"{elapsed:8.1f}"
         )
+        if snapshot_fn is not None:
+            snapshot_fn(
+                state,
+                dict(
+                    phase="sample",
+                    block=start + n,
+                    tau=(params.n_eql_blocks + start + n) * block_time,
+                    guide_energy=float(guide_mu),
+                    guide_error=None if guide_se is None else float(guide_se),
+                    trial_energy=None if trial_e_avg is None else float(np.real(trial_e_avg)),
+                    trial_error=None if trial_error is None else float(trial_error),
+                ),
+            )
         # the energy this run reports is the trial's, so that is the error to stop on
         if target > 0.0 and trial_error is not None and float(trial_error) <= target:
             print(f"\nTarget error {target:.3e} reached at block {start + n}.")

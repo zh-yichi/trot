@@ -20,6 +20,7 @@ from ..runtime_provenance import print_runtime_provenance
 from ..setup_mixed import JobMixed
 from ..staging import StagedInputs, TrialInput
 from ..staging import stage as stage_inputs
+from ..wavefunction_io import WavefunctionBasis
 from . import io as lno_io
 from .driver import FragQmcResult, run_frag_qmc
 from .mixed import LnoMixedRecipe, get_mixed_recipe
@@ -105,6 +106,8 @@ class LnoFragMixed(AfqmcMixed):
     reads the sizes from the compiled kernels, "analytic" uses the memory model, a number
     is a budget in MB for it. The device memory is read from nvidia-smi under the platform
     allocator, where jax itself reports no limit.
+    save_wavefunction : h5 file for the final walker population and its LNO basis
+        (AfqmcMixed.save_wavefunction, wavefunction_io).
     The remaining keywords are AfqmcMixed's (max_memory, nchol_chunk, mixed_precision
     with the per side guide_mixed_precision / trial_mixed_precision, chol_cut,
     n_eql_blocks, n_blocks, seed, dt, n_prop_steps, n_walkers, n_chunks, error_method,
@@ -139,6 +142,7 @@ class LnoFragMixed(AfqmcMixed):
         n_chunks: int | None = None,
         error_method: Literal["gamma", "blocking"] | None = "blocking",
         tau_eql: float | None = None,
+        save_wavefunction: Union[str, Path] | None = None,
     ):
         if tau_eql is not None and n_eql_blocks is not None:
             raise ValueError("pass either tau_eql or n_eql_blocks, not both.")
@@ -196,6 +200,9 @@ class LnoFragMixed(AfqmcMixed):
         self.max_memory = max_memory
         self.nchol_chunk = nchol_chunk
         self.tau_eql = None if tau_eql is None else float(tau_eql)
+        self.save_wavefunction_path = (
+            None if save_wavefunction is None else Path(save_wavefunction).expanduser()
+        )
 
         self.max_error = max_error
         self.stop_ratio = float(stop_ratio)
@@ -380,9 +387,61 @@ class LnoFragMixed(AfqmcMixed):
         self.guide_e_err = result.guide_stderr_energy
         self.e_tot = result.frag_mean_energy
         self.e_err = result.frag_stderr_energy
+        if self.save_wavefunction_path is not None:
+            path = self.save_wavefunction(self.save_wavefunction_path)
+            print(f"\nfragment AFQMC wavefunction written to {path}")
         return self.e_tot, self.e_err
 
-    run = kernel
+    def wavefunction_basis(self) -> WavefunctionBasis | tuple[WavefunctionBasis, WavefunctionBasis]:
+        """
+        The fragment's LNO basis, [frz_occ | act_occ | act_vir | frz_vir] per spin, with
+        the frozen LNOs (lno_frozen) split into the frozen occupied ones (the core the
+        wavefunction is the product with) and the frozen virtual ones.
+        """
+        frag = self.frag
+        if frag.unrestricted:
+            return tuple(
+                WavefunctionBasis.from_frozen_indices(
+                    np.asarray(frag.lno_coeff[s]),
+                    np.asarray(frag.lno_frozen[s]),
+                    int(frag.nfrzocc[s]) + int(frag.nactocc[s]),
+                    kind="lno",
+                )
+                for s in range(2)
+            )
+        return WavefunctionBasis.from_frozen_indices(
+            np.asarray(frag.lno_coeff),
+            np.asarray(frag.lno_frozen),
+            int(frag.nfrzocc) + int(frag.nactocc),
+            kind="lno",
+        )
+
+    def _wavefunction_meta(self) -> dict[str, Any]:
+        meta = super()._wavefunction_meta() if self._scf is not None else self._meta_without_mf()
+        meta.update(
+            frag_idx=int(self.frag.frag_idx),
+            frag_name=str(self.frag.frag_name),
+            emf=None if self.emf is None else float(self.emf),
+        )
+        return meta
+
+    def _meta_without_mf(self) -> dict[str, Any]:
+        """The run attributes of a fragment re-run from its file, which has no mean field."""
+        job = cast(JobMixed, self.job)
+        assert job is not None
+        params = cast(QmcParams, job.params)
+        return dict(
+            guide=self.guide,
+            trial=self.trial,
+            ham_basis=self.recipe.ham_basis,
+            norb=job.sys.norb,
+            dt=float(params.dt),
+            n_prop_steps=int(params.n_prop_steps),
+            n_eql_blocks=int(params.n_eql_blocks),
+            n_blocks=int(params.n_blocks),
+            seed=int(params.seed),
+            guide_mixed_precision=bool(self.guide_mixed_precision),
+        )
 
 
 # ======================================================================================
@@ -437,6 +496,8 @@ class LnoAfqmcMixed:
     pipeline, prefetch : run the CPU stage ahead on a thread, and how far ahead
     frag_output, lno_output : optional per-fragment logs / results table (lnoafqmc.io)
     save_frag_data : directory for the self-contained frag{i}.h5 files
+    save_wavefunction : directory for the fragments' final walker populations,
+        wavefunction{i}.h5 each (LnoFragMixed(save_wavefunction=...))
     isolate : run each fragment's AFQMC in a child process (python -m trot.lnoafqmc.run_frag)
     keep_qmc_results : keep every fragment's FragQmcResult in frag_qmc_results
     debug_memory : raise if device memory does not return to baseline after a fragment
@@ -470,6 +531,7 @@ class LnoAfqmcMixed:
         frag_output: Union[str, Path] | None = None,
         lno_output: Union[str, Path] | None = None,
         save_frag_data: Union[str, Path] | None = None,
+        save_wavefunction: Union[str, Path] | None = None,
         isolate: bool = False,
         keep_qmc_results: bool = False,
         debug_memory: bool = False,
@@ -598,6 +660,7 @@ class LnoAfqmcMixed:
         if self.isolate and save_frag_data is None and not self.frag_files:
             save_frag_data = "frag_data"  # the child process reads the fragment from its file
         self.save_frag_data = save_frag_data
+        self.save_wavefunction = save_wavefunction
         self.keep_qmc_results = bool(keep_qmc_results)
         self.debug_memory = bool(debug_memory)
         self.memory_tolerance_mb = float(memory_tolerance_mb)
@@ -733,6 +796,7 @@ class LnoAfqmcMixed:
         return Path(base) / f"{stem}{frag_idx + 1}.h5"
 
     def _frag_kwargs(self, frag_idx: int) -> dict[str, Any]:
+        wf_path = self._frag_path(self.save_wavefunction, frag_idx, "wavefunction")
         return dict(
             trial=self.trial,
             guide=self.guide,
@@ -740,6 +804,7 @@ class LnoAfqmcMixed:
             stop_ratio=self.stop_ratio,
             min_blocks=self.min_blocks,
             seed=self._frag_seed(frag_idx),
+            save_wavefunction=None if wf_path is None else str(wf_path),
             **self.qmc_kwargs,
         )
 

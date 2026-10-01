@@ -869,9 +869,15 @@ def run_qmc(
     mesh: Mesh | None = None,
     observable_names: tuple[str, ...] = (),
     runtime: QmcRuntime | None = None,
+    snapshot_fn: Callable[[PropState, dict[str, Any]], None] | None = None,
 ) -> QmcResult:
     """
     equilibration blocks then sampling blocks.
+
+    snapshot_fn, when given, is called with the walker state and a dict of where the run
+    is (phase "init" / "eql" / "sample", the block count reached in that phase, tau and
+    the energy so far) at tau = 0 and after every batch of blocks, at every printed row:
+    that is how the wavefunction snapshots are saved (Afqmc(save_wavefunction=...)).
 
     ``runtime`` transfers ownership of Hamiltonian/context replacements; normal
     Jobs supply it automatically. Separate array arguments are borrowed, so
@@ -958,6 +964,11 @@ def run_qmc(
         f"{int(state.node_encounters):10d}  "
         f"{0.0:8.1f}"
     )
+    block_time = float(params.dt) * int(params.n_prop_steps)
+    if snapshot_fn is not None:
+        snapshot_fn(
+            state, dict(phase="init", block=0, tau=0.0, energy=float(np.real(state.e_estimate)))
+        )
     chunk = print_every if print_every > 0 else 1
     for start in range(0, params.n_eql_blocks, chunk):
         n = min(chunk, params.n_eql_blocks - start)
@@ -985,6 +996,16 @@ def run_qmc(
             f"{int(state.node_encounters):10d}  "
             f"{elapsed:8.1f}"
         )
+        if snapshot_fn is not None:
+            snapshot_fn(
+                state,
+                dict(
+                    phase="eql",
+                    block=start + n,
+                    tau=(start + n) * block_time,
+                    energy=float(e_chunk_avg),
+                ),
+            )
     if meas_ops.retune_block_energy is not None:
         print("\nRetuning block-energy sampling after equilibration:")
 
@@ -1137,6 +1158,17 @@ def run_qmc(
             f"{elapsed:8.1f}"
             f"{diagnostic_text}"
         )
+        if snapshot_fn is not None:
+            snapshot_fn(
+                state,
+                dict(
+                    phase="sample",
+                    block=start + n,
+                    tau=(params.n_eql_blocks + start + n) * block_time,
+                    energy=float(mu),
+                    error=None if not np.isfinite(se) else float(se),
+                ),
+            )
         if (
             np.isfinite(se)
             and (error_analysis.reliable or error_analysis.error_method == "blocking")

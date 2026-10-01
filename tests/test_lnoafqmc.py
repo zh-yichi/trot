@@ -485,6 +485,60 @@ def test_frag_file_projected_doubles(o2, tmp_path):
     assert lst.load_frag(path3)[0].has_full_amplitudes
 
 
+def test_frag_wavefunction_file(o2, tmp_path):
+    """
+    A fragment's final population is saved in its LNO basis: the active LNOs in the
+    walkers' order, the frozen occupied LNOs as the core, the frozen virtual ones apart;
+    the fragment loop writes one file per fragment.
+    """
+    from trot.wavefunction_io import load_wavefunction, walker_ao_coefficients
+
+    mf, frag = o2["mf"], o2["frags"][0]
+    qmc: dict[str, Any] = dict(
+        n_walkers=6, n_eql_blocks=2, n_blocks=8, dt=0.005, n_prop_steps=4, seed=3
+    )
+    path = tmp_path / "wf1.h5"
+    with contextlib.redirect_stdout(io.StringIO()):
+        fm = LnoFragMixed(
+            mf, frag, chol_cut=CHOL_CUT, mixed_precision=False, save_wavefunction=path, **qmc
+        )
+        fm.kernel()
+    wf = load_wavefunction(path)
+    basis = wf["basis"]
+    frozen = np.sort(np.asarray(frag.lno_frozen)).tolist()
+    assert basis.kind == "lno" and basis.norb == fm.job.sys.norb
+    assert sorted(basis.frozen_occ.tolist() + basis.frozen_vir.tolist()) == frozen
+    assert basis.frozen_occ.size == frag.nfrzocc and basis.frozen_vir.size == frag.nfrzvir
+    assert basis.active.tolist() == [i for i in range(basis.coeff.shape[1]) if i not in frozen]
+    np.testing.assert_allclose(basis.coeff, np.asarray(frag.lno_coeff), atol=1e-14)
+    assert wf["walkers"].shape == (6, basis.norb, fm.job.sys.nup)
+    np.testing.assert_allclose(wf["walkers"], np.asarray(fm.qmc_result.final_state.walkers))
+    # the core, the active and the frozen virtual LNOs are orthonormal blocks
+    s1e = mf.get_ovlp()
+    ao = walker_ao_coefficients(wf)
+    assert np.abs(np.einsum("pi,pq,wqj->wij", basis.frozen_occ_coeff, s1e, ao)).max() < 1e-10
+    a = wf["attrs"]
+    assert a["frag_name"] == frag.frag_name and a["e_tot"] == pytest.approx(fm.e_tot)
+    # the loop: one file per fragment
+    with contextlib.redirect_stdout(io.StringIO()):
+        lno = LnoAfqmcMixed(
+            mf,
+            o2["lo_coeff"],
+            o2["frag_list"],
+            frag_name=o2["frag_name"],
+            lno_thresh=1e-12,
+            nfrozen=o2["nfrozen"],
+            chol_cut=CHOL_CUT,
+            run_frag=[1],
+            save_wavefunction=tmp_path / "wfs",
+            mixed_precision=False,
+            **qmc,
+        )
+        lno.kernel()
+    assert (tmp_path / "wfs" / "wavefunction2.h5").exists()
+    assert load_wavefunction(tmp_path / "wfs" / "wavefunction2.h5")["attrs"]["frag_idx"] == 1
+
+
 def test_frag_mixed_options(o2):
     mf, frag = o2["mf"], o2["frags"][0]
     with pytest.raises(ValueError, match="tau_eql or n_eql_blocks"):

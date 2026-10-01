@@ -310,8 +310,8 @@ def test_bar_and_chunk_trials_give_the_same_run(nh2_ucc, guide):
 @pytest.mark.parametrize("guide", ["uhf", "ucisd"])
 def test_guide_energy_uses_the_trial_chunk(nh2_ucc, guide):
     """
-    The UHF guide's local energy is summed over the trial's cholesky chunk, and the run
-    matches an unchunked one; the UCISD guide, which scans one vector at a time, is kept.
+    The guide's local energy (UHF and UCISD alike) is summed over the trial's cholesky
+    chunk, and the run matches an unchunked one.
     """
     runs = {}
     for chunk in (2, 10_000):
@@ -326,16 +326,15 @@ def test_guide_energy_uses_the_trial_chunk(nh2_ucc, guide):
         )
         job = _quiet(af.build_job)
         kernel = job.meas_ops.require_kernel("energy")
+        assert job.guide_nchol_chunk == job.mix_meas_ctx().nchol_chunk
         if guide == "uhf":
-            assert job.guide_nchol_chunk == job.mix_meas_ctx().nchol_chunk
             assert kernel.keywords["nchol_chunk"] == job.guide_nchol_chunk
         else:
-            assert job.guide_nchol_chunk is None
-            assert not hasattr(kernel, "keywords")
+            guide_ctx = job.meas_ops.build_meas_ctx(job.ham_data, job.trial_data)
+            assert guide_ctx.nchol_chunk == job.guide_nchol_chunk
         runs[chunk] = (af, *_quiet(af.kernel))
     (small, e_s, err_s), (whole, e_w, err_w) = runs[2], runs[10_000]
-    if guide == "uhf":
-        assert small.job.guide_nchol_chunk <= 2 < whole.job.guide_nchol_chunk
+    assert small.job.guide_nchol_chunk <= 2 < whole.job.guide_nchol_chunk
     assert e_s == pytest.approx(e_w, abs=1e-8)
     assert err_s == pytest.approx(err_w, abs=1e-8)
     assert small.guide_e_tot == pytest.approx(whole.guide_e_tot, abs=1e-8)
