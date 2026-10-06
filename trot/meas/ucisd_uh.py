@@ -21,6 +21,14 @@ meas/upt2ccsd_bar_uh.py does: every three index intermediate is built inside the
 the chunk rather than by the number of vectors. The chunk size and the mixed dtypes of
 the <C1 h2> and <C2 h2> contractions are the measurement context's (UcisdMeasCtxUh).
 
+The overlap and the force bias run at every propagation step, so their large products
+are kept few and real: the doubles meet the green's function as (nocc nvir, nocc nvir)
+matrix products, the force bias contracts the cholesky tensor once per spin (every term
+is linear in it), and a real matrix times a complex vector is two real products (_rdot)
+rather than a complex one. The force bias runs those products in the mixed dtypes of the
+measurement context; the overlap does only when asked (DEFAULT_OVERLAP_MIXED_PRECISION).
+The CI coefficients and the cholesky vectors are real.
+
 Conventions, per spin (dropping the spin label):
     green      (nocc, norb)   [phi (phi_occ)^-1]^T,   the half green's function
     green_occ  (nocc, nvir)   its virtual columns
@@ -34,6 +42,7 @@ alpha and beta bases to meas.ucisd's _uw_rh kernels (tests/test_uchol_ucisd.py).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import jax
@@ -60,19 +69,88 @@ def _greens(wa: jax.Array, wb: jax.Array, nocc_a: int, nocc_b: int):
     return green_a, green_b
 
 
-def overlap_uw_uh(walker: tuple[jax.Array, jax.Array], trial_data: UcisdTrial) -> jax.Array:
+# whether the overlap's <C2> products follow mixed_precision when make_ucisd_meas_ops_uh is
+# not told. Off: the overlap sets the walker weights, so it stays in the working precision
+DEFAULT_OVERLAP_MIXED_PRECISION: bool = False
+
+
+def _rdot(mat: jax.Array, vec: jax.Array) -> jax.Array:
+    """
+    mat @ vec for a real mat and a complex vec, as two real products: mat is not promoted
+    to complex, which would copy it and double the multiplications.
+    """
+    return lax.complex(mat @ jnp.real(vec), mat @ jnp.imag(vec))
+
+
+def _ldot(vec: jax.Array, mat: jax.Array) -> jax.Array:
+    """vec @ mat for a complex vec and a real mat, as _rdot."""
+    return lax.complex(jnp.real(vec) @ mat, jnp.imag(vec) @ mat)
+
+
+def _ci2_green_occ(
+    trial_data: UcisdTrial,
+    green_occ_a: jax.Array,
+    green_occ_b: jax.Array,
+    rtype: Any = None,
+    ctype: Any = None,
+    *,
+    with_ab_b: bool = True,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None]:
+    """
+    The doubles contracted with the virtual columns of the green's functions,
+
+        ci2g_a     c2aa_ptqu G^a_pt   (nocc_a, nvir_a)
+        ci2g_b     c2bb_ptqu G^b_pt   (nocc_b, nvir_b)
+        ci2g_ab_a  c2ab_ptqu G^b_qu   (nocc_a, nvir_a)
+        ci2g_ab_b  c2ab_ptqu G^a_pt   (nocc_b, nvir_b), None unless with_ab_b
+
+    each one (nocc nvir, nocc nvir) matrix product. rtype / ctype are the dtypes of the
+    products (None: those of the operands); the results come back in green's dtype.
+    """
+    wtype = green_occ_a.dtype
+    shape_a, shape_b = green_occ_a.shape, green_occ_b.shape
+    nov_a, nov_b = shape_a[0] * shape_a[1], shape_b[0] * shape_b[1]
+    g_a, g_b = green_occ_a.reshape(nov_a), green_occ_b.reshape(nov_b)
+    c2aa = trial_data.c2aa.reshape(nov_a, nov_a)
+    c2ab = trial_data.c2ab.reshape(nov_a, nov_b)
+    c2bb = trial_data.c2bb.reshape(nov_b, nov_b)
+    if ctype is not None:
+        g_a, g_b = g_a.astype(ctype), g_b.astype(ctype)
+    if rtype is not None:
+        c2aa, c2ab, c2bb = c2aa.astype(rtype), c2ab.astype(rtype), c2bb.astype(rtype)
+
+    ci2g_a = _ldot(g_a, c2aa).astype(wtype).reshape(shape_a)
+    ci2g_b = _ldot(g_b, c2bb).astype(wtype).reshape(shape_b)
+    ci2g_ab_a = _rdot(c2ab, g_b).astype(wtype).reshape(shape_a)
+    ci2g_ab_b = _ldot(g_a, c2ab).astype(wtype).reshape(shape_b) if with_ab_b else None
+    return ci2g_a, ci2g_b, ci2g_ab_a, ci2g_ab_b
+
+
+def overlap_uw_uh(
+    walker: tuple[jax.Array, jax.Array],
+    trial_data: UcisdTrial,
+    *,
+    rtype: Any = None,
+    ctype: Any = None,
+) -> jax.Array:
+    """
+    <T|phi>. rtype / ctype are the dtypes of the <C2> products (None: the working
+    precision); the determinants, <C1> and the sums are always in the working precision.
+    """
     wa, wb = walker
     nocc_a, nocc_b = trial_data.nocc
     c1a, c1b = trial_data.c1a, trial_data.c1b
-    c2aa, c2ab, c2bb = trial_data.c2aa, trial_data.c2ab, trial_data.c2bb
     green_a, green_b = _greens(wa, wb, nocc_a, nocc_b)
-    green_a, green_b = green_a[:, nocc_a:], green_b[:, nocc_b:]
+    green_occ_a, green_occ_b = green_a[:, nocc_a:], green_b[:, nocc_b:]
     o0 = jnp.linalg.det(wa[:nocc_a, :]) * jnp.linalg.det(wb[:nocc_b, :])
-    o1 = jnp.einsum("ia,ia", c1a, green_a) + jnp.einsum("ia,ia", c1b, green_b)
+    o1 = jnp.einsum("ia,ia", c1a, green_occ_a) + jnp.einsum("ia,ia", c1b, green_occ_b)
+    ci2g_a, ci2g_b, ci2g_ab_a, _ = _ci2_green_occ(
+        trial_data, green_occ_a, green_occ_b, rtype, ctype, with_ab_b=False
+    )
     o2 = (
-        0.5 * jnp.einsum("iajb,ia,jb", c2aa, green_a, green_a, optimize="optimal")
-        + 0.5 * jnp.einsum("iajb,ia,jb", c2bb, green_b, green_b, optimize="optimal")
-        + jnp.einsum("iajb,ia,jb", c2ab, green_a, green_b, optimize="optimal")
+        0.5 * jnp.einsum("qu,qu->", ci2g_a, green_occ_a)
+        + 0.5 * jnp.einsum("qu,qu->", ci2g_b, green_occ_b)
+        + jnp.einsum("pt,pt->", ci2g_ab_a, green_occ_a)
     )
     return (1.0 + o1 + o2) * o0
 
@@ -109,64 +187,72 @@ def build_meas_ctx_uh(
     return UcisdMeasCtxUh(cfg=cfg, nchol_chunk=nchol_chunk)
 
 
+def _chol_dot_ci_green(
+    chol: jax.Array,
+    green: jax.Array,
+    ci_green_occ: jax.Array,
+    overlap: jax.Array,
+    rtype: Any,
+    ctype: Any,
+) -> jax.Array:
+    """
+    One spin of <T| L_g |phi> / <T|phi>. The reference, single and double excitation
+    terms are all linear in the cholesky vector, so they are summed first and chol is
+    contracted once:
+
+        fb_g = sum_ij L_g,ij [ (G; 0) - greenp ci_green_occ^T G / overlap ]_ij
+
+    with ci_green_occ = c1 + c2 . green_occ, (nocc, nvir), and (G; 0) the green's function
+    padded with zero rows to (norb, norb). The (n_chol, norb^2) product is in rtype / ctype.
+    """
+    nocc, norb = green.shape
+    greenp = jnp.vstack((green[:, nocc:], -jnp.eye(norb - nocc)))
+    lin = -((greenp @ ci_green_occ.T) @ green) / overlap
+    lin = lin.at[:nocc, :].add(green)
+    chol_flat = chol.reshape(chol.shape[0], norb * norb).astype(rtype)
+    return _rdot(chol_flat, lin.reshape(norb * norb).astype(ctype)).astype(green.dtype)
+
+
 def force_bias_kernel_uw_uh(
     walker: tuple[jax.Array, jax.Array],
     ham_data: HamCholU,
     meas_ctx: UcisdMeasCtxUh,
     trial_data: UcisdTrial,
 ) -> jax.Array:
-    """<T| L_g |phi> / <T|phi> for every cholesky vector g."""
+    """
+    <T| L_g |phi> / <T|phi> for every cholesky vector g. The products with the doubles
+    and with the cholesky tensor run in the mixed dtypes of meas_ctx.cfg: the force bias
+    only shifts the sampled fields, so its precision does not bias the walk.
+    """
+    cfg = meas_ctx.cfg
+    rtype = cfg.mixed_real_dtype
+    ctype = cfg.mixed_complex_dtype
+
     wa, wb = walker
     nocc_a, nocc_b = trial_data.nocc
-    norb_a, norb_b = wa.shape[0], wb.shape[0]
     c1a, c1b = trial_data.c1a, trial_data.c1b
-    c2aa, c2ab, c2bb = trial_data.c2aa, trial_data.c2ab, trial_data.c2bb
     green_a, green_b = _greens(wa, wb, nocc_a, nocc_b)
     green_occ_a = green_a[:, nocc_a:]
     green_occ_b = green_b[:, nocc_b:]
-    greenp_a = jnp.vstack((green_occ_a, -jnp.eye(norb_a - nocc_a)))
-    greenp_b = jnp.vstack((green_occ_b, -jnp.eye(norb_b - nocc_b)))
 
-    chol_a, chol_b = ham_data.chol_a, ham_data.chol_b
-    rot_chol_a = chol_a[:, :nocc_a, :]
-    rot_chol_b = chol_b[:, :nocc_b, :]
-    lg_a = jnp.einsum("gpj,pj->g", rot_chol_a, green_a)
-    lg_b = jnp.einsum("gpj,pj->g", rot_chol_b, green_b)
-    lg = lg_a + lg_b
-
-    # reference
-    fb_0 = lg
-
-    # single excitations
     ci1g = jnp.einsum("pt,pt->", c1a, green_occ_a) + jnp.einsum("pt,pt->", c1b, green_occ_b)
-    fb_1_1 = ci1g * lg
-    ci1gp_a = jnp.einsum("pt,it->pi", c1a, greenp_a)
-    ci1gp_b = jnp.einsum("pt,it->pi", c1b, greenp_b)
-    gci1gp_a = jnp.einsum("pj,pi->ij", green_a, ci1gp_a)
-    gci1gp_b = jnp.einsum("pj,pi->ij", green_b, ci1gp_b)
-    fb_1_2 = -jnp.einsum("gij,ij->g", chol_a, gci1gp_a) - jnp.einsum("gij,ij->g", chol_b, gci1gp_b)
-    fb_1 = fb_1_1 + fb_1_2
-
-    # double excitations
-    ci2g_a = jnp.einsum("ptqu,pt->qu", c2aa, green_occ_a)
-    ci2g_b = jnp.einsum("ptqu,pt->qu", c2bb, green_occ_b)
-    ci2g_ab_a = jnp.einsum("ptqu,qu->pt", c2ab, green_occ_b)
-    ci2g_ab_b = jnp.einsum("ptqu,pt->qu", c2ab, green_occ_a)
+    ci2g_a, ci2g_b, ci2g_ab_a, ci2g_ab_b = _ci2_green_occ(
+        trial_data, green_occ_a, green_occ_b, rtype, ctype
+    )
     gci2g = (
         0.5 * jnp.einsum("qu,qu->", ci2g_a, green_occ_a)
         + 0.5 * jnp.einsum("qu,qu->", ci2g_b, green_occ_b)
         + jnp.einsum("pt,pt->", ci2g_ab_a, green_occ_a)
     )
-    fb_2_1 = lg * gci2g
-    ci2_green_a = (greenp_a @ (ci2g_a + ci2g_ab_a).T) @ green_a
-    ci2_green_b = (greenp_b @ (ci2g_b + ci2g_ab_b).T) @ green_b
-    fb_2_2 = -jnp.einsum("gij,ij->g", chol_a, ci2_green_a) - jnp.einsum(
-        "gij,ij->g", chol_b, ci2_green_b
-    )
-    fb_2 = fb_2_1 + fb_2_2
-
     overlap = 1.0 + ci1g + gci2g
-    return (fb_0 + fb_1 + fb_2) / overlap
+
+    fb_a = _chol_dot_ci_green(
+        ham_data.chol_a, green_a, c1a + ci2g_a + ci2g_ab_a, overlap, rtype, ctype
+    )
+    fb_b = _chol_dot_ci_green(
+        ham_data.chol_b, green_b, c1b + ci2g_b + ci2g_ab_b, overlap, rtype, ctype
+    )
+    return fb_a + fb_b
 
 
 def _chunk_terms(
@@ -371,13 +457,16 @@ def make_ucisd_meas_ops_uh(
     *,
     testing: bool = False,
     nchol_chunk: int | None = None,
+    overlap_mixed_precision: bool | None = None,
 ) -> MeasOps:
     """
     MeasOps of the UCISD trial on the unrestricted hamiltonian. Only unrestricted walkers
-    are meaningful, as for make_uhf_meas_ops_uh. mixed_precision runs the local energy's
-    <C1 h2> and <C2 h2> contractions in single precision; the overlap and the force bias
-    stay in the working precision. nchol_chunk caps the cholesky vectors per step of the
-    local energy's scan (None: DEFAULT_NCHOL_CHUNK).
+    are meaningful, as for make_uhf_meas_ops_uh. mixed_precision runs in single precision
+    the local energy's <C1 h2> and <C2 h2> contractions and the force bias's products with
+    the doubles and the cholesky tensor. The overlap stays in the working precision unless
+    overlap_mixed_precision (None: DEFAULT_OVERLAP_MIXED_PRECISION) is set as well, which
+    runs its <C2> products in single precision too. nchol_chunk caps the cholesky vectors
+    per step of the local energy's scan (None: DEFAULT_NCHOL_CHUNK).
     """
     wk = sys.walker_kind.lower()
     if wk != "unrestricted":
@@ -387,8 +476,13 @@ def make_ucisd_meas_ops_uh(
     cfg = make_chunk_meas_cfg(
         mixed_precision=mixed_precision, testing=testing, nchol_chunk=nchol_chunk
     )
+    if overlap_mixed_precision is None:
+        overlap_mixed_precision = DEFAULT_OVERLAP_MIXED_PRECISION
+    overlap = overlap_uw_uh
+    if mixed_precision and overlap_mixed_precision:
+        overlap = partial(overlap_uw_uh, rtype=cfg.mixed_real_dtype, ctype=cfg.mixed_complex_dtype)
     meas_ops = MeasOps(
-        overlap=overlap_uw_uh,
+        overlap=overlap,
         build_meas_ctx=lambda ham_data, trial_data: build_meas_ctx_uh(ham_data, trial_data, cfg),
         kernels={k_force_bias: force_bias_kernel_uw_uh, k_energy: energy_kernel_uw_uh},
         observables={},

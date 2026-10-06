@@ -6,6 +6,8 @@ Checks:
     and energy kernels reproduce meas.ucisd's restricted-hamiltonian kernels with the
     beta rotation set to the identity;
   - with every CI coefficient zero they reduce to the uchol UHF kernels;
+  - the overlap and the force bias, which sum their terms before the large products,
+    reproduce the term by term formulas they replace on unstructured random input;
   - a restricted CCSD converted with convert_to_uccsd gives the same run as Afqmc with
     unrestricted walkers (same seed), since the beta basis equals the alpha basis;
   - the energy at tau = 0 is the UCCSD energy, with and without a frozen core;
@@ -164,6 +166,152 @@ def test_mixed_precision_energy(random_pair):
         # loose: float32 matmuls on a GPU (TF32) are only good to ~1e-4
         assert complex(e_mp) == pytest.approx(complex(e_dp), rel=1e-2)
         assert complex(e_mp) != complex(e_dp)
+
+
+def _overlap_term_by_term(walker, td):
+    """afqmc's _calc_overlap as ported first: one einsum per term, all in double."""
+    wa, wb = walker
+    nocc_a, nocc_b = td.nocc
+    green_a = (wa @ jnp.linalg.inv(wa[:nocc_a, :])).T[:, nocc_a:]
+    green_b = (wb @ jnp.linalg.inv(wb[:nocc_b, :])).T[:, nocc_b:]
+    o0 = jnp.linalg.det(wa[:nocc_a, :]) * jnp.linalg.det(wb[:nocc_b, :])
+    o1 = jnp.einsum("ia,ia", td.c1a, green_a) + jnp.einsum("ia,ia", td.c1b, green_b)
+    o2 = (
+        0.5 * jnp.einsum("iajb,ia,jb", td.c2aa, green_a, green_a)
+        + 0.5 * jnp.einsum("iajb,ia,jb", td.c2bb, green_b, green_b)
+        + jnp.einsum("iajb,ia,jb", td.c2ab, green_a, green_b)
+    )
+    return (1.0 + o1 + o2) * o0
+
+
+def _force_bias_term_by_term(walker, ham, td):
+    """afqmc's _calc_force_bias as ported first: chol contracted once per term."""
+    wa, wb = walker
+    nocc_a, nocc_b = td.nocc
+    norb_a, norb_b = wa.shape[0], wb.shape[0]
+    green_a = (wa @ jnp.linalg.inv(wa[:nocc_a, :])).T
+    green_b = (wb @ jnp.linalg.inv(wb[:nocc_b, :])).T
+    green_occ_a, green_occ_b = green_a[:, nocc_a:], green_b[:, nocc_b:]
+    greenp_a = jnp.vstack((green_occ_a, -jnp.eye(norb_a - nocc_a)))
+    greenp_b = jnp.vstack((green_occ_b, -jnp.eye(norb_b - nocc_b)))
+    chol_a, chol_b = ham.chol_a, ham.chol_b
+    lg = jnp.einsum("gpj,pj->g", chol_a[:, :nocc_a, :], green_a) + jnp.einsum(
+        "gpj,pj->g", chol_b[:, :nocc_b, :], green_b
+    )
+
+    ci1g = jnp.einsum("pt,pt->", td.c1a, green_occ_a) + jnp.einsum("pt,pt->", td.c1b, green_occ_b)
+    ci1gp_a = jnp.einsum("pt,it->pi", td.c1a, greenp_a)
+    ci1gp_b = jnp.einsum("pt,it->pi", td.c1b, greenp_b)
+    gci1gp_a = jnp.einsum("pj,pi->ij", green_a, ci1gp_a)
+    gci1gp_b = jnp.einsum("pj,pi->ij", green_b, ci1gp_b)
+    fb_1 = (
+        ci1g * lg
+        - jnp.einsum("gij,ij->g", chol_a, gci1gp_a)
+        - jnp.einsum("gij,ij->g", chol_b, gci1gp_b)
+    )
+
+    ci2g_a = jnp.einsum("ptqu,pt->qu", td.c2aa, green_occ_a)
+    ci2g_b = jnp.einsum("ptqu,pt->qu", td.c2bb, green_occ_b)
+    ci2g_ab_a = jnp.einsum("ptqu,qu->pt", td.c2ab, green_occ_b)
+    ci2g_ab_b = jnp.einsum("ptqu,pt->qu", td.c2ab, green_occ_a)
+    gci2g = (
+        0.5 * jnp.einsum("qu,qu->", ci2g_a, green_occ_a)
+        + 0.5 * jnp.einsum("qu,qu->", ci2g_b, green_occ_b)
+        + jnp.einsum("pt,pt->", ci2g_ab_a, green_occ_a)
+    )
+    ci2_green_a = (greenp_a @ (ci2g_a + ci2g_ab_a).T) @ green_a
+    ci2_green_b = (greenp_b @ (ci2g_b + ci2g_ab_b).T) @ green_b
+    fb_2 = (
+        lg * gci2g
+        - jnp.einsum("gij,ij->g", chol_a, ci2_green_a)
+        - jnp.einsum("gij,ij->g", chol_b, ci2_green_b)
+    )
+    return (lg + fb_1 + fb_2) / (1.0 + ci1g + gci2g)
+
+
+@pytest.mark.parametrize(
+    "norb, nocc, nchol",
+    [((6, 6), (3, 2), 7), ((7, 5), (2, 4), 5), ((5, 8), (1, 3), 9), ((4, 6), (3, 1), 1)],
+)
+@pytest.mark.parametrize("walker_kind", ["near_reference", "orthonormal", "gaussian"])
+def test_overlap_and_force_bias_match_term_by_term(norb, nocc, nchol, walker_kind):
+    """
+    Nothing in the input is structured: norb and nocc differ between the spins, the
+    doubles carry no index symmetry and the cholesky vectors are not symmetric, so a
+    transposed or mispaired index in the summed form shows up.
+    """
+    (norb_a, norb_b), (nocc_a, nocc_b) = norb, nocc
+    nvir_a, nvir_b = norb_a - nocc_a, norb_b - nocc_b
+    rng = np.random.default_rng(norb_a + 10 * nocc_b + 100 * nchol)
+    r = lambda *shape: jnp.asarray(rng.normal(size=shape))
+    ham = HamCholU(
+        h0=jnp.asarray(0.0),
+        h1_a=r(norb_a, norb_a),
+        h1_b=r(norb_b, norb_b),
+        chol_a=r(nchol, norb_a, norb_a),
+        chol_b=r(nchol, norb_b, norb_b),
+    )
+    td = UcisdTrial(
+        mo_coeff_a=jnp.eye(norb_a),
+        mo_coeff_b=jnp.eye(norb_b),
+        c1a=0.3 * r(nocc_a, nvir_a),
+        c1b=0.3 * r(nocc_b, nvir_b),
+        c2aa=0.3 * r(nocc_a, nvir_a, nocc_a, nvir_a),
+        c2ab=0.3 * r(nocc_a, nvir_a, nocc_b, nvir_b),
+        c2bb=0.3 * r(nocc_b, nvir_b, nocc_b, nvir_b),
+    )
+    n_walkers = 16
+
+    def walkers(n, o):
+        x = rng.normal(size=(n_walkers, n, o)) + 1j * rng.normal(size=(n_walkers, n, o))
+        if walker_kind == "orthonormal":
+            x = np.linalg.qr(x)[0]
+        elif walker_kind == "near_reference":
+            x = 0.2 * x
+            x[:, :o] += np.eye(o)
+        return jnp.asarray(x)
+
+    w = (walkers(norb_a, nocc_a), walkers(norb_b, nocc_b))
+    ctx = build_meas_ctx_uh(ham, td)
+    o_new = jax.vmap(overlap_uw_uh, (0, None))(w, td)
+    o_ref = jax.vmap(_overlap_term_by_term, (0, None))(w, td)
+    np.testing.assert_allclose(np.asarray(o_new), np.asarray(o_ref), rtol=1e-10)
+    fb_new = jax.vmap(force_bias_kernel_uw_uh, (0, None, None, None))(w, ham, ctx, td)
+    fb_ref = jax.vmap(_force_bias_term_by_term, (0, None, None))(w, ham, td)
+    scale = np.max(np.abs(np.asarray(fb_ref)), axis=1, keepdims=True)
+    np.testing.assert_allclose(np.asarray(fb_new) / scale, np.asarray(fb_ref) / scale, atol=1e-10)
+
+
+def test_mixed_precision_force_bias_and_overlap(random_pair):
+    """
+    mixed_precision moves the force bias's large products to single precision; the
+    overlap follows only with overlap_mixed_precision.
+    """
+    ham_u, trial, sys_u = random_pair["ham_u"], random_pair["trial"], random_pair["sys_u"]
+    wa, wb = random_pair["walkers"]
+    dp = make_ucisd_meas_ops_uh(sys_u, mixed_precision=False)
+    mp = make_ucisd_meas_ops_uh(sys_u, mixed_precision=True)
+    mp_ovlp = make_ucisd_meas_ops_uh(sys_u, mixed_precision=True, overlap_mixed_precision=True)
+    assert dp.overlap is overlap_uw_uh and mp.overlap is overlap_uw_uh
+    # the overlap flag alone does nothing: it rides on mixed_precision
+    assert (
+        make_ucisd_meas_ops_uh(sys_u, mixed_precision=False, overlap_mixed_precision=True).overlap
+        is overlap_uw_uh
+    )
+    ctx_dp, ctx_mp = dp.build_meas_ctx(ham_u, trial), mp.build_meas_ctx(ham_u, trial)
+    for i in range(wa.shape[0]):
+        w = (wa[i], wb[i])
+        fb_dp = force_bias_kernel_uw_uh(w, ham_u, ctx_dp, trial)
+        fb_mp = force_bias_kernel_uw_uh(w, ham_u, ctx_mp, trial)
+        assert fb_mp.dtype == fb_dp.dtype
+        # loose: float32 matmuls on a GPU (TF32) are only good to ~1e-4
+        np.testing.assert_allclose(np.asarray(fb_mp), np.asarray(fb_dp), rtol=1e-2, atol=1e-3)
+        assert not np.array_equal(np.asarray(fb_mp), np.asarray(fb_dp))
+
+        o_dp, o_mp = dp.overlap(w, trial), mp_ovlp.overlap(w, trial)
+        assert o_mp.dtype == o_dp.dtype
+        assert complex(o_mp) == pytest.approx(complex(o_dp), rel=1e-3)
+        assert complex(o_mp) != complex(o_dp)
 
 
 def test_zero_coefficients_reduce_to_uhf(random_pair):
