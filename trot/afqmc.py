@@ -349,14 +349,8 @@ class Afqmc:
         """
 
         if self.cisd_workflow is None:
-            raise ValueError(
-                "prepare_cisd_trial_cache requires cisd_workflow to be configured."
-            )
-        cache_path = (
-            Path(path).expanduser().resolve()
-            if path is not None
-            else self.cache
-        )
+            raise ValueError("prepare_cisd_trial_cache requires cisd_workflow to be configured.")
+        cache_path = Path(path).expanduser().resolve() if path is not None else self.cache
         if cache_path is None:
             raise ValueError(
                 "prepare_cisd_trial_cache requires a path argument or Afqmc(cache=...)."
@@ -499,15 +493,15 @@ class Afqmc:
         leading columns and the active orbitals after it, in the order the walkers use.
         One set for a restricted hamiltonian, an (alpha, beta) pair for the unrestricted one.
         """
-        job = self.build_job()
+        staged = self.stage()
         if self._scf is None:
             raise ValueError("the wavefunction basis needs the mean field object (mo_coeff).")
-        frozen = job.staged.meta.get("frozen")
+        frozen = staged.meta.get("frozen")
         if frozen is None:
             frozen = int(self.norb_frozen_core or 0)
         frozen = np.asarray(frozen, dtype=np.int64).reshape(-1)
         mo = np.asarray(self._scf.mo_coeff)
-        ham_basis = str(getattr(job.ham_data, "basis", "restricted"))
+        ham_basis = str(getattr(staged.ham, "basis", "restricted"))
         if ham_basis == "uchol":
             basis_a, basis_b = getattr(self, "basis_a", None), getattr(self, "basis_b", None)
             if basis_a is not None and basis_b is not None:
@@ -1214,7 +1208,10 @@ from .wavefunction_io import (  # noqa: E402
     dump_wavefunction,
 )
 from .staging import StagedMfOrCc  # noqa: E402
-from .staging_u import stage_ham_input_df  # noqa: E402
+from .staging_u import is_uchol_file, stage_ham_input_df  # noqa: E402
+
+MIXED_STAGED_FORMAT = "trot_afqmc_mixed_staged"
+MIXED_STAGED_FORMAT_VERSION = 1
 
 
 def _kernel_location(fn: Any) -> str:
@@ -1321,11 +1318,29 @@ class AfqmcMixed(Afqmc):
         ``snapshots.json``. ``save_wavefunction(path)`` writes the final population of a
         finished run to one file.
     The remaining parameters are those of ``Afqmc``.
+
+    Two machines. ``save_staged(path)`` writes everything the run needs for its guide and
+    trial to one h5 file: the hamiltonian (h0, h1, cholesky vectors), the guide's trial
+    data, the pt2CCSD trial's amplitudes, and the orbital basis for the wavefunction
+    files. It only stages, nothing is put on a device, so it can run where the mean field
+    and the CC were made; ``AfqmcMixed.from_staged(path, ...)`` then starts the AFQMC
+    from the file with no pyscf object::
+
+        AfqmcMixed(mycc, guide="uhf", trial="upt2ccsd_bar").save_staged("mixed.h5")
+        # later, on the GPU
+        af = AfqmcMixed.from_staged("mixed.h5", n_walkers=300, n_blocks=400, seed=7)
+        e, err = af.kernel()
     """
 
     params_cls = QmcParams
     job_cls = JobMixed
     setup_fn = staticmethod(setup_mixed)
+
+    # set by from_staged: the file the run was loaded from, and what it carries in place
+    # of the mean field (the wavefunction basis, the molecule's attributes)
+    staged_file: Path | None = None
+    _staged_wfn_basis: Any = None
+    _staged_mol_meta: dict[str, Any] = {}
 
     def __init__(
         self,
@@ -1412,11 +1427,34 @@ class AfqmcMixed(Afqmc):
             n_chunks=n_chunks,
             error_method=error_method,
         )
-        defaults = self.params_cls()
-        self.n_prop_steps = defaults.n_prop_steps if n_prop_steps is None else n_prop_steps
-
         self.basis_a = None if basis_a is None else np.asarray(basis_a)
         self.basis_b = None if basis_b is None else np.asarray(basis_b)
+        self._init_mixed_options(
+            n_prop_steps=n_prop_steps,
+            nchol_chunk=nchol_chunk,
+            max_memory=max_memory,
+            mixed_precision=mixed_precision,
+            guide_mixed_precision=guide_mixed_precision,
+            trial_mixed_precision=trial_mixed_precision,
+            tau_eql=tau_eql,
+            save_wavefunction=save_wavefunction,
+        )
+
+    def _init_mixed_options(
+        self,
+        *,
+        n_prop_steps: int | None,
+        nchol_chunk: int | None,
+        max_memory: float | str | None,
+        mixed_precision: bool,
+        guide_mixed_precision: bool | None,
+        trial_mixed_precision: bool | None,
+        tau_eql: float | None,
+        save_wavefunction: Union[bool, str, Path] | None,
+    ) -> None:
+        """The run options on top of Afqmc's, shared by __init__ and from_staged."""
+        defaults = self.params_cls()
+        self.n_prop_steps = defaults.n_prop_steps if n_prop_steps is None else n_prop_steps
         self.walker_kind = cast(WalkerKind, self.recipe.walker_kind)
         self.mixed_precision = mixed_precision
         self.guide_mixed_precision = (
@@ -1485,6 +1523,10 @@ class AfqmcMixed(Afqmc):
         staging does. The trial is staged by its own spec. Both get the CC object's
         frozen core.
         """
+        if self.staged_file is not None:
+            assert self._staged is not None
+            return self._staged
+
         key = self._key()
         if self._staged is not None and self._cache_key == key and not force:
             return self._staged
@@ -1739,9 +1781,207 @@ class AfqmcMixed(Afqmc):
         )
         return self._dump_wavefunction(path, result.final_state, meta)
 
-    @classmethod
-    def from_staged(cls, path: Union[str, Path], **kwargs: Any):  # type: ignore[override]
-        raise NotImplementedError(
-            "AfqmcMixed stages the trial from the CC object; pass the CC object and use "
-            "cache= for the guide's staged inputs."
+    # ------------------------------------------------------------------ staged files
+
+    def wavefunction_basis(self) -> WavefunctionBasis | tuple[WavefunctionBasis, WavefunctionBasis]:
+        """Afqmc.wavefunction_basis, or the basis the staged file carries (from_staged)."""
+        if self._staged_wfn_basis is not None:
+            return self._staged_wfn_basis
+        return super().wavefunction_basis()
+
+    def _wavefunction_meta(self) -> dict[str, Any]:
+        meta = super()._wavefunction_meta()
+        meta.update(self._staged_mol_meta)
+        return meta
+
+    def _mol_meta(self) -> dict[str, Any]:
+        if self._scf is None:
+            return dict(self._staged_mol_meta)
+        mol = self._scf.mol
+        return dict(
+            nelectron=int(mol.nelectron),
+            spin=int(mol.spin),
+            charge=int(mol.charge),
+            ao_basis=str(getattr(mol, "basis", "")),
         )
+
+    def save_staged(self, path: Union[str, Path]) -> Path:  # type: ignore[override]
+        """
+        Write everything this guide + trial run needs to one h5 file, for
+        AfqmcMixed.from_staged: the guide's staged inputs in staging's layout (the
+        hamiltonian h0 / h1 / cholesky vectors and the guide's trial data; staging_u's
+        layout on the unrestricted hamiltonian), and next to them
+
+            mixed_trial/   the measurement trial's TrialInput (the pt2CCSD amplitudes)
+            mixed/         the guide and trial names, the mean field energy, the
+                           molecule's attributes and the wavefunction basis (the MO
+                           coefficients with the frozen core), so that the run can still
+                           write wavefunction files
+
+        Only the staging runs (mean field / CC objects on the host); no job is built and
+        nothing is put on a device.
+        """
+        import h5py
+
+        staged = self.stage()
+        trial_input = self._trial_input
+        assert trial_input is not None
+        p = Path(path).expanduser().resolve()
+        if getattr(staged.ham, "basis", None) == "uchol":
+            dump_staged_uh(staged, p)
+        else:
+            dump_staged(staged, p)
+        bases = self.wavefunction_basis()
+        bases = bases if isinstance(bases, tuple) else (bases,)
+        with h5py.File(p, "a") as f:
+            gtr = f.create_group("mixed_trial")
+            gtr.attrs["kind"] = trial_input.kind
+            gtr.attrs["source_kind"] = trial_input.source_kind
+            gtr.create_dataset("frozen", data=np.asarray(trial_input.frozen, dtype=np.int64))
+            gdata = gtr.create_group("data")
+            for k, v in trial_input.data.items():
+                gdata.create_dataset(k, data=np.asarray(v))
+
+            g = f.create_group("mixed")
+            g.attrs["format"] = MIXED_STAGED_FORMAT
+            g.attrs["format_version"] = MIXED_STAGED_FORMAT_VERSION
+            g.attrs["guide"] = self.guide
+            g.attrs["trial"] = self.trial
+            g.attrs["ham_basis"] = self.recipe.ham_basis
+            g.attrs["mol_meta_json"] = json.dumps(self._mol_meta())
+            if self._scf is not None:
+                g.attrs["e_mf"] = float(self._scf.e_tot)
+            if self._cc is not None and getattr(self._cc, "e_tot", None) is not None:
+                g.attrs["e_cc"] = float(self._cc.e_tot)
+            for name, b in zip(("basis",) if len(bases) == 1 else ("basis_a", "basis_b"), bases):
+                gb = g.create_group(name)
+                gb.attrs["kind"] = b.kind
+                gb.create_dataset("coeff", data=b.coeff)
+                gb.create_dataset("active", data=b.active)
+                gb.create_dataset("frozen_occ", data=b.frozen_occ)
+                gb.create_dataset("frozen_vir", data=b.frozen_vir)
+        print(f"staged guide ({self.guide}) and trial ({self.trial}) written to {p}")
+        return p
+
+    @classmethod
+    def from_staged(  # type: ignore[override]
+        cls,
+        path: Union[str, Path],
+        *,
+        trial: str | None = None,
+        guide: str | None = None,
+        nchol_chunk: int | None = None,
+        max_memory: float | str | None = None,
+        mixed_precision: bool = True,
+        guide_mixed_precision: bool | None = None,
+        trial_mixed_precision: bool | None = None,
+        n_eql_blocks: int | None = None,
+        n_blocks: int | None = None,
+        seed: int | None = None,
+        dt: float | None = None,
+        n_prop_steps: int | None = None,
+        n_walkers: int | None = None,
+        n_chunks: int | None = None,
+        error_method: Literal["gamma", "blocking"] | None = "blocking",
+        tau_eql: float | None = None,
+        save_wavefunction: Union[bool, str, Path] | None = None,
+    ) -> "AfqmcMixed":
+        """
+        The run from a file save_staged wrote, with no mean field or CC object: the
+        hamiltonian, the guide and the trial are read from the file, so the frozen core
+        and chol_cut are the file's. trial and guide default to the ones the file was
+        written for; another one may be named as long as it is built from the same staged
+        data (trial="upt2ccsd" on a file written for "upt2ccsd_bar", say). The other
+        parameters are those of AfqmcMixed.
+        """
+        import h5py
+
+        if tau_eql is not None and n_eql_blocks is not None:
+            raise ValueError("pass either tau_eql or n_eql_blocks, not both.")
+        if tau_eql is not None and float(tau_eql) < 0.0:
+            raise ValueError(f"tau_eql must be non-negative, got {tau_eql}.")
+        p = Path(path).expanduser().resolve()
+        with h5py.File(p, "r") as f:
+            if "mixed" not in f or f["mixed"].attrs.get("format") != MIXED_STAGED_FORMAT:
+                raise ValueError(
+                    f"{p} carries no measurement trial: it was not written by "
+                    "AfqmcMixed.save_staged."
+                )
+            g: Any = f["mixed"]
+            file_guide, file_trial = str(g.attrs["guide"]), str(g.attrs["trial"])
+            ham_basis = str(g.attrs["ham_basis"])
+            mol_meta = json.loads(str(g.attrs["mol_meta_json"]))
+            names = ("basis",) if "basis" in g else ("basis_a", "basis_b")
+            bases = tuple(
+                WavefunctionBasis(
+                    coeff=np.array(g[name]["coeff"]),
+                    active=np.array(g[name]["active"]),
+                    frozen_occ=np.array(g[name]["frozen_occ"]),
+                    frozen_vir=np.array(g[name]["frozen_vir"]),
+                    kind=str(g[name].attrs["kind"]),
+                )
+                for name in names
+            )
+            gtr: Any = f["mixed_trial"]
+            frozen = np.array(gtr["frozen"])
+            trial_input = staging.TrialInput(
+                kind=str(gtr.attrs["kind"]),
+                data={k: np.array(gtr["data"][k]) for k in gtr["data"].keys()},
+                frozen=int(frozen) if frozen.ndim == 0 else frozen,
+                source_kind=str(gtr.attrs["source_kind"]),
+            )
+        staged = load_staged_uh(p) if is_uchol_file(p) else load_staged(p)
+
+        recipe = get_mixed_recipe(file_trial if trial is None else trial, guide or file_guide)
+        if recipe.ham_basis != ham_basis:
+            raise ValueError(
+                f"trial={recipe.trial!r} runs on the {recipe.ham_basis!r} hamiltonian, but {p} "
+                f"was staged for {file_trial!r} on the {ham_basis!r} one."
+            )
+        if trial_input.kind != recipe.trial_spec.kind:
+            raise ValueError(
+                f"trial={recipe.trial!r} needs staged data of kind {recipe.trial_spec.kind!r}, "
+                f"but {p} carries {trial_input.kind!r} (written for trial={file_trial!r})."
+            )
+        if staged.trial.kind not in recipe.guide_spec.kinds:
+            raise ValueError(
+                f"guide={recipe.guide!r} needs staged data of kind "
+                f"{sorted(recipe.guide_spec.kinds)}, but {p} carries {staged.trial.kind!r} "
+                f"(written for guide={file_guide!r})."
+            )
+
+        af = cls.__new__(cls)
+        af.recipe = recipe
+        af.trial, af.guide = recipe.trial, recipe.guide
+        Afqmc.__init__(
+            af,
+            None,
+            norb_frozen_core=None,
+            chol_cut=float(staged.meta["chol_cut"]),
+            cache=None,
+            n_eql_blocks=n_eql_blocks,
+            n_blocks=n_blocks,
+            seed=seed,
+            dt=dt,
+            n_walkers=n_walkers,
+            n_chunks=n_chunks,
+            error_method=error_method,
+        )
+        af.source_kind = str(staged.meta["source_kind"])
+        af.basis_a = af.basis_b = None
+        af._init_mixed_options(
+            n_prop_steps=n_prop_steps,
+            nchol_chunk=nchol_chunk,
+            max_memory=max_memory,
+            mixed_precision=mixed_precision,
+            guide_mixed_precision=guide_mixed_precision,
+            trial_mixed_precision=trial_mixed_precision,
+            tau_eql=tau_eql,
+            save_wavefunction=save_wavefunction,
+        )
+        af.staged_file = p
+        af._staged = staged
+        af._trial_input = trial_input
+        af._staged_wfn_basis = bases[0] if len(bases) == 1 else bases
+        af._staged_mol_meta = mol_meta
+        return af

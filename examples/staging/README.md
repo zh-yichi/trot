@@ -12,6 +12,8 @@ This is useful when the trial generation step is expensive and is done on CPU, w
 - `cisd.py`: runs a PySCF RHF + CCSD calculation and writes `h2o_afqmc.h5` with a staged CISD trial
 - `afqmc.py`: reads the staged file and runs a single device AFQMC calculation
 - `afqmc_multi_gpu.py`: reads the staged file and runs AFQMC with sharding across all visible GPUs
+- `mixed_stage.py`: runs a PySCF UHF + UCCSD calculation and writes `o2_mixed.h5` for an `AfqmcMixed` run (UHF guide, `upt2ccsd_bar` trial) with `AfqmcMixed.save_staged`
+- `mixed_afqmc.py`: reads that file with `AfqmcMixed.from_staged` and runs the guide + trial AFQMC without any PySCF object
 
 ## Typical Usage
 
