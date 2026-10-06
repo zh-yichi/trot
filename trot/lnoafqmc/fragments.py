@@ -30,7 +30,8 @@ print = partial(print, flush=True)
 # frag_name  one label per fragment, e.g. "O0H1H2"
 #
 # For a basis outside the cc-pVXZ family the IAO reference basis is built from free-atom
-# HF orbitals (free_atom_minao), since pyscf's 'minao' does not cover it.
+# HF orbitals (free_atom_minao, via resolve_minao), since pyscf's 'minao' does not cover it.
+# iao_labels() gives the IAO column labels ('0 Fe 3dxy', ...) for population analysis.
 
 
 def _fix_ecpbas(mol):
@@ -84,17 +85,32 @@ def _is_relativistic_basis(basis):
     return False
 
 
-def free_atom_minao(mol, occ_tol=1e-6, sv_tol=1e-8, x2c=None):
+def free_atom_minao(mol, occ_tol=1e-6, sv_tol=1e-8, x2c=None, atomic_configuration=None):
     """
     Free-atom occupied HF orbitals (core+valence) in the uncontracted working basis,
     packaged as a pyscf basis dict for use as `minao`.
 
+    Each element is solved as a spherically averaged (fractional occupation) RHF atom; for
+    every angular momentum the distinct radial functions among the occupied orbitals are
+    extracted by SVD, so e.g. Fe gives 1s 2s 3s 4s / 2p 3p / 3d (15 functions). The shell
+    labels pyscf attaches to the result (1s, 2s, ...) are by energy order within each l;
+    the n-th s function is a mixture of the atomic ns orbitals, but the l=2 (3d) and l=3
+    functions of a first-row transition metal are the pure atomic orbitals.
+
     x2c : None -> enable scalar relativity iff the working basis is a relativistically
           recontracted one; True/False to force it on or off.
+    atomic_configuration : per-element (ns, np, nd, nf) electron counts, indexed by nuclear
+          charge, used for the free-atom occupations. Default: pyscf.data.elements
+          .CONFIGURATION, the experimental ground state (Fe: 3d6 4s2). pyscf's own atomic
+          SCF default, NRSRHF_CONFIGURATION, is the lowest *spherically averaged RHF*
+          configuration, which for the 3d metals empties the 4s into the 3d (Fe: 3d8 4s0)
+          and would leave the 4s out of the reference basis altogether.
     """
     _fix_ecpbas(mol)
     if x2c is None:
         x2c = _is_relativistic_basis(mol.basis)
+    if atomic_configuration is None:
+        atomic_configuration = elements.CONFIGURATION
 
     elems = set(mol.elements)
     unc = {sym: gto.uncontract(mol._basis[sym]) for sym in elems}
@@ -129,9 +145,12 @@ def free_atom_minao(mol, occ_tol=1e-6, sv_tol=1e-8, x2c=None):
             shells_by_l[a1.bas_angular(ib)].append((float(a1.bas_exp(ib)[0]), ao_loc[ib]))
 
         amf: Any = atom_hf.AtomHF1e(a1) if a1.nelectron == 1 else atom_hf.AtomSphAverageRHF(a1)
+        amf.atomic_configuration = atomic_configuration
         if x2c:
             amf = amf.sfx2c1e()
         amf.run()
+        if not amf.converged:
+            raise RuntimeError(f"free-atom SCF for {sym} did not converge")
 
         c, occ = amf.mo_coeff, amf.mo_occ
         occ_cols = c[:, occ > occ_tol]
@@ -149,6 +168,45 @@ def free_atom_minao(mol, occ_tol=1e-6, sv_tol=1e-8, x2c=None):
                 shells.append([l] + [[float(exps[k]), float(d[k])] for k in range(p)])
         ref_basis[sym] = shells
     return ref_basis
+
+
+def resolve_minao(mol, minao: Any = "minao", x2c=None, verbose=True):
+    """
+    The IAO reference basis iao_fragment uses for `mol`.
+
+    A basis in the plain cc-pVXZ family keeps `minao` as given (pyscf's tabulated 'minao' by
+    default). Anything else (relativistically recontracted, def2, ANO, ECP, ...) gets
+    free-atom HF orbitals from free_atom_minao, with scalar relativity (sfX2C1e) switched on
+    automatically for a relativistic basis unless `x2c` says otherwise. A dict passed as
+    `minao` is always taken as the reference basis itself.
+    """
+    if isinstance(minao, dict):
+        return minao
+    if _is_ccpvxz_family(mol.basis):
+        return minao
+    if x2c is None:
+        x2c = _is_relativistic_basis(mol.basis)
+    if verbose:
+        print(
+            "Detected basis set not in the cc-pVXZ family. "
+            "Run free atom scf to generate reference basis."
+        )
+        if x2c:
+            print(
+                "Detected relativistic basis set. "
+                "Run free atom scf with scalar relativistic (sfX2C1e) effects."
+            )
+    return free_atom_minao(mol, occ_tol=1e-6, sv_tol=1e-8, x2c=x2c)
+
+
+def iao_labels(mol, minao: Any = "minao", x2c=None):
+    """
+    One label per IAO column that iao_fragment returns (before any `more_loc`), in the
+    pyscf ao_labels format "<atom index> <symbol> <shell>", e.g. '0 Fe 3dxy'. Resolves the
+    reference basis exactly as iao_fragment does, so pass the same `minao`/`x2c`.
+    """
+    minao = resolve_minao(mol, minao, x2c=x2c, verbose=False)
+    return lo.iao.reference_mol(mol, minao).ao_labels()
 
 
 def name_fragments(frag_atmlist, elems, sep=""):
@@ -248,6 +306,12 @@ def iao_fragment(
     nfrozen   : number of frozen core orbitals (default: chemcore)
     frag_type : "atom" (one fragment per atom) or "h2heavy" (hydrogens join their heavy atom)
     more_loc  : None, "boys" or "pm": further localize the IAOs before mapping to fragments
+    minao     : IAO reference basis: a pyscf basis name or dict. Only honoured as given for a
+                plain cc-pVXZ-family working basis; otherwise it is replaced by free-atom HF
+                orbitals computed in the working basis (see resolve_minao / free_atom_minao).
+                iao_labels(mol, minao, x2c) names the resulting IAO columns.
+    x2c       : scalar relativity for those free-atom calculations (None: on iff the working
+                basis is relativistically recontracted)
     save2     : path of an HDF5 file to write (lo_coeff, frag_list, frag_name) to
     read_from : path of such a file to read instead of rebuilding the IAOs; the stored
                 molecule must match mf.mol
@@ -285,19 +349,7 @@ def iao_fragment(
     if nfrozen is None:
         nfrozen = elements.chemcore(mol)
 
-    if not _is_ccpvxz_family(mol.basis):
-        print(
-            "Detected basis set not in the cc-pVXZ family. "
-            "Run free atom scf to generate reference basis."
-        )
-        if x2c is None:
-            x2c = _is_relativistic_basis(mol.basis)
-        if x2c:
-            print(
-                "Detected relativistic basis set. "
-                "Run free atom scf with scalar relativistic (sfX2C1e) effects."
-            )
-        minao = free_atom_minao(mol, occ_tol=1e-6, sv_tol=1e-8, x2c=x2c)
+    minao = resolve_minao(mol, minao, x2c=x2c)
 
     if isinstance(mf, scf.uhf.UHF):
         lo_coeff, frag_list, frag_name = uiao_fragment(mf, nfrozen, frag_type, more_loc, minao)
