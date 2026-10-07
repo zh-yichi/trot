@@ -6,8 +6,9 @@ Checks:
     and energy kernels reproduce meas.ucisd's restricted-hamiltonian kernels with the
     beta rotation set to the identity;
   - with every CI coefficient zero they reduce to the uchol UHF kernels;
-  - the overlap and the force bias, which sum their terms before the large products,
-    reproduce the term by term formulas they replace on unstructured random input;
+  - the overlap, the force bias and the energy, which sum their terms before the large
+    products, reproduce the term by term formulas they replace on unstructured random
+    input;
   - a restricted CCSD converted with convert_to_uccsd gives the same run as Afqmc with
     unrestricted walkers (same seed), since the beta basis equals the alpha basis;
   - the energy at tau = 0 is the UCCSD energy, with and without a frozen core;
@@ -229,12 +230,97 @@ def _force_bias_term_by_term(walker, ham, td):
     return (lg + fb_1 + fb_2) / (1.0 + ci1g + gci2g)
 
 
+def _energy_term_by_term(walker, ham, td):
+    """
+    afqmc's _calc_energy as ported first: one einsum per term, every cholesky vector at
+    once, all in double. Same conventions as the kernel (chol symmetric is not assumed:
+    gl = G_ir L_g,qr everywhere, lci2_green from the occupied rows of chol).
+    """
+    wa, wb = walker
+    nocc_a, nocc_b = td.nocc
+    norb_a, norb_b = wa.shape[0], wb.shape[0]
+    green_a = (wa @ jnp.linalg.inv(wa[:nocc_a, :])).T
+    green_b = (wb @ jnp.linalg.inv(wb[:nocc_b, :])).T
+    green_occ_a, green_occ_b = green_a[:, nocc_a:], green_b[:, nocc_b:]
+    greenp_a = jnp.vstack((green_occ_a, -jnp.eye(norb_a - nocc_a)))
+    greenp_b = jnp.vstack((green_occ_b, -jnp.eye(norb_b - nocc_b)))
+    h1_a, h1_b, chol_a, chol_b = ham.h1_a, ham.h1_b, ham.chol_a, ham.chol_b
+
+    hg = jnp.einsum("pj,pj->", h1_a[:nocc_a, :], green_a) + jnp.einsum(
+        "pj,pj->", h1_b[:nocc_b, :], green_b
+    )
+    ci1g = jnp.einsum("pt,pt->", td.c1a, green_occ_a) + jnp.einsum("pt,pt->", td.c1b, green_occ_b)
+    ci1_green_a = (greenp_a @ td.c1a.T) @ green_a
+    ci1_green_b = (greenp_b @ td.c1b.T) @ green_b
+    e1_1 = (
+        ci1g * hg
+        - jnp.einsum("ij,ij->", h1_a, ci1_green_a)
+        - jnp.einsum("ij,ij->", h1_b, ci1_green_b)
+    )
+
+    ci2g_a = jnp.einsum("ptqu,pt->qu", td.c2aa, green_occ_a) / 4
+    ci2g_b = jnp.einsum("ptqu,pt->qu", td.c2bb, green_occ_b) / 4
+    ci2g_ab_a = jnp.einsum("ptqu,qu->pt", td.c2ab, green_occ_b)
+    ci2g_ab_b = jnp.einsum("ptqu,pt->qu", td.c2ab, green_occ_a)
+    gci2g = (
+        2 * jnp.einsum("qu,qu->", ci2g_a, green_occ_a)
+        + 2 * jnp.einsum("qu,qu->", ci2g_b, green_occ_b)
+        + jnp.einsum("pt,pt->", ci2g_ab_a, green_occ_a)
+    )
+    ci2_green_a = 4 * (greenp_a @ ci2g_a.T) @ green_a + (greenp_a @ ci2g_ab_a.T) @ green_a
+    ci2_green_b = 4 * (greenp_b @ ci2g_b.T) @ green_b + (greenp_b @ ci2g_ab_b.T) @ green_b
+    e1_2 = (
+        hg * gci2g
+        - jnp.einsum("ij,ij->", h1_a, ci2_green_a)
+        - jnp.einsum("ij,ij->", h1_b, ci2_green_b)
+    )
+    e1 = hg + e1_1 + e1_2
+
+    gl_a = jnp.einsum("ir,gqr->giq", green_a, chol_a)
+    gl_b = jnp.einsum("ir,gqr->giq", green_b, chol_b)
+    glo_a, glo_b = gl_a[:, :, :nocc_a], gl_b[:, :, :nocc_b]
+    tr_gl = jnp.einsum("gpp->g", glo_a) + jnp.einsum("gpp->g", glo_b)
+    ex_gl = jnp.einsum("gpq,gqp->g", glo_a, glo_a) + jnp.einsum("gpq,gqp->g", glo_b, glo_b)
+    e2_0 = jnp.sum(tr_gl * tr_gl - ex_gl) / 2
+
+    lci1g = jnp.einsum("gij,ij->g", chol_a, ci1_green_a) + jnp.einsum(
+        "gij,ij->g", chol_b, ci1_green_b
+    )
+    e2_1 = (
+        e2_0 * ci1g
+        - lci1g @ tr_gl
+        + jnp.einsum("gqp,grq,rp->", glo_a, glo_a, td.c1a @ green_occ_a.T)
+        + jnp.einsum("gqp,grq,rp->", glo_b, glo_b, td.c1b @ green_occ_b.T)
+        - jnp.einsum("gqt,pt,gpq->", gl_a[:, :, nocc_a:], td.c1a, glo_a)
+        - jnp.einsum("gqt,pt,gpq->", gl_b[:, :, nocc_b:], td.c1b, glo_b)
+    )
+
+    ci2_green_a, ci2_green_b = 2 * ci2_green_a, 2 * ci2_green_b
+    lci2g = jnp.einsum("gij,ij->g", chol_a, ci2_green_a) + jnp.einsum(
+        "gij,ij->g", chol_b, ci2_green_b
+    )
+    lci2_green_a = jnp.einsum("gir,qr->giq", chol_a[:, :nocc_a, :], ci2_green_a)
+    lci2_green_b = jnp.einsum("gir,qr->giq", chol_b[:, :nocc_b, :], ci2_green_b)
+    glgp_a = jnp.einsum("giq,qa->gia", gl_a, greenp_a)
+    glgp_b = jnp.einsum("giq,qa->gia", gl_b, greenp_b)
+    e2_2 = (
+        e2_0 * gci2g
+        - (lci2g @ tr_gl) / 2
+        + 0.5 * jnp.einsum("giq,giq->", gl_a, lci2_green_a)
+        + 0.5 * jnp.einsum("giq,giq->", gl_b, lci2_green_b)
+        + 0.5 * jnp.einsum("gia,iajb,gjb->", glgp_a, td.c2aa, glgp_a)
+        + 0.5 * jnp.einsum("gia,iajb,gjb->", glgp_b, td.c2bb, glgp_b)
+        + jnp.einsum("gia,iajb,gjb->", glgp_a, td.c2ab, glgp_b)
+    )
+    return (e1 + e2_0 + e2_1 + e2_2) / (1.0 + ci1g + gci2g) + ham.h0
+
+
 @pytest.mark.parametrize(
     "norb, nocc, nchol",
     [((6, 6), (3, 2), 7), ((7, 5), (2, 4), 5), ((5, 8), (1, 3), 9), ((4, 6), (3, 1), 1)],
 )
 @pytest.mark.parametrize("walker_kind", ["near_reference", "orthonormal", "gaussian"])
-def test_overlap_and_force_bias_match_term_by_term(norb, nocc, nchol, walker_kind):
+def test_kernels_match_term_by_term(norb, nocc, nchol, walker_kind):
     """
     Nothing in the input is structured: norb and nocc differ between the spins, the
     doubles carry no index symmetry and the cholesky vectors are not symmetric, so a
@@ -272,7 +358,8 @@ def test_overlap_and_force_bias_match_term_by_term(norb, nocc, nchol, walker_kin
         return jnp.asarray(x)
 
     w = (walkers(norb_a, nocc_a), walkers(norb_b, nocc_b))
-    ctx = build_meas_ctx_uh(ham, td)
+    # a chunk that does not divide nchol, so the last one is zero padded
+    ctx = build_meas_ctx_uh(ham, td, Pt2ccsdChunkMeasCfg(nchol_chunk=max(1, nchol - 1)))
     o_new = jax.vmap(overlap_uw_uh, (0, None))(w, td)
     o_ref = jax.vmap(_overlap_term_by_term, (0, None))(w, td)
     np.testing.assert_allclose(np.asarray(o_new), np.asarray(o_ref), rtol=1e-10)
@@ -280,6 +367,9 @@ def test_overlap_and_force_bias_match_term_by_term(norb, nocc, nchol, walker_kin
     fb_ref = jax.vmap(_force_bias_term_by_term, (0, None, None))(w, ham, td)
     scale = np.max(np.abs(np.asarray(fb_ref)), axis=1, keepdims=True)
     np.testing.assert_allclose(np.asarray(fb_new) / scale, np.asarray(fb_ref) / scale, atol=1e-10)
+    e_new = jax.vmap(energy_kernel_uw_uh, (0, None, None, None))(w, ham, ctx, td)
+    e_ref = jax.vmap(_energy_term_by_term, (0, None, None))(w, ham, td)
+    np.testing.assert_allclose(np.asarray(e_new), np.asarray(e_ref), rtol=1e-10)
 
 
 def test_mixed_precision_force_bias_and_overlap(random_pair):

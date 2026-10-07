@@ -21,13 +21,14 @@ meas/upt2ccsd_bar_uh.py does: every three index intermediate is built inside the
 the chunk rather than by the number of vectors. The chunk size and the mixed dtypes of
 the <C1 h2> and <C2 h2> contractions are the measurement context's (UcisdMeasCtxUh).
 
-The overlap and the force bias run at every propagation step, so their large products
-are kept few and real: the doubles meet the green's function as (nocc nvir, nocc nvir)
-matrix products, the force bias contracts the cholesky tensor once per spin (every term
-is linear in it), and a real matrix times a complex vector is two real products (_rdot)
-rather than a complex one. The force bias runs those products in the mixed dtypes of the
-measurement context; the overlap does only when asked (DEFAULT_OVERLAP_MIXED_PRECISION).
-The CI coefficients and the cholesky vectors are real.
+In every kernel the large products are kept few and real: the doubles meet the green's
+function as (nocc nvir, nocc nvir) matrix products, the force bias contracts the cholesky
+tensor once per spin (every term is linear in it), the energy's gl and gl . greenp use
+the identity blocks of green and greenp, and a real matrix times a complex one is two
+real products (_rdot, _split) rather than a complex promoted one. The force bias runs its
+products in the mixed dtypes of the measurement context like the energy's <C1 h2> and
+<C2 h2> terms; the overlap does only when asked (DEFAULT_OVERLAP_MIXED_PRECISION). The CI
+coefficients and the cholesky vectors are real.
 
 Conventions, per spin (dropping the spin label):
     green      (nocc, norb)   [phi (phi_occ)^-1]^T,   the half green's function
@@ -58,7 +59,7 @@ from .pt2ccsd_chunking import (
     pad_reshape_chol,
     resolve_nchol_chunk,
 )
-from .upt2ccsd_uh import e2_0_g, l2t2_g, nchol_of
+from .upt2ccsd_uh import nchol_of
 
 _UCISD_UH_MEAS_CFG_ATTR = "_ucisd_uh_meas_cfg"
 
@@ -255,84 +256,107 @@ def force_bias_kernel_uw_uh(
     return fb_a + fb_b
 
 
+def _split(fn: Any, x: jax.Array) -> jax.Array:
+    """A linear fn with real operands applied to a complex x as two real calls."""
+    return lax.complex(fn(jnp.real(x)), fn(jnp.imag(x)))
+
+
 def _chunk_terms(
-    chol_a_c: jax.Array,
-    chol_b_c: jax.Array,
-    green: tuple[jax.Array, jax.Array],
-    greenp: tuple[jax.Array, jax.Array],
-    ci1_green: tuple[jax.Array, jax.Array],
+    chol_c: tuple[jax.Array, jax.Array],
+    green_occ: tuple[jax.Array, jax.Array],
+    ci12_green: tuple[jax.Array, jax.Array],
     ci1g1: tuple[jax.Array, jax.Array],
     ci2_green: tuple[jax.Array, jax.Array],
     c1_r: tuple[jax.Array, jax.Array],
     c2_r: tuple[jax.Array, jax.Array, jax.Array],
-    nocc: tuple[int, int],
     rtype: Any,
     ctype: Any,
 ) -> tuple[jax.Array, ...]:
     """
     The two body terms of one chunk of k cholesky vectors, summed over the chunk:
 
-        e2_0      <h2>                          working precision, exact
-        e2_1_2    -tr(L ci1_green) tr(G L)
+        e2_0      <h2>                                     working precision, exact
+        e2_12     -tr(L (ci1_green + ci2_green/2)) tr(G L)
         e2_1_3_1  G L . G L . c1 G
         e2_1_3_2  -G L c1 . G L
-        e2_2_2_1  -tr(L ci2_green) tr(G L) / 2
         e2_2_2_2  G L . L ci2_green / 2
         e2_2_3    L c2 L
 
-    All but e2_0 are in ctype. ci1_green, ci1g1 and ci2_green come in ctype, c1_r and c2_r
+    All but e2_0 are in ctype. ci12_green, ci1g1 and ci2_green come in ctype, c1_r and c2_r
     in rtype. ci2_green is 8 * (same spin) + 2 * (opposite spin) per spin. chol is
     symmetric in its orbital indices, so one gl = G_ir L_g,qr serves every term.
-    """
-    nocc_a, nocc_b = nocc
 
-    gl_a = jnp.einsum("ir,gqr->giq", green[0], chol_a_c, optimize="optimal")  # (k, nocc_a, norb_a)
-    gl_b = jnp.einsum("ir,gqr->giq", green[1], chol_b_c, optimize="optimal")  # (k, nocc_b, norb_b)
+    The large products are kept real and small: green = [I | G_ov] makes gl the slice
+    L[:, :, :nocc]^T plus G_ov . L[:, :, nocc:] (two real products in the working
+    precision, L never promoted to complex), greenp = [G_ov; -I] makes gl . greenp the
+    (nocc, nocc) product glo . G_ov - glv, the two traces against chol are one, and every
+    real times complex contraction is two real ones (_split).
+    """
+    nocc = (green_occ[0].shape[0], green_occ[1].shape[0])
 
     # reference: 1/2 [ (tr L_g G)^2 - tr(L_g G L_g G) ], coulomb over both spins
-    e2_0_c, tr_gl = e2_0_g(gl_a[:, :, :nocc_a], gl_b[:, :, :nocc_b])
-
-    chol_a_r, chol_b_r = chol_a_c.astype(rtype), chol_b_c.astype(rtype)
-    gl_a, gl_b = gl_a.astype(ctype), gl_b.astype(ctype)
-    glo_a, glo_b = gl_a[:, :, :nocc_a], gl_b[:, :, :nocc_b]
+    gl, tr_gl, ex_gl = [], 0.0, 0.0
+    for s in range(2):
+        chol_s, no = chol_c[s], nocc[s]
+        gl_s = jnp.transpose(chol_s[:, :, :no], (0, 2, 1)) + _split(
+            lambda x, chol_v=chol_s[:, :, no:]: jnp.einsum(
+                "ia,gqa->giq", x, chol_v, optimize="optimal"
+            ),
+            green_occ[s],
+        )
+        glo_s = gl_s[:, :, :no]
+        tr_gl = tr_gl + jnp.einsum("gpp->g", glo_s, optimize="optimal")
+        ex_gl = ex_gl + jnp.einsum("gpq,gqp->g", glo_s, glo_s, optimize="optimal")
+        gl.append(gl_s)
+    e2_0 = jnp.sum((tr_gl * tr_gl - ex_gl) / 2.0)
     tr_gl = tr_gl.astype(ctype)
 
-    # single excitations
-    lci1g = jnp.einsum("gij,ij->g", chol_a_r, ci1_green[0], optimize="optimal") + jnp.einsum(
-        "gij,ij->g", chol_b_r, ci1_green[1], optimize="optimal"
-    )
-    e2_1_2 = -(lci1g @ tr_gl)
-    e2_1_3_1 = jnp.einsum("gqp,grq,rp->", glo_a, glo_a, ci1g1[0], optimize="optimal") + jnp.einsum(
-        "gqp,grq,rp->", glo_b, glo_b, ci1g1[1], optimize="optimal"
-    )
-    # afqmc's lci1: the virtual columns of gl contracted with c1
-    glci1_a = jnp.einsum("gqt,pt->gpq", gl_a[:, :, nocc_a:], c1_r[0], optimize="optimal")
-    glci1_b = jnp.einsum("gqt,pt->gpq", gl_b[:, :, nocc_b:], c1_r[1], optimize="optimal")
-    e2_1_3_2 = -jnp.einsum("gpq,gpq->", glci1_a, glo_a, optimize="optimal") - jnp.einsum(
-        "gpq,gpq->", glci1_b, glo_b, optimize="optimal"
+    lci12g = 0.0
+    e2_1_3_1 = e2_1_3_2 = e2_2_2_2 = 0.0
+    glgp = []
+    for s in range(2):
+        no = nocc[s]
+        k, norb = chol_c[s].shape[0], chol_c[s].shape[1]
+        chol_r = chol_c[s].astype(rtype)
+        gl_c = gl[s].astype(ctype)
+        glo, glv = gl_c[:, :, :no], gl_c[:, :, no:]
+
+        # single and double excitations against tr(G L): one trace
+        lci12g = lci12g + _rdot(chol_r.reshape(k, norb * norb), ci12_green[s].reshape(norb * norb))
+        # single excitations
+        e2_1_3_1 = e2_1_3_1 + jnp.einsum("gqp,grq,rp->", glo, glo, ci1g1[s], optimize="optimal")
+        # afqmc's lci1: the virtual columns of gl contracted with c1
+        glci1 = _split(
+            lambda x, c1=c1_r[s]: jnp.einsum("gqt,pt->gpq", x, c1, optimize="optimal"), glv
+        )
+        e2_1_3_2 = e2_1_3_2 - jnp.einsum("gpq,gpq->", glci1, glo, optimize="optimal")
+        # double excitations: only the occupied rows of chol . ci2_green meet a nonzero row
+        # of gl
+        lci2_green = _split(
+            lambda x, chol_o=chol_r[:, :no, :]: jnp.einsum(
+                "gir,qr->giq", chol_o, x, optimize="optimal"
+            ),
+            ci2_green[s],
+        )
+        e2_2_2_2 = e2_2_2_2 + 0.5 * jnp.einsum("giq,giq->", gl_c, lci2_green, optimize="optimal")
+        # gl . greenp
+        glgp.append(
+            jnp.einsum("gij,ja->gia", glo, green_occ[s].astype(ctype), optimize="optimal") - glv
+        )
+    e2_12 = -(lci12g @ tr_gl)
+
+    # L c2 L: 1/2 L c2aa L + 1/2 L c2bb L + L c2ab L
+    c2aa_r, c2ab_r, c2bb_r = c2_r
+    lc2_aa = _split(lambda x: jnp.einsum("gia,iajb->gjb", x, c2aa_r, optimize="optimal"), glgp[0])
+    lc2_bb = _split(lambda x: jnp.einsum("gia,iajb->gjb", x, c2bb_r, optimize="optimal"), glgp[1])
+    lc2_ab = _split(lambda x: jnp.einsum("gia,iajb->gjb", x, c2ab_r, optimize="optimal"), glgp[0])
+    e2_2_3 = (
+        0.5 * jnp.einsum("gjb,gjb->", lc2_aa, glgp[0], optimize="optimal")
+        + 0.5 * jnp.einsum("gjb,gjb->", lc2_bb, glgp[1], optimize="optimal")
+        + jnp.einsum("gjb,gjb->", lc2_ab, glgp[1], optimize="optimal")
     )
 
-    # double excitations
-    lci2g = jnp.einsum("gij,ij->g", chol_a_r, ci2_green[0], optimize="optimal") + jnp.einsum(
-        "gij,ij->g", chol_b_r, ci2_green[1], optimize="optimal"
-    )
-    e2_2_2_1 = -(lci2g @ tr_gl) / 2.0
-    # only the occupied rows of chol . ci2_green meet a nonzero row of gl
-    lci2_green_a = jnp.einsum(
-        "gir,qr->giq", chol_a_r[:, :nocc_a, :], ci2_green[0], optimize="optimal"
-    )
-    lci2_green_b = jnp.einsum(
-        "gir,qr->giq", chol_b_r[:, :nocc_b, :], ci2_green[1], optimize="optimal"
-    )
-    e2_2_2_2 = 0.5 * (
-        jnp.einsum("giq,giq->", gl_a, lci2_green_a, optimize="optimal")
-        + jnp.einsum("giq,giq->", gl_b, lci2_green_b, optimize="optimal")
-    )
-    glgp_a = jnp.einsum("giq,qa->gia", gl_a, greenp[0], optimize="optimal")
-    glgp_b = jnp.einsum("giq,qa->gia", gl_b, greenp[1], optimize="optimal")
-    e2_2_3 = jnp.sum(l2t2_g(glgp_a, glgp_b, c2_r))
-
-    return jnp.sum(e2_0_c), e2_1_2, e2_1_3_1, e2_1_3_2, e2_2_2_1, e2_2_2_2, e2_2_3
+    return e2_0, e2_12, e2_1_3_1, e2_1_3_2, e2_2_2_2, e2_2_3
 
 
 def energy_kernel_uw_uh(
@@ -379,10 +403,8 @@ def energy_kernel_uw_uh(
     e1_1_2 = -(jnp.einsum("ij,ij->", h1_a, ci1_green_a) + jnp.einsum("ij,ij->", h1_b, ci1_green_b))
     e1_1 = e1_1_1 + e1_1_2
 
-    ci2g_a = jnp.einsum("ptqu,pt->qu", c2aa, green_occ_a) / 4
-    ci2g_b = jnp.einsum("ptqu,pt->qu", c2bb, green_occ_b) / 4
-    ci2g_ab_a = jnp.einsum("ptqu,qu->pt", c2ab, green_occ_b)
-    ci2g_ab_b = jnp.einsum("ptqu,pt->qu", c2ab, green_occ_a)
+    ci2g_a, ci2g_b, ci2g_ab_a, ci2g_ab_b = _ci2_green_occ(trial_data, green_occ_a, green_occ_b)
+    ci2g_a, ci2g_b = ci2g_a / 4, ci2g_b / 4
     gci2g_a = jnp.einsum("qu,qu->", ci2g_a, green_occ_a)
     gci2g_b = jnp.einsum("qu,qu->", ci2g_b, green_occ_b)
     gci2g_ab = jnp.einsum("pt,pt->", ci2g_ab_a, green_occ_a)
@@ -404,13 +426,14 @@ def energy_kernel_uw_uh(
     chol_a, _, _, _ = pad_reshape_chol(ham_data.chol_a, meas_ctx.nchol_chunk)
     chol_b, _, _, _ = pad_reshape_chol(ham_data.chol_b, meas_ctx.nchol_chunk)
 
-    greenp_c = (greenp_a.astype(ctype), greenp_b.astype(ctype))
-    ci1_green_c = (ci1_green_a.astype(ctype), ci1_green_b.astype(ctype))
-    ci1g1_c = ((c1a @ green_occ_a.T).astype(ctype), (c1b @ green_occ_b.T).astype(ctype))
-    ci2_green_c = (
-        (8 * ci2_green_a + 2 * ci2_green_ab_a).astype(ctype),
-        (8 * ci2_green_b + 2 * ci2_green_ab_b).astype(ctype),
+    ci2_green_a = 8 * ci2_green_a + 2 * ci2_green_ab_a
+    ci2_green_b = 8 * ci2_green_b + 2 * ci2_green_ab_b
+    ci12_green_c = (
+        (ci1_green_a + 0.5 * ci2_green_a).astype(ctype),
+        (ci1_green_b + 0.5 * ci2_green_b).astype(ctype),
     )
+    ci1g1_c = ((c1a @ green_occ_a.T).astype(ctype), (c1b @ green_occ_b.T).astype(ctype))
+    ci2_green_c = (ci2_green_a.astype(ctype), ci2_green_b.astype(ctype))
     c1_r = (c1a.astype(rtype), c1b.astype(rtype))
     c2_r = (c2aa.astype(rtype), c2ab.astype(rtype), c2bb.astype(rtype))
 
@@ -418,34 +441,24 @@ def energy_kernel_uw_uh(
 
     def scanned_fun(carry, x):
         terms = _chunk_terms(
-            x[0],
-            x[1],
-            (green_a, green_b),
-            greenp_c,
-            ci1_green_c,
+            x,
+            (green_occ_a, green_occ_b),
+            ci12_green_c,
             ci1g1_c,
             ci2_green_c,
             c1_r,
             c2_r,
-            (nocc_a, nocc_b),
             rtype,
             ctype,
         )
         return tuple(c + t.astype(zero.dtype) for c, t in zip(carry, terms)), None
 
-    (e2_0, e2_1_2, e2_1_3_1, e2_1_3_2, e2_2_2_1, e2_2_2_2, e2_2_3), _ = lax.scan(
-        scanned_fun, (zero,) * 7, (chol_a, chol_b)
+    (e2_0, e2_12, e2_1_3_1, e2_1_3_2, e2_2_2_2, e2_2_3), _ = lax.scan(
+        scanned_fun, (zero,) * 6, (chol_a, chol_b)
     )
 
-    # single excitations
-    e2_1_1 = e2_0 * ci1g
-    e2_1 = e2_1_1 + e2_1_2 + e2_1_3_1 + e2_1_3_2
-
-    # double excitations
-    e2_2_1 = e2_0 * gci2g
-    e2_2 = e2_2_1 + e2_2_2_1 + e2_2_2_2 + e2_2_3
-
-    e2 = e2_0 + e2_1 + e2_2
+    # single and double excitations: <h2> times the excitation overlap, then the rest
+    e2 = e2_0 * (1.0 + ci1g + gci2g) + e2_12 + e2_1_3_1 + e2_1_3_2 + e2_2_2_2 + e2_2_3
 
     overlap = 1.0 + ci1g + gci2g
     return (e1 + e2) / overlap + e0
