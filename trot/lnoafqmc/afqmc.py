@@ -510,6 +510,9 @@ class LnoAfqmcMixed:
     save_snapshots : directory for the fragments' wavefunction snapshots along the run,
         one subdirectory snapshots{i} each (LnoFragMixed(save_snapshots=...))
     isolate : run each fragment's AFQMC in a child process (python -m trot.lnoafqmc.run_frag)
+    mesh : a jax device mesh with a "data" axis (trot.sharding.make_data_mesh): every
+        fragment's walkers are split over its devices, as AfqmcMixed.kernel(mesh=...) does.
+        Not combined with isolate (the child process has no mesh to inherit)
     keep_qmc_results : keep every fragment's FragQmcResult in frag_qmc_results
     debug_memory : raise if device memory does not return to baseline after a fragment
 
@@ -545,6 +548,7 @@ class LnoAfqmcMixed:
         save_wavefunction: Union[str, Path] | None = None,
         save_snapshots: Union[str, Path] | None = None,
         isolate: bool = False,
+        mesh: Any = None,
         keep_qmc_results: bool = False,
         debug_memory: bool = False,
         memory_tolerance_mb: float = 256.0,
@@ -669,6 +673,9 @@ class LnoAfqmcMixed:
         self.frag_output = frag_output
         self.lno_output = lno_output
         self.isolate = bool(isolate)
+        if self.isolate and mesh is not None:
+            raise ValueError("mesh cannot be combined with isolate: the child process has no mesh.")
+        self.mesh = mesh
         if self.isolate and save_frag_data is None and not self.frag_files:
             save_frag_data = "frag_data"  # the child process reads the fragment from its file
         self.save_frag_data = save_frag_data
@@ -867,7 +874,7 @@ class LnoAfqmcMixed:
                     fm = LnoFragMixed(self._scf, frag, **self._frag_kwargs(frag_idx))
                 else:
                     fm = LnoFragMixed.from_frag_data(cast(Any, path), **self._frag_kwargs(frag_idx))
-                e, err = fm.kernel()
+                e, err = fm.kernel(mesh=self.mesh)
                 result = fm.qmc_result
                 del fm
         finally:
