@@ -4,6 +4,9 @@ from pathlib import Path
 import pytest
 
 os.environ["NVIDIA_TF32_OVERRIDE"] = "0"
+# the override reaches cuBLAS (complex products) but not XLA's own real float32 matmuls,
+# which stay TF32 (~3e-4 relative) unless jax is asked for true float32 precision
+os.environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "float32")
 
 
 def _patch_pyscf_einsum_numpy_path_compat() -> None:
