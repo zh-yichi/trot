@@ -404,14 +404,17 @@ def setup_mixed(
     # flight, and holds less per walker per cholesky vector than the trial's kernel (a
     # (nocc, nocc) block of L.G against the trial's (nocc, norb) and larger ones). The
     # two run one after the other within a block, so the trial's plan bounds the guide
-    # energy as well: run it with the trial's cholesky chunk. A guide meas_ops passed in
-    # by the caller is kept as given.
+    # energy as well: run it with the trial's cholesky chunk. A trial without a plan
+    # (the unchunked "pt2ccsd") leaves the whole index as one chunk, so that the guide
+    # runs the same kernels whatever the trial. A guide meas_ops passed in by the caller
+    # is kept as given.
     make_chunked = rec.guide_spec.chunked_meas_ops
-    if nchol_chunk is not None and meas_ops is None and make_chunked is not None:
+    if meas_ops is None and make_chunked is not None:
+        guide_chunk = int(nchol_chunk) if nchol_chunk is not None else int(job.ham_data.nchol)
         chunked = make_chunked(
-            job.sys, rec.ham_basis, int(nchol_chunk), mixed_precision=bool(mixed_precision)
+            job.sys, rec.ham_basis, guide_chunk, mixed_precision=bool(mixed_precision)
         )
         if chunked is not None:
             job.meas_ops = chunked
-            job.guide_nchol_chunk = int(nchol_chunk)
+            job.guide_nchol_chunk = guide_chunk
     return job

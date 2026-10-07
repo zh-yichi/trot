@@ -184,13 +184,18 @@ class MixedRecipe:
 # guides
 # ------------------------------------------------------------------------------------
 
+
 def _rhf_chunked_meas_ops(
     sys: Any, ham_basis: str, nchol_chunk: int, *, mixed_precision: bool = False
 ) -> MeasOps | None:
-    """meas.rhf's low memory mode: the local energy sums batches of nchol_chunk vectors."""
-    from .meas.rhf import make_rhf_meas_ops
+    """
+    meas.rhf_rh scans the local energy over chunks of nchol_chunk vectors, as the
+    unrestricted guides do (meas.rhf's own kernels sum them at once or in fori_loop
+    batches).
+    """
+    from .meas.rhf_rh import make_rhf_meas_ops_rh
 
-    return make_rhf_meas_ops(sys, memory_mode="low", chol_batch_size=int(nchol_chunk))
+    return make_rhf_meas_ops_rh(sys, nchol_chunk=int(nchol_chunk))
 
 
 def _uhf_chunked_meas_ops(
@@ -225,8 +230,21 @@ def _ucisd_chunked_meas_ops(
     )
 
 
-# cisd has no chunked_meas_ops: its local energy already scans the cholesky vectors one
-# at a time
+def _cisd_chunked_meas_ops(
+    sys: Any, ham_basis: str, nchol_chunk: int, *, mixed_precision: bool = False
+) -> MeasOps | None:
+    """
+    meas.cisd_rh scans the local energy over chunks of nchol_chunk vectors, as
+    meas.ucisd_uh does on the unrestricted hamiltonian (meas.cisd's own kernels sum the
+    vectors at once or one at a time).
+    """
+    if ham_basis != "restricted":
+        return None
+    from .meas.cisd_rh import make_cisd_meas_ops_rh
+
+    return make_cisd_meas_ops_rh(sys, mixed_precision=mixed_precision, nchol_chunk=int(nchol_chunk))
+
+
 GUIDES: dict[str, GuideSpec] = {
     "rhf": GuideSpec(
         name="rhf",
@@ -252,6 +270,7 @@ GUIDES: dict[str, GuideSpec] = {
         source="cc",
         ham_bases=frozenset({"restricted"}),
         walker_kinds=frozenset({"restricted"}),
+        chunked_meas_ops=_cisd_chunked_meas_ops,
     ),
     # on the restricted hamiltonian as Afqmc(ucc) runs it; on the unrestricted one with
     # the meas.ucisd_uh kernels, each spin's CI coefficients in that spin's own basis

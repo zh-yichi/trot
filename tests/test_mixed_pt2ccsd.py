@@ -286,11 +286,14 @@ def test_bar_and_plain_trials_give_the_same_run(h4, guide):
 @pytest.mark.parametrize("guide", ["rhf", "cisd"])
 def test_guide_energy_uses_the_trial_chunk(h4, guide):
     """
-    The RHF guide's local energy runs in its low memory mode with the trial's cholesky
-    chunk as the batch, and the run matches an unchunked one; the CISD guide, which scans
-    one vector at a time, is kept.
+    The guide's local energy is scanned over the trial's cholesky chunk (meas.rhf_rh for
+    the RHF guide, meas.cisd_rh for the CISD one), and the run matches an unchunked one.
     """
-    from trot.meas.rhf import get_rhf_meas_cfg
+    from functools import partial
+
+    from trot.core.ops import k_energy
+    from trot.meas.cisd_rh import energy_kernel_rw_rh as cisd_energy_rw_rh
+    from trot.meas.rhf_rh import energy_kernel_rw_rh
 
     runs = {}
     for chunk in (2, 10_000):
@@ -304,13 +307,15 @@ def test_guide_energy_uses_the_trial_chunk(h4, guide):
             **_PARAMS,
         )
         job = _quiet(af.build_job)
-        cfg = get_rhf_meas_cfg(job.meas_ops)
+        assert job.guide_nchol_chunk == job.mix_meas_ctx().nchol_chunk
+        kernel = job.meas_ops.require_kernel(k_energy)
         if guide == "rhf":
-            assert job.guide_nchol_chunk == job.mix_meas_ctx().nchol_chunk
-            assert cfg is not None and cfg.memory_mode == "low"
-            assert cfg.chol_batch_size == job.guide_nchol_chunk
+            assert isinstance(kernel, partial) and kernel.func is energy_kernel_rw_rh
+            assert kernel.keywords == {"nchol_chunk": job.guide_nchol_chunk}
         else:
-            assert job.guide_nchol_chunk is None
+            assert kernel is cisd_energy_rw_rh
+            ctx = job.meas_ops.build_meas_ctx(job.ham_data, job.trial_data)
+            assert ctx.nchol_chunk == job.guide_nchol_chunk
         runs[chunk] = (af, *_quiet(af.kernel))
     (small, e_s, err_s), (whole, e_w, err_w) = runs[2], runs[10_000]
     assert e_s == pytest.approx(e_w, abs=1e-8)
