@@ -116,7 +116,9 @@ class LnoFragMixed(AfqmcMixed):
     The remaining keywords are AfqmcMixed's (max_memory, nchol_chunk, mixed_precision
     with the per side guide_mixed_precision / trial_mixed_precision, chol_cut,
     n_eql_blocks, n_blocks, seed, dt, n_prop_steps, n_walkers, n_chunks, error_method,
-    tau_eql). n_blocks defaults to 300.
+    tau_eql, mixed_outlier = the per walker outlier handling of block_mixed, judged on the
+    guide local energy: "clamp" (default), "reject" or "none", see QmcParams). n_blocks
+    defaults to 300.
     """
 
     def __init__(
@@ -147,6 +149,7 @@ class LnoFragMixed(AfqmcMixed):
         n_chunks: int | None = None,
         error_method: Literal["gamma", "blocking"] | None = "blocking",
         tau_eql: float | None = None,
+        mixed_outlier: Literal["clamp", "reject", "none"] | None = None,
         save_wavefunction: Union[str, Path] | None = None,
         save_snapshots: Union[str, Path] | None = None,
     ):
@@ -154,6 +157,9 @@ class LnoFragMixed(AfqmcMixed):
             raise ValueError("pass either tau_eql or n_eql_blocks, not both.")
         if tau_eql is not None and float(tau_eql) < 0.0:
             raise ValueError(f"tau_eql must be non-negative, got {tau_eql}.")
+        if mixed_outlier is not None:
+            # a QmcParams field: Afqmc._make_params reads it off self
+            self.mixed_outlier = mixed_outlier
         # Afqmc.__init__ directly: there is no CC object, the trial comes from frag
         Afqmc.__init__(
             self,
@@ -523,7 +529,9 @@ class LnoAfqmcMixed:
         error is below stop_ratio * target_error / sqrt(nfrag)
     chol_cut, max_memory, nchol_chunk, mixed_precision (with guide_mixed_precision /
     trial_mixed_precision to set the two sides apart), n_eql_blocks, n_blocks (default
-    300), seed, dt, n_prop_steps, n_walkers, n_chunks, error_method, tau_eql
+    300), seed, dt, n_prop_steps, n_walkers, n_chunks, error_method, tau_eql,
+    mixed_outlier (the per walker outlier handling of every fragment's block_mixed, judged
+    on the guide local energy: "clamp" (default), "reject" or "none", see QmcParams)
     """
 
     def __init__(
@@ -573,6 +581,7 @@ class LnoAfqmcMixed:
         n_chunks: int | None = None,
         error_method: Literal["gamma", "blocking"] | None = "blocking",
         tau_eql: float | None = None,
+        mixed_outlier: Literal["clamp", "reject", "none"] | None = None,
     ):
         from pyscf import scf
         from pyscf.data import elements
@@ -703,6 +712,7 @@ class LnoAfqmcMixed:
             n_chunks=n_chunks,
             error_method=error_method,
             tau_eql=tau_eql,
+            mixed_outlier=mixed_outlier,
         )
         self.seed = int(np.random.randint(1, 2**31 - 1)) if seed is None else int(seed)
 

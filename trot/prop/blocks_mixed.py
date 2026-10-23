@@ -80,8 +80,8 @@ def block_mixed(
 ) -> tuple[PropState, BlockObs]:
     """
     One block: n_prop_steps of guided propagation, then the guide's local energy (for the
-    population control and the outlier rejection) and, unless measure_trial=False, the
-    trial's components.
+    population control and the outlier handling, see params.mixed_outlier) and, unless
+    measure_trial=False, the trial's components.
 
     measure_trial=False skips the trial estimator entirely and returns guide scalars
     only. During equilibration the walkers are governed purely by the guide, so the
@@ -119,19 +119,39 @@ def block_mixed(
     )(state.walkers, ham_data, guide_meas_ctx, guide_data)
     guide_e_samples = jnp.real(guide_e_samples)
 
-    # Outlier rejection, judged on the guide local energy. A walker whose guide energy
-    # has run away is discarded by zeroing its weight, not by clamping its energy:
-    # clamping would leave it contributing its full weight to the trial averages further
-    # down, since trial_weights is built from guide_weights. The energy is still replaced
-    # by e_ref so that a nan cannot survive as nan * 0.
+    # Outlier handling, judged on the guide local energy alone (params.mixed_outlier). The
+    # same mask is applied to every sampled quantity of the walker further down, so the
+    # sampling stays controlled by the guide.
+    #   clamp:  the walker keeps its weight; its guide energy becomes e_ref (as in
+    #           blocks.block for the regular sampler) and its trial component samples the
+    #           block's wp-average over the non-outlier walkers. Only a non-finite guide
+    #           energy removes the walker.
+    #   reject: the walker's weight is zeroed. trial_weights is built from guide_weights,
+    #           so it drops out of the trial averages too.
+    #   none:   no threshold, the raw samples enter the averages; only a non-finite guide
+    #           energy removes the walker.
+    # In every mode the energy is replaced by e_ref so that a nan cannot survive as
+    # nan * 0.
+    if params.mixed_outlier not in ("clamp", "reject", "none"):
+        raise ValueError(
+            "params.mixed_outlier must be 'clamp', 'reject' or 'none', "
+            f"got {params.mixed_outlier!r}"
+        )
     thresh = jnp.sqrt(2.0 / jnp.asarray(params.dt))
     e_ref = state.e_estimate
-    is_bad = ~jnp.isfinite(guide_e_samples) | (jnp.abs(guide_e_samples - e_ref) > thresh)
+    is_nan = ~jnp.isfinite(guide_e_samples)
+    if params.mixed_outlier == "none":
+        is_bad = is_nan
+    else:
+        is_bad = is_nan | (jnp.abs(guide_e_samples - e_ref) > thresh)
     guide_e_samples = jnp.where(is_bad, e_ref, guide_e_samples)
 
-    guide_weights = jnp.where(is_bad, 0.0, state.weights)
+    # "none" is the clamp path with the threshold off: only nan walkers are flagged
+    clamp = params.mixed_outlier in ("clamp", "none")
+    guide_weights = jnp.where(is_nan if clamp else is_bad, 0.0, state.weights)
     guide_w_block = jnp.sum(guide_weights)
-    guide_e_block = jnp.sum(guide_weights * guide_e_samples) / guide_w_block
+    guide_w_safe = jnp.where(guide_w_block == 0, 1.0, guide_w_block)
+    guide_e_block = jnp.sum(guide_weights * guide_e_samples) / guide_w_safe
     guide_e_block = jnp.where(guide_w_block == 0, e_ref, guide_e_block)
 
     alpha = jnp.asarray(params.shift_ema, dtype=jnp.result_type(guide_e_block))
@@ -173,6 +193,23 @@ def block_mixed(
     )(walkers_new, trial_data)
     # wp = w_guide * <T|walker> / <G|walker>
     trial_weights = guide_weights * trial_overlaps / guide_overlaps
+    if clamp:
+        # The outlier's component samples (for pt2CCSD: theta = <T>, electronic_0 = <H>,
+        # h_t = <TH>) are replaced by the wp-average over the non-outlier walkers of this
+        # block, i.e. the sample average, so the walker keeps its weight but no longer
+        # pulls the components apart. The one component average is what a clamped walker
+        # contributes to each of them, so the combined energy of the clamped walker is
+        # the block's own estimate.
+        w_good = jnp.where(is_bad, 0.0, trial_weights)
+        w_good_block = jnp.sum(w_good)
+        has_good = w_good_block != 0
+        comps_good = jnp.sum(w_good[:, None] * results, axis=0) / jnp.where(
+            has_good, w_good_block, 1.0
+        )
+        results = jnp.where(is_bad[:, None], comps_good[None, :], results)
+        # with no non-outlier walker in the block there is no average to clamp to; the
+        # outliers are then rejected from the trial estimator as before
+        trial_weights = jnp.where(is_bad & ~has_good, 0.0, trial_weights)
     trial_w_block = jnp.sum(trial_weights)
     # (n_components,): the wp-averaged components in the recipe's order
     trial_components = jnp.sum(trial_weights[:, None] * results, axis=0) / trial_w_block

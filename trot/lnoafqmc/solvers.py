@@ -84,6 +84,17 @@ def get_maskact(mf, frozen_idx, mo_occ):
 
 def _make_cc(mf, mo_coeff, frozen, verbose):
     if isinstance(mf, scf.uhf.UHF):
+        # make_ulas / get_maskact give an int per spin when that spin freezes nothing, but
+        # pyscf reads a list whose first entry is an int as an index list for both spins
+        # ([0, 0] would freeze orbital 0 of each spin): hand it the per-spin index lists
+        if isinstance(frozen, (list, tuple)) and len(frozen) == 2 and any(
+            isinstance(f, (int, np.integer)) for f in frozen
+        ):
+            frozen = [
+                list(range(int(f))) if isinstance(f, (int, np.integer)) else list(np.asarray(f).reshape(-1))
+                for f in frozen
+            ]
+            frozen = None if not (frozen[0] or frozen[1]) else frozen
         mcc = ulnoccsd.UCCSD(mf, mo_coeff=mo_coeff, frozen=frozen).set(verbose=verbose)
     elif isinstance(mf, scf.rhf.RHF):
         mcc = lnoccsd.CCSD(mf, mo_coeff=mo_coeff, frozen=frozen).set(verbose=verbose)

@@ -52,6 +52,18 @@ class QmcParams(QmcParamsBase):
     shift_ema: float = 0.1
     n_eql_blocks: int = 20
     error_method: Literal["gamma", "blocking"] = "gamma"
+    # Outlier handling of the mixed block sampler (prop/blocks_mixed.block_mixed). A walker
+    # is an outlier when its guide local energy is non-finite or further than
+    # sqrt(2/dt) from the running estimate; the guide alone decides.
+    #   "clamp": the walker keeps its weight; its guide energy is replaced by the running
+    #            estimate and its trial component samples by the block's wp-average over
+    #            the non-outlier walkers (the regular sampler's convention in
+    #            prop/blocks.block). Only a non-finite guide energy removes the walker.
+    #   "reject": the walker's weight is zeroed, so it drops out of every average and of
+    #            the population at the next reconfiguration.
+    #   "none":  no threshold; the raw samples enter the averages. Only a non-finite guide
+    #            energy removes the walker (it would otherwise poison the block).
+    mixed_outlier: Literal["clamp", "reject", "none"] = "clamp"
     # Frozen CISD/UCISD and PT component pair samplers use local Cholesky
     # strata on model or combined data/model meshes. False retains global sampling.
     local_cholesky_sampling: bool = field(default=True, kw_only=True)
