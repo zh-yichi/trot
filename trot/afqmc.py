@@ -26,7 +26,7 @@ from .cisd_workflow import (
     cached_representation_key,
     prepare_cisd_modes,
 )
-from .core.system import WalkerKind
+from .core.system import System, WalkerKind
 from .driver import QmcResult
 from .prop.types import QmcParams, QmcParamsBase, QmcParamsFp, QmcParamsLno
 from .runtime_provenance import print_runtime_provenance
@@ -207,8 +207,9 @@ class Afqmc:
     def _resolve_meas_cfg(self, job: Job) -> object | None:
         from .meas.cisd import get_cisd_meas_cfg
         from .meas.rhf import get_rhf_meas_cfg
+        from .meas.stoccsd import get_stoccsd_meas_cfg
 
-        for getter in (get_cisd_meas_cfg, get_rhf_meas_cfg):
+        for getter in (get_cisd_meas_cfg, get_rhf_meas_cfg, get_stoccsd_meas_cfg):
             cfg = getter(job.meas_ops)
             if cfg is not None:
                 return cfg
@@ -1369,6 +1370,8 @@ class AfqmcMixed(Afqmc):
         error_method: Literal["gamma", "blocking"] | None = "blocking",
         tau_eql: float | None = None,
         save_wavefunction: Union[bool, str, Path] | None = None,
+        guide_n_samples: int | None = None,
+        guide_t2_thresh: float | None = None,
     ):
         from pyscf.cc.uccsd import UCCSD
 
@@ -1438,6 +1441,8 @@ class AfqmcMixed(Afqmc):
             trial_mixed_precision=trial_mixed_precision,
             tau_eql=tau_eql,
             save_wavefunction=save_wavefunction,
+            guide_n_samples=guide_n_samples,
+            guide_t2_thresh=guide_t2_thresh,
         )
 
     def _init_mixed_options(
@@ -1451,8 +1456,17 @@ class AfqmcMixed(Afqmc):
         trial_mixed_precision: bool | None,
         tau_eql: float | None,
         save_wavefunction: Union[bool, str, Path] | None,
+        guide_n_samples: int | None = None,
+        guide_t2_thresh: float | None = None,
     ) -> None:
         """The run options on top of Afqmc's, shared by __init__ and from_staged."""
+        # the options of a guide with its own staging / bundle (GuideSpec.stage, .bundle):
+        # for "stoccsd" the determinants per walker and the T2 truncation
+        self.guide_options: dict[str, Any] = {}
+        if guide_n_samples is not None:
+            self.guide_options["n_samples"] = int(guide_n_samples)
+        if guide_t2_thresh is not None:
+            self.guide_options["t2_thresh"] = float(guide_t2_thresh)
         defaults = self.params_cls()
         self.n_prop_steps = defaults.n_prop_steps if n_prop_steps is None else n_prop_steps
         self.walker_kind = cast(WalkerKind, self.recipe.walker_kind)
@@ -1506,6 +1520,7 @@ class AfqmcMixed(Afqmc):
         return super()._key() + (
             self.trial,
             self.guide,
+            tuple(sorted(self.guide_options.items())),
             None if self.basis_a is None else id(self.basis_a),
             None if self.basis_b is None else id(self.basis_b),
         )
@@ -1560,6 +1575,13 @@ class AfqmcMixed(Afqmc):
                     verbose=self.verbose,
                 )
             )
+            # a guide with its own stager (GuideSpec.stage) is staged from the CC object
+            # and replaces what the branch's staging would make of it
+            guide_trial = (
+                guide_spec.stage(self._cc, frozen=norb_frozen, options=self.guide_options)
+                if guide_spec.stage is not None
+                else None
+            )
             staged = stage_inputs(
                 guide_src,
                 norb_frozen_core=norb_frozen,
@@ -1568,6 +1590,7 @@ class AfqmcMixed(Afqmc):
                 overwrite=self.overwrite_cache if self.cache is not None else False,
                 verbose=self.verbose,
                 ham=ham,
+                trial=guide_trial,
             )
         if staged.trial.kind not in guide_spec.kinds:
             raise ValueError(
@@ -1612,6 +1635,7 @@ class AfqmcMixed(Afqmc):
                 mixed_precision=self.guide_mixed_precision,
                 trial_mixed_precision=self.trial_mixed_precision,
                 params=cast(Any, qmc_params),
+                **self._guide_bundle_overrides(staged, kwargs),
                 **kwargs,
             ),
         )
@@ -1621,6 +1645,27 @@ class AfqmcMixed(Afqmc):
 
         self._job = job
         return job
+
+    def _guide_bundle_overrides(self, staged: StagedInputs, kwargs: dict) -> dict[str, Any]:
+        """
+        The trial_data / trial_ops / meas_ops / prop_ops overrides of a guide that builds
+        its own bundle (GuideSpec.bundle), empty for the branch's own guides or when the
+        caller passes any of them.
+        """
+        bundle = self.recipe.guide_spec.bundle
+        names = ("trial_data", "trial_ops", "meas_ops", "prop_ops")
+        if bundle is None or any(kwargs.get(name) is not None for name in names):
+            return {}
+        sys = System(
+            norb=int(staged.ham.norb), nelec=tuple(staged.ham.nelec), walker_kind=self.walker_kind
+        )
+        td, to, mo, po = bundle(
+            staged.trial.data,
+            sys,
+            mixed_precision=self.guide_mixed_precision,
+            options=self.guide_options,
+        )
+        return dict(zip(names, (td, to, mo, po)))
 
     def _frozen_core_label(self, meta: dict) -> Any:
         """
@@ -1653,7 +1698,10 @@ class AfqmcMixed(Afqmc):
         print(f" cache           = {str(self.cache) if self.cache else None}")
         print(f" mixed_precision = {self.mixed_precision}")
         print(f"   guide           = {self.guide_mixed_precision}")
-        print(f"   trial           = {self.trial_mixed_precision}\n")
+        print(f"   trial           = {self.trial_mixed_precision}")
+        if self.guide_options:
+            print(f" guide_options   = {self.guide_options}")
+        print("")
 
         # the guide propagates the walkers, so it carries a force bias; the trial only
         # measures, so it has none
@@ -1885,6 +1933,7 @@ class AfqmcMixed(Afqmc):
         error_method: Literal["gamma", "blocking"] | None = "blocking",
         tau_eql: float | None = None,
         save_wavefunction: Union[bool, str, Path] | None = None,
+        guide_n_samples: int | None = None,
     ) -> "AfqmcMixed":
         """
         The run from a file save_staged wrote, with no mean field or CC object: the
@@ -1978,6 +2027,7 @@ class AfqmcMixed(Afqmc):
             trial_mixed_precision=trial_mixed_precision,
             tau_eql=tau_eql,
             save_wavefunction=save_wavefunction,
+            guide_n_samples=guide_n_samples,
         )
         af.staged_file = p
         af._staged = staged

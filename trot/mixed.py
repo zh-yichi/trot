@@ -13,6 +13,14 @@ setup_u._make_trial_bundle_uh on the unrestricted hamiltonian) builds it. The tr
 everything that touches the measurement: its overlap, an energy kernel that returns named
 components per walker, and how the wp-averaged components combine into an energy.
 
+A guide that is not one of the branch's trial kinds brings its own staging, bundle and
+block function on its GuideSpec (stage / bundle / mixed_block_fn); AfqmcMixed feeds them
+through setup_mixed's trial_data / trial_ops / meas_ops / prop_ops overrides. The
+stochastically sampled CCSD guide "stoccsd" (trial/stoccsd.py, prop/afqmc_stocc.py,
+prop/blocks_mixed_stocc.py) is such a guide: every walker carries its own sample of
+n_samples determinants, redrawn at every step (AfqmcMixed's guide_n_samples and
+guide_t2_thresh).
+
 So guides and trials are registered separately (GUIDES, TRIALS) and paired on demand:
 get_mixed_recipe(trial, guide) checks that the two agree on the hamiltonian basis and on a
 walker kind, and returns the MixedRecipe that setup_mixed and JobMixed consume.
@@ -25,7 +33,15 @@ The trials registered here are the plain pt2CCSD estimators,
     "upt2ccsd_bar"  unrestricted hamiltonian, exp(T1) applied to the right, chunked
 
 all with the components (theta, electronic_0, h_t) and the energy
-h0 + <electronic_0> + <h_t> - <theta><electronic_0> (meas.pt2ccsd.combine_first_order_energy).
+h0 + <electronic_0> + <h_t> - <theta><electronic_0> (meas.pt2ccsd.combine_first_order_energy),
+and the plain local energy estimators
+
+    "rhf"           restricted hamiltonian, meas/rhf.py:  <HF|H|phi>/<HF|phi>
+    "cisd"          restricted hamiltonian, meas/cisd.py: <CISD|H|phi>/<CISD|phi>, the CISD
+                    built from the CC amplitudes (staging._stage_cisd_input)
+
+with the one component ("energy") and energy_fn single_component_energy, which returns
+it; these measure the energy a plain Afqmc run with that trial would, under whatever guide.
 """
 
 from __future__ import annotations
@@ -52,9 +68,20 @@ from .meas.upt2ccsd_uh import (
     plan_chunking_for_run_u,
 )
 from .prop.blocks_mixed import PT2_COMPONENTS, MixedBlockFn, block_mixed
-from .staging import StagedMfOrCc, TrialInput, _is_cc_like, _stage_pt2ccsd_input
+from .prop.blocks_mixed_stocc import block_mixed_stocc
+from .staging import (
+    StagedMfOrCc,
+    TrialInput,
+    _is_cc_like,
+    _stage_cisd_input,
+    _stage_mf_input,
+    _stage_pt2ccsd_input,
+)
+from .staging_stoccsd import STOCCSD_KIND, stage_stoccsd_guide
 from .staging_u import stage_upt2ccsd_trial_uh
+from .trial.cisd import make_cisd_trial_data
 from .trial.pt2ccsd import make_pt2ccsd_trial_data
+from .trial.rhf import make_rhf_trial_data
 from .trial.upt2ccsd_uh import make_upt2ccsd_trial_data
 
 WALKER_KIND_ORDER: tuple[str, ...] = ("restricted", "unrestricted", "generalized")
@@ -67,6 +94,27 @@ def _scf_of(obj: Any) -> Any:
 def stage_pt2ccsd_trial(cc: Any, *, frozen: int | None = None) -> TrialInput:
     """The restricted pt2CCSD trial of a pyscf CCSD object (staging._stage_pt2ccsd_input)."""
     return _stage_pt2ccsd_input(StagedMfOrCc(cc, frozen))
+
+
+def stage_rhf_trial(cc: Any, *, frozen: int | None = None) -> TrialInput:
+    """The RHF trial of the mean field under a pyscf CCSD object (staging._stage_mf_input)."""
+    tr = _stage_mf_input(StagedMfOrCc(_scf_of(cc), frozen))
+    if tr.kind != "rhf":
+        raise ValueError(f"the mean field under the CC object stages as {tr.kind!r}, not 'rhf'.")
+    return tr
+
+
+def stage_cisd_trial(cc: Any, *, frozen: int | None = None) -> TrialInput:
+    """The restricted CISD trial of a pyscf CCSD object's amplitudes (staging._stage_cisd_input)."""
+    return _stage_cisd_input(StagedMfOrCc(cc, frozen))
+
+
+ONE_COMPONENT: tuple[str, ...] = ("energy",)
+
+
+def single_component_energy(h0: Any, components: Any) -> Any:
+    """The energy of a trial whose kernel returns the full local energy as its one component."""
+    return components[..., 0]
 
 
 @dataclass(frozen=True)
@@ -86,6 +134,15 @@ class GuideSpec:
                    None where that guide's energy has no such knob on that hamiltonian.
                    setup_mixed uses it to run the guide energy with the trial's chunk
                    plan; mixed_precision is the guide's, for the kernels that honour it
+    stage:         optional (cc, *, frozen, options) -> TrialInput, for a guide the
+                   branch's staging does not produce from the object itself; AfqmcMixed
+                   stages the guide with it (options: AfqmcMixed's guide options)
+    bundle:        optional (TrialInput.data, sys, *, mixed_precision, options) ->
+                   (trial_data, trial_ops, meas_ops, prop_ops), for a guide
+                   setup._make_trial_bundle does not know; passed to setup_mixed as the
+                   overrides
+    mixed_block_fn:
+                   the block function of this guide's runs, block_mixed by default
     """
 
     name: str
@@ -94,6 +151,9 @@ class GuideSpec:
     ham_bases: frozenset[str]
     walker_kinds: frozenset[str]
     chunked_meas_ops: Callable[..., MeasOps | None] | None = None
+    stage: Callable[..., TrialInput] | None = None
+    bundle: Callable[..., tuple[Any, Any, MeasOps, Any]] | None = None
+    mixed_block_fn: MixedBlockFn | None = None
 
     def source_obj(self, obj: Any) -> Any:
         """The pyscf object the guide is staged from."""
@@ -112,7 +172,7 @@ class TrialSpec:
     """
     A wavefunction the energy can be measured against.
 
-    name:           "pt2ccsd", "pt2ccsd_bar", "upt2ccsd", "upt2ccsd_bar"
+    name:           "rhf", "cisd", "pt2ccsd", "pt2ccsd_bar", "upt2ccsd", "upt2ccsd_bar"
     kind:           the TrialInput.kind stage() must produce, checked after staging
     stage:          (pyscf cc, *, frozen) -> TrialInput
     make_data:      (TrialInput.data, sys) -> trial pytree
@@ -245,6 +305,38 @@ def _cisd_chunked_meas_ops(
     return make_cisd_meas_ops_rh(sys, mixed_precision=mixed_precision, nchol_chunk=int(nchol_chunk))
 
 
+def _stoccsd_stage(
+    cc: Any, *, frozen: int | None = None, options: dict | None = None
+) -> TrialInput:
+    """The sampled CCSD guide's staging; options["t2_thresh"] truncates the T2 modes."""
+    opts = options or {}
+    return stage_stoccsd_guide(cc, frozen=frozen, t2_thresh=float(opts.get("t2_thresh", 1e-6)))
+
+
+def _stoccsd_bundle(
+    data: dict, sys: Any, *, mixed_precision: bool = False, options: dict | None = None
+) -> tuple[Any, Any, MeasOps, Any]:
+    """
+    (guide data, trial ops, meas ops, prop ops) of the sampled CCSD guide;
+    options["n_samples"] determinants per walker (10 by default), options["seed"] draws
+    the sample the initial population starts from.
+    """
+    from .meas.stoccsd import make_stoccsd_meas_ops
+    from .prop.afqmc_stocc import make_stocc_prop_ops
+    from .trial.stoccsd import make_stoccsd_trial_data, make_stoccsd_trial_ops
+
+    opts = options or {}
+    guide = make_stoccsd_trial_data(
+        data, sys, n_samples=int(opts.get("n_samples", 10)), seed=int(opts.get("seed", 0))
+    )
+    return (
+        guide,
+        make_stoccsd_trial_ops(sys),
+        make_stoccsd_meas_ops(sys, mixed_precision=bool(mixed_precision)),
+        make_stocc_prop_ops("restricted", sys.walker_kind, mixed_precision=bool(mixed_precision)),
+    )
+
+
 GUIDES: dict[str, GuideSpec] = {
     "rhf": GuideSpec(
         name="rhf",
@@ -282,6 +374,18 @@ GUIDES: dict[str, GuideSpec] = {
         walker_kinds=frozenset({"unrestricted", "generalized"}),
         chunked_meas_ops=_ucisd_chunked_meas_ops,
     ),
+    # the stochastically sampled CCSD, a per walker multi-determinant guide redrawn at
+    # every step; its own staging, kernels, propagator and block function
+    "stoccsd": GuideSpec(
+        name="stoccsd",
+        kinds=frozenset({STOCCSD_KIND}),
+        source="cc",
+        ham_bases=frozenset({"restricted"}),
+        walker_kinds=frozenset({"restricted"}),
+        stage=_stoccsd_stage,
+        bundle=_stoccsd_bundle,
+        mixed_block_fn=block_mixed_stocc,
+    ),
 }
 
 
@@ -297,7 +401,51 @@ def _make_pt2ccsd_meas_ops(
     return make_pt2ccsd_meas_ops(sys, mixed_precision=mixed_precision)
 
 
+def _make_rhf_trial_meas_ops(
+    sys: Any, *, mixed_precision: bool = True, nchol_chunk: int | None = None
+) -> MeasOps:
+    """meas.rhf's factory in the mixed signature; its energy is double and unchunked."""
+    from .meas.rhf import make_rhf_meas_ops
+
+    return make_rhf_meas_ops(sys)
+
+
+def _make_cisd_trial_meas_ops(
+    sys: Any, *, mixed_precision: bool = True, nchol_chunk: int | None = None
+) -> MeasOps:
+    """meas.cisd's factory in the mixed signature; it scans the cholesky vectors one at a time."""
+    from .meas.cisd import make_cisd_meas_ops
+
+    return make_cisd_meas_ops(sys, mixed_precision=mixed_precision)
+
+
 TRIALS: dict[str, TrialSpec] = {
+    "rhf": TrialSpec(
+        name="rhf",
+        kind="rhf",
+        stage=stage_rhf_trial,
+        make_data=make_rhf_trial_data,
+        make_meas_ops=_make_rhf_trial_meas_ops,
+        components=ONE_COMPONENT,
+        energy_fn=single_component_energy,
+        ham_basis="restricted",
+        walker_kinds=frozenset({"restricted"}),
+        cc_kind="ccsd",
+        default_guide="rhf",
+    ),
+    "cisd": TrialSpec(
+        name="cisd",
+        kind="cisd",
+        stage=stage_cisd_trial,
+        make_data=make_cisd_trial_data,
+        make_meas_ops=_make_cisd_trial_meas_ops,
+        components=ONE_COMPONENT,
+        energy_fn=single_component_energy,
+        ham_basis="restricted",
+        walker_kinds=frozenset({"restricted"}),
+        cc_kind="ccsd",
+        default_guide="rhf",
+    ),
     "pt2ccsd": TrialSpec(
         name="pt2ccsd",
         kind="pt2ccsd",
@@ -393,7 +541,7 @@ def pair_recipe(guide: GuideSpec, trial: TrialSpec) -> MixedRecipe:
         stage_trial=trial.stage,
         make_trial_data=trial.make_data,
         make_trial_meas_ops=trial.make_meas_ops,
-        mixed_block_fn=block_mixed,
+        mixed_block_fn=guide.mixed_block_fn or block_mixed,
         components=trial.components,
         energy_fn=trial.energy_fn,
         plan_chunking=trial.plan_chunking,
@@ -466,4 +614,8 @@ __all__ = [
     "available_guides",
     "available_trials",
     "stage_pt2ccsd_trial",
+    "stage_rhf_trial",
+    "stage_cisd_trial",
+    "single_component_energy",
+    "ONE_COMPONENT",
 ]
