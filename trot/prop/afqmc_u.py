@@ -16,7 +16,7 @@ from jax.sharding import Mesh
 
 from ..core.ops import MeasOps, TrialOps
 from ..walkers import init_walkers_uh
-from .afqmc import afqmc_step, init_prop_state
+from .afqmc import afqmc_step, afqmc_step_probe, init_prop_state
 from .chol_afqmc_ops_u import CholAfqmcCtxU, _build_prop_ctx_u, make_trotter_ops_u
 from .types import PropOps, PropState, QmcParamsBase
 
@@ -107,3 +107,47 @@ def make_prop_ops_u(
         )
 
     return PropOps(init_prop_state=init_prop_state_uh, build_prop_ctx=build_prop_ctx, step=step)
+
+
+def make_prop_ops_u_probe(
+    ham_basis: str,
+    walker_kind: str,
+    mixed_precision: bool = False,
+    packed_cholesky: bool = False,
+) -> PropOps:
+    """
+    make_prop_ops_u with the probing step (prop/afqmc.afqmc_step_probe): ``step`` returns
+    (PropState, StepProbe), for prop/blocks_mixed_probe.block_mixed_probe.
+    """
+    base = make_prop_ops_u(
+        ham_basis, walker_kind, mixed_precision=mixed_precision, packed_cholesky=packed_cholesky
+    )
+    trotter_ops = make_trotter_ops_u(ham_basis, walker_kind, mixed_precision=mixed_precision)
+
+    def step_probe(
+        state: PropState,
+        *,
+        params: QmcParamsBase,
+        ham_data: Any,
+        trial_data: Any,
+        trial_ops: TrialOps,
+        meas_ops: MeasOps,
+        meas_ctx: Any,
+        prop_ctx: Any,
+    ) -> Any:
+        return afqmc_step_probe(
+            state,
+            params=params,
+            ham_data=ham_data,
+            trial_data=trial_data,
+            meas_ops=meas_ops,
+            meas_ctx=meas_ctx,
+            prop_ctx=prop_ctx,
+            trotter_ops=trotter_ops,  # type: ignore[arg-type]
+        )
+
+    return PropOps(
+        init_prop_state=base.init_prop_state,
+        build_prop_ctx=base.build_prop_ctx,
+        step=step_probe,  # type: ignore[arg-type]
+    )

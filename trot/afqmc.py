@@ -1308,6 +1308,17 @@ class AfqmcMixed(Afqmc):
         blocks is derived from it, n_eql_blocks = ceil(tau_eql / (dt * n_prop_steps)), so
         the run equilibrates to (at least) tau_eql whatever the time step and the steps
         per block are. It cannot be combined with n_eql_blocks.
+    probe : bool, optional
+        Probe the importance sampling, by default False. The propagation is unchanged but
+        runs with the probing step (prop/afqmc.afqmc_step_probe); every printed row then
+        also carries the averages over the walkers and the steps, weighted with the walker
+        weights, of |force bias| (the norm over the fields, mean field part subtracted),
+        the root mean square of the force bias per field (the root of the average of
+        the mean square over the fields, ``probe_means["probe_fb_rms"]``),
+        ln|importance function| and cos(theta), and the variance of ln|importance
+        function| over the walkers within a step. The sampling averages are kept in
+        ``probe_means`` and the per block values in ``qmc_result.probe_blocks``. Not for
+        the ``"stoccsd"`` guide.
     save_wavefunction : bool, str or Path, optional
         Save snapshots of the AFQMC wavefunction, the walker population (walkers,
         weights, guide overlaps) with the orbital basis it is expressed in, at tau = 0
@@ -1372,6 +1383,7 @@ class AfqmcMixed(Afqmc):
         save_wavefunction: Union[bool, str, Path] | None = None,
         guide_n_samples: int | None = None,
         guide_t2_thresh: float | None = None,
+        probe: bool = False,
     ):
         from pyscf.cc.uccsd import UCCSD
 
@@ -1443,6 +1455,7 @@ class AfqmcMixed(Afqmc):
             save_wavefunction=save_wavefunction,
             guide_n_samples=guide_n_samples,
             guide_t2_thresh=guide_t2_thresh,
+            probe=probe,
         )
 
     def _init_mixed_options(
@@ -1458,8 +1471,12 @@ class AfqmcMixed(Afqmc):
         save_wavefunction: Union[bool, str, Path] | None,
         guide_n_samples: int | None = None,
         guide_t2_thresh: float | None = None,
+        probe: bool = False,
     ) -> None:
         """The run options on top of Afqmc's, shared by __init__ and from_staged."""
+        # probe the importance sampling: the probing step and block function
+        self.probe = bool(probe)
+        self.probe_means: dict[str, tuple[float, float | None]] | None = None
         # the options of a guide with its own staging / bundle (GuideSpec.stage, .bundle):
         # for "stoccsd" the determinants per walker and the T2 truncation
         self.guide_options: dict[str, Any] = {}
@@ -1635,6 +1652,7 @@ class AfqmcMixed(Afqmc):
                 mixed_precision=self.guide_mixed_precision,
                 trial_mixed_precision=self.trial_mixed_precision,
                 params=cast(Any, qmc_params),
+                **({"probe": True} if self.probe else {}),
                 **self._guide_bundle_overrides(staged, kwargs),
                 **kwargs,
             ),
@@ -1701,6 +1719,8 @@ class AfqmcMixed(Afqmc):
         print(f"   trial           = {self.trial_mixed_precision}")
         if self.guide_options:
             print(f" guide_options   = {self.guide_options}")
+        if self.probe:
+            print(f" probe           = {self.probe}")
         print("")
 
         # the guide propagates the walkers, so it carries a force bias; the trial only
@@ -1795,6 +1815,7 @@ class AfqmcMixed(Afqmc):
         self.guide_e_err = float(qmc_result.guide_stderr_energy)
         self.e_tot = float(qmc_result.trial_mean_energy)
         self.e_err = float(qmc_result.trial_stderr_energy)
+        self.probe_means = getattr(qmc_result, "probe_means", None)
         return self.e_tot, self.e_err
 
     run = kernel
@@ -1934,6 +1955,7 @@ class AfqmcMixed(Afqmc):
         tau_eql: float | None = None,
         save_wavefunction: Union[bool, str, Path] | None = None,
         guide_n_samples: int | None = None,
+        probe: bool = False,
     ) -> "AfqmcMixed":
         """
         The run from a file save_staged wrote, with no mean field or CC object: the
@@ -2028,6 +2050,7 @@ class AfqmcMixed(Afqmc):
             tau_eql=tau_eql,
             save_wavefunction=save_wavefunction,
             guide_n_samples=guide_n_samples,
+            probe=probe,
         )
         af.staged_file = p
         af._staged = staged

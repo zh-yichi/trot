@@ -29,7 +29,10 @@ from .meas.pt2ccsd_chunking import (
     pytree_bytes,
 )
 from .mixed import MixedRecipe, get_mixed_recipe
+from .prop.afqmc import make_prop_ops_probe
+from .prop.afqmc_u import make_prop_ops_u_probe
 from .prop.blocks import block as default_block
+from .prop.blocks_mixed_probe import block_mixed_probe
 from .prop.types import QmcParams, QmcParamsBase
 from .setup import Job, _assemble_job, _make_params, _make_prop, _resolve_default_walker_kind
 from .setup_u import setup_uh
@@ -254,6 +257,8 @@ def setup_mixed(
     meas_ops: Any = None,
     prop_ops: Any = None,
     block_fn: Callable[..., Any] | None = None,
+    # probe the importance sampling: the probing step and its block function
+    probe: bool = False,
     # extra kwargs
     params_kwargs: dict[str, Any] | None = None,
     prop_kwargs: dict[str, Any] | None = None,
@@ -281,9 +286,25 @@ def setup_mixed(
     may raise it further after compiling. nchol_chunk, when given, is taken as fixed and
     only n_chunks is derived.
 
+    probe=True runs the same propagation with the probing step
+    (prop/afqmc.afqmc_step_probe) and the block function block_mixed_probe, which adds the
+    block averages of |force bias|, ln|importance function|, its variance over the walkers
+    and cos(theta); the driver
+    prints them. It is for the guides that use the branch's own propagator and
+    block_mixed, not for a guide with its own (stoccsd) or a prop_ops passed in.
+
     Basic usage is through AfqmcMixed rather than this function directly.
     """
     rec = get_mixed_recipe(recipe) if isinstance(recipe, str) else recipe
+    if probe:
+        if rec.guide_spec.mixed_block_fn is not None or rec.guide_spec.bundle is not None:
+            raise NotImplementedError(
+                f"probe=True is not implemented for guide={rec.guide!r}, which has its own "
+                "propagator and block function."
+            )
+        if prop_ops is not None:
+            raise ValueError("probe=True builds its own prop_ops; do not pass one.")
+        rec = replace(rec, mixed_block_fn=block_mixed_probe)
     trial_mp = mixed_precision if trial_mixed_precision is None else bool(trial_mixed_precision)
     if trial_input is None:
         raise ValueError(
@@ -344,6 +365,13 @@ def setup_mixed(
             walker_kind_resolver=_resolve_default_walker_kind,
         )
     job = cast(JobMixed, job)
+
+    if probe:
+        # the same propagator with the probing step, see prop/blocks_mixed_probe.py
+        make_probe = make_prop_ops_u_probe if rec.ham_basis == "uchol" else make_prop_ops_probe
+        job.prop_ops = make_probe(
+            job.ham_data.basis, job.sys.walker_kind, mixed_precision=mixed_precision
+        )
 
     # attach the measurement trial
     job.recipe = rec

@@ -106,6 +106,45 @@ def block_mixed(
 
     state, _ = lax.scan(_scan_step, state, xs=None, length=params.n_prop_steps)
 
+    return measure_block_mixed(
+        state,
+        sys=sys,
+        params=params,
+        ham_data=ham_data,
+        guide_data=guide_data,
+        guide_meas_ops=guide_meas_ops,
+        guide_meas_ctx=guide_meas_ctx,
+        trial_data=trial_data,
+        trial_meas_ops=trial_meas_ops,
+        trial_meas_ctx=trial_meas_ctx,
+        sr_fn=sr_fn,
+        measure_trial=measure_trial,
+        components=components,
+    )
+
+
+def measure_block_mixed(
+    state: PropState,
+    *,
+    sys: System,
+    params: QmcParams,
+    ham_data: Any,
+    guide_data: Any,
+    guide_meas_ops: MeasOps,
+    guide_meas_ctx: Any,
+    trial_data: Any,
+    trial_meas_ops: MeasOps,
+    trial_meas_ctx: Any,
+    sr_fn: Callable = wk.stochastic_reconfiguration,
+    measure_trial: bool = True,
+    components: tuple[str, ...] = PT2_COMPONENTS,
+) -> tuple[PropState, BlockObs]:
+    """
+    What block_mixed does after the n_prop_steps of propagation: orthonormalization, the
+    guide's local energy with the outlier handling, the trial's components and the
+    stochastic reconfiguration. Shared with the block functions that only differ in the
+    propagation (prop/blocks_mixed_probe.block_mixed_probe).
+    """
     walkers_new = wk.orthonormalize(state.walkers, sys.walker_kind)
     guide_overlaps = wk.vmap_chunked(
         guide_meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None)

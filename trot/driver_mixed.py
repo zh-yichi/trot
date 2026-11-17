@@ -35,6 +35,7 @@ from .driver import (
     _print_energy_error_analysis,
 )
 from .prop.blocks_mixed import PT2_COMPONENTS, MixedBlockFn
+from .prop.blocks_mixed_probe import PROBE_SCALARS, block_mixed_probe
 from .prop.types import PropOps, PropState, QmcParams
 from .stat_utils import (
     blocking_analysis_components,
@@ -70,6 +71,14 @@ class MixedQmcResult(NamedTuple):
     guide_analysis: EnergyErrorAnalysis
     trial_analysis: EnergyErrorAnalysis
     final_state: PropState
+    # probe runs only (block_mixed_probe): per sampling block, the weight sum of the probe
+    # averages and the block averages of |force bias|, its mean square per field,
+    # ln|importance function|, its
+    # variance over the walkers and cos(theta); probe_means holds (mean, blocking error or
+    # None) of each over the sampling, and of "probe_fb_rms", the root of the mean square
+    probe_block_weights: np.ndarray | None = None
+    probe_blocks: dict[str, np.ndarray] | None = None
+    probe_means: dict[str, tuple[float, float | None]] | None = None
 
 
 def make_run_mixed_blocks(
@@ -173,6 +182,46 @@ def _progress_trial(h0, weights, comps, energy_fn):
     return float(stats["mu"]), stats["se_star"]
 
 
+PROBE_LABELS: dict[str, str] = {
+    "probe_fb_norm": "|fb|",
+    "probe_fb_ms": "rms fb",
+    "probe_ln_imp": "ln|I|",
+    "probe_var_ln_imp": "var ln|I|",
+    "probe_cos_theta": "cos(theta)",
+}
+# ln|I| and its variance are small numbers of either sign: printed in scientific format
+PROBE_FORMATS: dict[str, str] = {
+    "probe_fb_norm": "14.10f",
+    "probe_fb_ms": "14.10f",
+    "probe_ln_imp": "14.6e",
+    "probe_var_ln_imp": "14.6e",
+    "probe_cos_theta": "14.10f",
+}
+# averaged as they are and printed as their square root: the mean square of the force bias
+# per field, shown as the root mean square per field ("rms fb")
+PROBE_ROOT: frozenset[str] = frozenset({"probe_fb_ms"})
+
+
+def _probe_header() -> str:
+    return "".join(f"  {PROBE_LABELS[name]:>14s}" for name in PROBE_SCALARS)
+
+
+def _probe_row(weights: Any, blocks: dict[str, Any] | None) -> str:
+    """The probe columns of a printed row: the weighted averages over the given blocks."""
+    if blocks is None:
+        return "".join(f"  {'-':>14s}" for _ in PROBE_SCALARS)
+    w = np.asarray(weights, dtype=float)
+    w_sum = float(np.sum(w))
+    out = ""
+    for name in PROBE_SCALARS:
+        x = np.asarray(blocks[name], dtype=float)
+        avg = float(np.sum(w * x) / w_sum) if w_sum != 0.0 else float("nan")
+        if name in PROBE_ROOT:
+            avg = float(np.sqrt(avg))
+        out += f"  {avg:{PROBE_FORMATS[name]}}"
+    return out
+
+
 def run_mixed_qmc(
     *,
     sys: System,
@@ -212,7 +261,14 @@ def run_mixed_qmc(
     (energy_fn(h0, components), the last axis being the component axis). The trial is
     measured at tau = 0 and during sampling, not during equilibration. target_error stops
     the sampling once the trial energy's blocking error is below it.
+
+    With the probing block function (prop/blocks_mixed_probe.block_mixed_probe) every
+    printed row also carries the averages of |force bias|, the root mean square of the
+    force bias per field, ln|importance function|, its
+    variance over the walkers and cos(theta): over the blocks of the row in the equilibration, over the sampling blocks
+    so far in the sampling.
     """
+    probe = mix_block_fn is block_mixed_probe
     for name in observable_names:
         guide_meas_ops.require_observable(name)
 
@@ -285,6 +341,7 @@ def run_mixed_qmc(
         print(
             f"{'':4s}{'block':>9s}  {'tau':>6s}  {'Guide_E_blk':>14s}  {'Guide_W_blk':>12s}   "
             f"{'Trial_E_blk':>14s}  {'Trial_W_blk':>12s}   {'nodes':>10s}  {'t[s]':>8s}"
+            + (_probe_header() if probe else "")
         )
     print(
         f"[eql {0:4d}/{params.n_eql_blocks}]  "
@@ -294,7 +351,7 @@ def run_mixed_qmc(
         f"{float(trial_energy0.real):14.10f}  "
         f"{float(trial_weights0.real):12.6e}  "
         f"{int(state.node_encounters):10d}  "
-        f"{0.0:8.1f}"
+        f"{0.0:8.1f}" + (_probe_row(None, None) if probe else "")
     )
     chunk = print_every if print_every > 0 else 1
     for start in range(0, params.n_eql_blocks, chunk):
@@ -325,6 +382,7 @@ def run_mixed_qmc(
             f"{'-':>14s}  {'-':>12s}  "
             f"{int(state.node_encounters):10d}  "
             f"{time.perf_counter() - t0:8.1f}"
+            + (_probe_row(scalars_chunk["probe_weight"], scalars_chunk) if probe else "")
         )
         if snapshot_fn is not None:
             snapshot_fn(
@@ -349,11 +407,14 @@ def run_mixed_qmc(
     guide_block_e_sp: list = []
     trial_block_w_sp: list = []
     trial_comp_sp: list = []  # rows of (n_components,)
+    probe_w_sp: list = []
+    probe_sp: dict[str, list] = {name: [] for name in PROBE_SCALARS}
 
     if print_every:
         print(
             f"{'':4s}{'block':>9s}  {'Guide_E_avg':>14s}  {'Guide_E_err':>10s}  {'Guide_W':>12s}  "
             f"{'Trial_E_avg':>14s}  {'Trial_E_err':>10s}  {'nodes':>10s}  {'dt[s/bl]':>10s}  {'t[s]':>7s}"
+            + (_probe_header() if probe else "")
         )
 
     chunk = print_every if print_every > 0 else 1
@@ -374,6 +435,10 @@ def run_mixed_qmc(
         guide_block_e_sp.extend(scalars_chunk["guide_energy"].tolist())
         trial_block_w_sp.extend(scalars_chunk["trial_weight"].tolist())
         trial_comp_sp.extend(np.asarray(scalars_chunk["trial_components"]))
+        if probe:
+            probe_w_sp.extend(scalars_chunk["probe_weight"].tolist())
+            for name in PROBE_SCALARS:
+                probe_sp[name].extend(scalars_chunk[name].tolist())
 
         elapsed = time.perf_counter() - t0
         dt_per_block = (time.perf_counter() - t_mark) / float(n)
@@ -395,7 +460,7 @@ def run_mixed_qmc(
             f"{(f'{float(trial_error):10.3e}' if trial_error is not None else ' ' * 10)}  "
             f"{int(state.node_encounters):10d}  "
             f"{dt_per_block:9.3f}  "
-            f"{elapsed:8.1f}"
+            f"{elapsed:8.1f}" + (_probe_row(probe_w_sp, probe_sp) if probe else "")
         )
         if snapshot_fn is not None:
             snapshot_fn(
@@ -446,6 +511,32 @@ def run_mixed_qmc(
         f"{trial_analysis.stderr:.6f} (1-sigma, {params.error_method})"
     )
 
+    # ---------------------------------------------------------------- probe statistics
+    probe_means: dict[str, tuple[float, float | None]] | None = None
+    if probe:
+        probe_means = {}
+        print("\nProbe averages over the sampling phase (walkers and steps, weighted):")
+        for name in PROBE_SCALARS:
+            stats = blocking_analysis_ratio(
+                np.asarray(probe_sp[name]), np.asarray(probe_w_sp), print_q=False
+            )
+            mu, se = float(stats["mu"]), stats["se_star"]
+            if name in PROBE_ROOT:
+                # the root of the average, with the error propagated: d sqrt(x) = dx / (2 sqrt(x))
+                probe_means[name] = (mu, None if se is None else float(se))
+                mu = float(np.sqrt(mu))
+                se = None if se is None else float(se) / (2.0 * mu)
+                name = "probe_fb_rms"
+                probe_means[name] = (mu, se)
+                print(f" {'rms fb':<12s} = {mu:14.10f}"
+                      + ("" if se is None else f" +/- {se:.3e}") + "   (per field)")
+                continue
+            probe_means[name] = (mu, None if se is None else float(se))
+            err = "" if se is None else f" +/- {float(se):.3e}"
+            print(f" {PROBE_LABELS[name]:<12s} = {mu:{PROBE_FORMATS[name].strip()}}{err}")
+            if name == "probe_cos_theta":
+                print(f" {'1-cos(theta)':<12s} = {1.0 - mu:.6e}{err}")
+
     return MixedQmcResult(
         guide_mean_energy=guide_analysis.mean,
         guide_stderr_energy=guide_analysis.stderr,
@@ -465,4 +556,7 @@ def run_mixed_qmc(
         trial_analysis=trial_analysis,
         # the jitted block runner returns an untyped state; it is the PropState it was given
         final_state=cast(PropState, state),
+        probe_block_weights=np.asarray(probe_w_sp) if probe else None,
+        probe_blocks={name: np.asarray(probe_sp[name]) for name in PROBE_SCALARS} if probe else None,
+        probe_means=probe_means,
     )

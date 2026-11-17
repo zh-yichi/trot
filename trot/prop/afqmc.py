@@ -13,7 +13,7 @@ from ..ham.chol import HamBasis, HamChol
 from ..sharding import shard_prop_state
 from ..walkers import init_walkers
 from .chol_afqmc_ops import CholAfqmcCtx, TrotterOps, _build_prop_ctx, make_trotter_ops
-from .types import PropOps, PropState, QmcParamsBase
+from .types import PropOps, PropState, QmcParamsBase, StepProbe
 
 
 def init_prop_state(
@@ -154,6 +154,92 @@ def afqmc_step(
     )
 
 
+def afqmc_step_probe(
+    state: PropState,
+    *,
+    params: QmcParamsBase,
+    ham_data: HamChol,
+    trial_data: Any,
+    meas_ops: MeasOps,
+    trotter_ops: TrotterOps,
+    prop_ctx: CholAfqmcCtx,
+    meas_ctx: Any,
+) -> tuple[PropState, StepProbe]:
+    """
+    A copy of afqmc_step that also returns, per walker, the quantities of the importance
+    sampling of the step it takes (StepProbe): the norm and the mean square per field of
+    the mean field subtracted force bias, ln|importance function| and cos(theta). The step itself is afqmc_step's: the same
+    fields, walkers and weights.
+    """
+
+    key, subkey = jax.random.split(state.rng_key)
+    nw = wk.n_walkers(state.walkers)
+    fields = jax.random.normal(subkey, (nw, prop_ctx.chol_flat.shape[0]))
+
+    fb_kernel = meas_ops.require_kernel(k_force_bias)
+    force_bias = wk.vmap_chunked(
+        fb_kernel, n_chunks=params.n_chunks, in_axes=(0, None, None, None)
+    )(state.walkers, ham_data, meas_ctx, trial_data)
+    field_shifts = -prop_ctx.sqrt_dt * (1.0j * force_bias - prop_ctx.mf_shifts)
+    shifted_fields = fields - field_shifts
+
+    shift_term = jnp.sum(shifted_fields * prop_ctx.mf_shifts, axis=1)
+    fb_term = jnp.sum(fields * field_shifts - 0.5 * field_shifts * field_shifts, axis=1)
+    walkers_new = wk.vmap_chunked(
+        trotter_ops.apply_trotter, n_chunks=params.n_chunks, in_axes=(0, 0, None, None)
+    )(state.walkers, shifted_fields, prop_ctx, params.n_exp_terms)
+
+    overlaps_new = wk.vmap_chunked(meas_ops.overlap, n_chunks=params.n_chunks, in_axes=(0, None))(
+        walkers_new, trial_data
+    )
+    ratio = overlaps_new / state.overlaps
+    exponent = (
+        -prop_ctx.sqrt_dt * shift_term
+        + fb_term
+        + prop_ctx.dt * (state.pop_control_ene_shift + prop_ctx.h0_prop)
+    )
+    imp_fun = jnp.exp(exponent) * ratio
+
+    theta = jnp.angle(jnp.exp(-prop_ctx.sqrt_dt * shift_term) * ratio)
+    imp_ph = jnp.abs(imp_fun) * jnp.cos(theta)
+
+    # the probed quantities, before the floor and the cap of the weight update.
+    # mf_shifts = i tr(L rho), so force_bias + i mf_shifts = <L>_loc - tr(L rho)
+    fb_sub = force_bias + 1.0j * prop_ctx.mf_shifts
+    fb_sq = jnp.sum(jnp.abs(fb_sub) ** 2, axis=1)
+    probe = StepProbe(
+        fb_norm=jnp.sqrt(fb_sq),
+        fb_ms=fb_sq / fb_sub.shape[1],
+        ln_imp=jnp.log(jnp.abs(imp_fun)),
+        cos_theta=jnp.cos(theta),
+    )
+
+    w_floor = float(getattr(params, "weight_floor", 1.0e-3))
+    w_cap = float(getattr(params, "weight_cap", 100.0))
+
+    imp_ph = jnp.where(~jnp.isfinite(imp_ph) | (imp_ph < w_floor), 0.0, imp_ph)
+    node_encounters_new = state.node_encounters + jnp.sum(imp_ph <= 0.0)
+    imp_ph = jnp.where(imp_ph > w_cap, 0.0, imp_ph)
+
+    weights_new = state.weights * imp_ph
+    weights_new = jnp.where(weights_new > w_cap, 0.0, weights_new)
+
+    damping = float(getattr(params, "pop_control_damping", 0.1))
+    avg_w = jnp.clip(jnp.mean(weights_new), min=1.0e-300)
+    pop_shift_new = state.e_estimate - damping * (jnp.log(avg_w) / prop_ctx.dt)
+
+    state_new = PropState(
+        walkers=walkers_new,
+        weights=weights_new,
+        overlaps=overlaps_new,
+        rng_key=key,
+        pop_control_ene_shift=pop_shift_new,
+        e_estimate=state.e_estimate,
+        node_encounters=node_encounters_new,
+    )
+    return state_new, probe
+
+
 def make_prop_ops(
     ham_basis: HamBasis,
     walker_kind: str,
@@ -194,3 +280,49 @@ def make_prop_ops(
         )
 
     return PropOps(init_prop_state=init_prop_state, build_prop_ctx=build_prop_ctx, step=step)
+
+
+def make_prop_ops_probe(
+    ham_basis: HamBasis,
+    walker_kind: str,
+    mixed_precision: bool = False,
+    packed_cholesky: bool = False,
+) -> PropOps:
+    """
+    make_prop_ops with the probing step: ``step`` is afqmc_step_probe and returns
+    (PropState, StepProbe) instead of the state alone, so it goes with a block function
+    that expects it (prop/blocks_mixed_probe.block_mixed_probe). The initial state and
+    the propagation context are make_prop_ops's.
+    """
+    base = make_prop_ops(
+        ham_basis, walker_kind, mixed_precision=mixed_precision, packed_cholesky=packed_cholesky
+    )
+    trotter_ops = make_trotter_ops(ham_basis, walker_kind, mixed_precision=mixed_precision)
+
+    def step_probe(
+        state: PropState,
+        *,
+        params: QmcParamsBase,
+        ham_data: Any,
+        trial_data: Any,
+        trial_ops: TrialOps,
+        meas_ops: MeasOps,
+        meas_ctx: Any,
+        prop_ctx: Any,
+    ) -> tuple[PropState, StepProbe]:
+        return afqmc_step_probe(
+            state,
+            params=params,
+            ham_data=ham_data,
+            trial_data=trial_data,
+            meas_ops=meas_ops,
+            meas_ctx=meas_ctx,
+            prop_ctx=prop_ctx,
+            trotter_ops=trotter_ops,
+        )
+
+    return PropOps(
+        init_prop_state=base.init_prop_state,
+        build_prop_ctx=base.build_prop_ctx,
+        step=step_probe,  # type: ignore[arg-type]
+    )

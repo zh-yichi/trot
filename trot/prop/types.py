@@ -17,6 +17,31 @@ def _random_seed() -> int:
     return int(np.random.randint(0, int(1e6)))
 
 
+class StepProbe(NamedTuple):
+    """
+    What the probing step (prop/afqmc.afqmc_step_probe) returns per walker, next to the
+    new state, for the step it has just taken.
+
+    fb_norm:   (sum_gamma |<psi_g|L_gamma|phi>/<psi_g|phi> - tr(L_gamma rho)|^2)^(1/2), the
+               norm over the fields of the force bias with the mean field part of the
+               propagator subtracted (rho is the density matrix the propagation context is
+               built with, the HF one for the HF and the CISD guides)
+    fb_ms:     sum_gamma |...|^2 / N_gamma, the mean square over the fields of the same
+               force bias (fb_norm^2 over the number of fields). Averaged over the
+               walkers, its root is the root mean square of the force bias per field,
+               which takes the root after the average and not per walker as fb_norm
+    ln_imp:    ln|I|, the logarithm of the absolute value of the importance function of
+               the step, with the population control energy shift as in the weight
+               update; -inf for a walker with I = 0
+    cos_theta: cos(theta), theta the phase of the phaseless constraint
+    """
+
+    fb_norm: jax.Array
+    fb_ms: jax.Array
+    ln_imp: jax.Array
+    cos_theta: jax.Array
+
+
 class PropState(NamedTuple):
     walkers: Any
     weights: jax.Array
