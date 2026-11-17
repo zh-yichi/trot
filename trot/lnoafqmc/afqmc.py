@@ -197,6 +197,9 @@ class LnoFragMixed(AfqmcMixed):
         self.basis_b = None
         self.walker_kind = cast(WalkerKind, self.recipe.walker_kind)
         self.mixed_precision = mixed_precision
+        # options of a guide with its own staging (AfqmcMixed._init_mixed_options); the LNO
+        # fragment guides take none, but _key() and build_job() read the attribute
+        self.guide_options: dict[str, Any] = {}
         self.guide_mixed_precision = (
             bool(mixed_precision) if guide_mixed_precision is None else bool(guide_mixed_precision)
         )

@@ -9,7 +9,9 @@ stochastic reconfiguration copies the sample along with the walker: a copy must 
 divided by the same guide overlap as its original for sum_w w_w |phi_w>/<G_w|phi_w> to
 be unchanged. The overlaps are then permuted rather than recomputed. Everything else,
 the guide energy for the population control, the outlier handling
-(params.mixed_outlier) and the trial measurement, is block_mixed's.
+(params.mixed_outlier) and the trial measurement, is block_mixed's. On a data mesh the
+reconfigured population is constrained back to the walkers' sharding, as
+walkers.stochastic_reconfiguration does with its data_sharding.
 """
 
 from __future__ import annotations
@@ -23,7 +25,12 @@ from jax import lax
 from .. import walkers as wk
 from ..core.ops import MeasOps, TrialOps, k_energy
 from ..core.system import System
-from .afqmc_stocc import PropStateStocc, guide_kernel, guide_overlaps
+from .afqmc_stocc import (
+    PropStateStocc,
+    constrain_like_walkers,
+    guide_kernel,
+    guide_overlaps,
+)
 from .blocks import BlockObs
 from .blocks_mixed import PT2_COMPONENTS
 from .types import PropOps, QmcParams
@@ -34,11 +41,12 @@ def _reconfigure(state: PropStateStocc, zeta: jax.Array) -> PropStateStocc:
     n = wk.n_walkers(state.walkers)
     idx = wk._sr_indices(state.weights, zeta, n)
     avg = jnp.sum(jnp.abs(state.weights)) / n
+    like = lambda x: constrain_like_walkers(x, state.walkers)
     return state._replace(
-        walkers=wk.take_walkers(state.walkers, idx),
-        guide_dets=state.guide_dets[idx],
-        overlaps=state.overlaps[idx],
-        weights=jnp.full((n,), avg, dtype=state.weights.dtype),
+        walkers=jax.tree_util.tree_map(like, wk.take_walkers(state.walkers, idx)),
+        guide_dets=like(state.guide_dets[idx]),
+        overlaps=like(state.overlaps[idx]),
+        weights=like(jnp.full((n,), avg, dtype=state.weights.dtype)),
     )
 
 
@@ -66,7 +74,7 @@ def block_mixed_stocc(
     One block: n_prop_steps of guided propagation (the guide redrawn per walker at every
     step), then the guide's local energy and, unless measure_trial=False, the trial's
     components; see block_mixed. sr_fn is not used: the reconfiguration has to carry the
-    guide samples, so it is this module's own (no walker sharding).
+    guide samples, so it is this module's own; it follows the walkers' sharding.
     """
 
     step = lambda st: guide_prop_ops.step(
@@ -87,7 +95,11 @@ def block_mixed_stocc(
 
     walkers_new = wk.orthonormalize(state.walkers, sys.walker_kind)
     overlaps = guide_overlaps(
-        guide_meas_ops, walkers_new, state.guide_dets, guide_data, n_chunks=params.n_chunks
+        guide_meas_ops,
+        walkers_new,
+        state.guide_dets,
+        guide_data,
+        n_chunks=params.n_chunks,
     )
     state = state._replace(walkers=walkers_new, overlaps=overlaps)
 

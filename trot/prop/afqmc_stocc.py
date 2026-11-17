@@ -26,6 +26,12 @@ walker) because the block function needs the determinants that produced state.ov
 after orthonormalization and reconfiguration. The propagation fields come from the same
 subkey as trot's afqmc_step and the guide fields from a fold_in of it, so with no T2
 modes and one sample the walk is the RHF-guided one with the Thouless reference as guide.
+
+On a device mesh with a "data" axis (sharding.make_data_mesh) the walkers, weights,
+overlaps and guide samples are all split over the devices along the walker axis
+(shard_prop_state_stocc); the per walker kernels run device locally through
+walkers.vmap_chunked and every freshly drawn sample is constrained to the walkers'
+sharding.
 """
 
 from __future__ import annotations
@@ -34,12 +40,15 @@ from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh
+from jax import lax
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from .. import walkers as wk
 from ..core.ops import MeasOps, TrialOps, k_energy, k_force_bias
 from ..core.system import System
 from ..ham.chol import HamBasis, HamChol
+from ..sharding import replicate, shard_first_axis
 from ..trial.stoccsd import StoccsdGuide, sample_dets, with_dets
 from ..walkers import init_walkers
 from .chol_afqmc_ops import CholAfqmcCtx, TrotterOps, _build_prop_ctx, make_trotter_ops
@@ -64,18 +73,61 @@ class PropStateStocc(NamedTuple):
 # ------------------------------------------------------------------------------------
 
 
-def sample_walker_dets(guide: StoccsdGuide, key: jax.Array, n_walkers: int) -> jax.Array:
+def sample_walker_dets(
+    guide: StoccsdGuide, key: jax.Array, n_walkers: int
+) -> jax.Array:
     """An independent sample of guide.n_samples determinants for each of n_walkers walkers."""
     keys = jax.random.split(key, int(n_walkers))
-    return jax.vmap(lambda k: sample_dets(guide.mo_t, guide.tau, k, guide.n_samples))(keys)
+    return jax.vmap(lambda k: sample_dets(guide.mo_t, guide.tau, k, guide.n_samples))(
+        keys
+    )
+
+
+def walker_data_sharding(walkers: Any) -> NamedSharding | None:
+    """The walkers' sharding along the data axis, None off a mesh (also inside a jit)."""
+    mesh = wk._walker_data_mesh(walkers)
+    return None if mesh is None else NamedSharding(mesh, P("data"))
+
+
+def constrain_like_walkers(x: jax.Array, walkers: Any) -> jax.Array:
+    """x (leading walker axis) sharded as the walkers are; unchanged off a mesh."""
+    sharding = walker_data_sharding(walkers)
+    return x if sharding is None else lax.with_sharding_constraint(x, sharding)
+
+
+def shard_prop_state_stocc(
+    state: "PropStateStocc", mesh: Mesh | None
+) -> "PropStateStocc":
+    """sharding.shard_prop_state for the sampled guide's state: the samples go with the walkers."""
+    if mesh is None or mesh.size == 1:
+        return state
+    return state._replace(
+        walkers=jax.tree_util.tree_map(
+            lambda a: shard_first_axis(a, mesh), state.walkers
+        ),
+        weights=shard_first_axis(state.weights, mesh),
+        overlaps=shard_first_axis(state.overlaps, mesh),
+        rng_key=replicate(state.rng_key, mesh),
+        pop_control_ene_shift=replicate(state.pop_control_ene_shift, mesh),
+        e_estimate=replicate(state.e_estimate, mesh),
+        node_encounters=replicate(state.node_encounters, mesh),
+        guide_dets=shard_first_axis(state.guide_dets, mesh),
+    )
 
 
 def guide_overlaps(
-    meas_ops: MeasOps, walkers: Any, dets: jax.Array, guide: StoccsdGuide, *, n_chunks: int
+    meas_ops: MeasOps,
+    walkers: Any,
+    dets: jax.Array,
+    guide: StoccsdGuide,
+    *,
+    n_chunks: int,
 ) -> jax.Array:
     """<G_w|phi_w> for every walker with its own sample."""
     fn = lambda w, d, g: meas_ops.overlap(w, with_dets(g, d))
-    return wk.vmap_chunked(fn, n_chunks=n_chunks, in_axes=(0, 0, None))(walkers, dets, guide)
+    return wk.vmap_chunked(fn, n_chunks=n_chunks, in_axes=(0, 0, None))(
+        walkers, dets, guide
+    )
 
 
 def guide_kernel(
@@ -119,11 +171,19 @@ def init_prop_state_stocc(
     """
     prop.afqmc.init_prop_state for the sampled guide: the walkers from the guide's rdm1,
     a first sample per walker from the run seed, the overlaps with it, and the energy
-    estimate from the guide's local energy of the first walker.
+    estimate from the guide's local energy of the first walker; sharded over the mesh's
+    data axis when one is given (n_walkers must then be a multiple of the device count).
     """
-    if mesh is not None and mesh.size > 1:
-        raise NotImplementedError("the stoccsd guide does not shard the walkers over a mesh yet.")
     n_walkers = params.n_walkers
+    if (
+        mesh is not None
+        and mesh.size > 1
+        and n_walkers % int(mesh.shape.get("data", mesh.size))
+    ):
+        raise ValueError(
+            f"n_walkers={n_walkers} is not a multiple of the mesh's data axis "
+            f"({mesh.shape.get('data', mesh.size)} devices)."
+        )
     key = jax.random.PRNGKey(int(params.seed))
     weights = jnp.ones((n_walkers,))
 
@@ -133,7 +193,9 @@ def init_prop_state_stocc(
         initial_walkers = init_walkers(sys=sys, rdm1=rdm1, n_walkers=n_walkers)
 
     dets = sample_walker_dets(trial_data, jax.random.fold_in(key, 2), n_walkers)
-    overlaps = guide_overlaps(meas_ops, initial_walkers, dets, trial_data, n_chunks=params.n_chunks)
+    overlaps = guide_overlaps(
+        meas_ops, initial_walkers, dets, trial_data, n_chunks=params.n_chunks
+    )
 
     if initial_e_estimate is not None:
         e_est = jnp.asarray(initial_e_estimate)
@@ -156,7 +218,7 @@ def init_prop_state_stocc(
         e_est = jnp.mean(e_samples)
     e_est = jax.block_until_ready(e_est)
 
-    return PropStateStocc(
+    state = PropStateStocc(
         walkers=initial_walkers,
         weights=weights,
         overlaps=overlaps,
@@ -166,6 +228,7 @@ def init_prop_state_stocc(
         node_encounters=jnp.asarray(0),
         guide_dets=dets,
     )
+    return shard_prop_state_stocc(state, mesh)
 
 
 def afqmc_step_stocc(
@@ -183,8 +246,9 @@ def afqmc_step_stocc(
     nw = wk.n_walkers(state.walkers)
     fields = jax.random.normal(subkey, (nw, prop_ctx.chol_flat.shape[0]))
 
-    # the new guide of every walker, G^{(i+1)}
+    # the new guide of every walker, G^{(i+1)}, split over the devices as the walkers are
     dets = sample_walker_dets(trial_data, jax.random.fold_in(subkey, 1), nw)
+    dets = constrain_like_walkers(dets, state.walkers)
     # <G^{(i+1)}|phi^{(i)}> and the force bias of the new guide on the old walker
     overlaps_10 = guide_overlaps(
         meas_ops, state.walkers, dets, trial_data, n_chunks=params.n_chunks
@@ -209,7 +273,9 @@ def afqmc_step_stocc(
     )(state.walkers, shifted_fields, prop_ctx, params.n_exp_terms)
 
     # <G^{(i+1)}|phi^{(i+1)}>
-    overlaps_11 = guide_overlaps(meas_ops, walkers_new, dets, trial_data, n_chunks=params.n_chunks)
+    overlaps_11 = guide_overlaps(
+        meas_ops, walkers_new, dets, trial_data, n_chunks=params.n_chunks
+    )
     ratio_g = overlaps_10 / state.overlaps  # the change of the guide
     ratio_w = overlaps_11 / overlaps_10  # the walk
     exponent = (
@@ -256,8 +322,12 @@ def make_stocc_prop_ops(
 ) -> PropOps:
     """prop.afqmc.make_prop_ops with the sampled guide's state and step."""
     if walker_kind.lower() != "restricted":
-        raise ValueError(f"the stoccsd guide propagates restricted walkers, got {walker_kind!r}")
-    trotter_ops = make_trotter_ops(ham_basis, walker_kind, mixed_precision=mixed_precision)
+        raise ValueError(
+            f"the stoccsd guide propagates restricted walkers, got {walker_kind!r}"
+        )
+    trotter_ops = make_trotter_ops(
+        ham_basis, walker_kind, mixed_precision=mixed_precision
+    )
 
     def step(
         state: PropStateStocc,
@@ -281,7 +351,9 @@ def make_stocc_prop_ops(
             trotter_ops=trotter_ops,
         )
 
-    def build_prop_ctx(ham_data: Any, rdm1: jax.Array, params: QmcParamsBase) -> CholAfqmcCtx:
+    def build_prop_ctx(
+        ham_data: Any, rdm1: jax.Array, params: QmcParamsBase
+    ) -> CholAfqmcCtx:
         return _build_prop_ctx(
             ham_data,
             rdm1,
@@ -290,15 +362,20 @@ def make_stocc_prop_ops(
             packed_cholesky=packed_cholesky,
         )
 
-    return PropOps(init_prop_state=init_prop_state_stocc, build_prop_ctx=build_prop_ctx, step=step)
+    return PropOps(
+        init_prop_state=init_prop_state_stocc, build_prop_ctx=build_prop_ctx, step=step
+    )
 
 
 __all__ = [
     "PropStateStocc",
     "afqmc_step_stocc",
+    "constrain_like_walkers",
     "guide_kernel",
     "guide_overlaps",
     "init_prop_state_stocc",
     "make_stocc_prop_ops",
     "sample_walker_dets",
+    "shard_prop_state_stocc",
+    "walker_data_sharding",
 ]
