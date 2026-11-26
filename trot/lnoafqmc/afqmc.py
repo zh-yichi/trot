@@ -200,6 +200,10 @@ class LnoFragMixed(AfqmcMixed):
         # options of a guide with its own staging (AfqmcMixed._init_mixed_options); the LNO
         # fragment guides take none, but _key() and build_job() read the attribute
         self.guide_options: dict[str, Any] = {}
+        # the probe of the importance sampling (AfqmcMixed._init_mixed_options) is not
+        # wired into the fragment run loop (lnoafqmc/driver.py), but build_job() reads it
+        self.probe = False
+        self.probe_means: dict[str, tuple[float, float | None]] | None = None
         self.guide_mixed_precision = (
             bool(mixed_precision) if guide_mixed_precision is None else bool(guide_mixed_precision)
         )
